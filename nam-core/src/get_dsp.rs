@@ -530,34 +530,26 @@ mod tests {
         Some((max_diff, rms_diff))
     }
 
+    // ── Strict accuracy guards ────────────────────────────────────────────
+    //
+    // These thresholds are the EXACT known-good accuracy levels as of the
+    // block-based processing implementation. Any code change that makes
+    // accuracy worse on ANY model will fail these tests.
+    //
+    // Current known-good values (max_diff vs C++ reference):
+    //   wavenet:              0.0       (bit-identical)
+    //   wavenet_condition_dsp: 0.0       (bit-identical)
+    //   lstm:                 2.09e-07  (f32 precision limit)
+    //   wavenet_a1_standard:  1.13e-06  (f32 precision floor for 20-layer model)
+    //   my_model:             1.13e-06  (same architecture as a1_standard)
+    //   wavenet_a2_max:       4.77e-06  (deep network with condition_dsp)
+
     #[test]
     fn test_regression_wavenet() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet") {
             assert!(
-                max_diff < 1e-4,
-                "wavenet regression: max_diff={:.2e}",
-                max_diff
-            );
-        }
-    }
-
-    #[test]
-    fn test_regression_lstm() {
-        if let Some((max_diff, _rms)) = regression_compare("lstm") {
-            assert!(
-                max_diff < 1e-4,
-                "lstm regression: max_diff={:.2e}",
-                max_diff
-            );
-        }
-    }
-
-    #[test]
-    fn test_regression_wavenet_a1_standard() {
-        if let Some((max_diff, _rms)) = regression_compare("wavenet_a1_standard") {
-            assert!(
-                max_diff < 1e-4,
-                "wavenet_a1_standard regression: max_diff={:.2e}",
+                max_diff == 0.0,
+                "wavenet: expected bit-identical, got max_diff={:.2e}",
                 max_diff
             );
         }
@@ -567,8 +559,30 @@ mod tests {
     fn test_regression_wavenet_condition_dsp() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_condition_dsp") {
             assert!(
-                max_diff < 1e-4,
-                "wavenet_condition_dsp regression: max_diff={:.2e}",
+                max_diff == 0.0,
+                "wavenet_condition_dsp: expected bit-identical, got max_diff={:.2e}",
+                max_diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_lstm() {
+        if let Some((max_diff, _rms)) = regression_compare("lstm") {
+            assert!(
+                max_diff <= 2.1e-07,
+                "lstm: accuracy regressed, max_diff={:.2e} (limit 2.1e-07)",
+                max_diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_wavenet_a1_standard() {
+        if let Some((max_diff, _rms)) = regression_compare("wavenet_a1_standard") {
+            assert!(
+                max_diff <= 1.2e-06,
+                "wavenet_a1_standard: accuracy regressed, max_diff={:.2e} (limit 1.2e-06)",
                 max_diff
             );
         }
@@ -578,8 +592,8 @@ mod tests {
     fn test_regression_my_model() {
         if let Some((max_diff, _rms)) = regression_compare("my_model") {
             assert!(
-                max_diff < 1e-4,
-                "my_model regression: max_diff={:.2e}",
+                max_diff <= 1.2e-06,
+                "my_model: accuracy regressed, max_diff={:.2e} (limit 1.2e-06)",
                 max_diff
             );
         }
@@ -587,17 +601,10 @@ mod tests {
 
     #[test]
     fn test_regression_wavenet_a2_max() {
-        // This model uses every advanced feature (FiLM, grouped convs, head1x1,
-        // gated+blended activations, nested condition_dsp with gating).
-        //
-        // With block-based matrix processing matching C++ Eigen computation order,
-        // this model now matches C++ output closely. The remaining difference is
-        // from floating-point non-associativity in activation functions (tanh, sigmoid)
-        // and the condition_dsp's per-sample processing.
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
             assert!(
-                max_diff < 1e-4,
-                "wavenet_a2_max regression: max_diff={:.2e}",
+                max_diff <= 5.0e-06,
+                "wavenet_a2_max: accuracy regressed, max_diff={:.2e} (limit 5.0e-06)",
                 max_diff
             );
         }
