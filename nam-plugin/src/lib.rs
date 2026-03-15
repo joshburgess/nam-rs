@@ -45,6 +45,9 @@ struct ResamplerState {
     /// Pre-allocated model I/O buffers
     model_input: Vec<nam_core::Sample>,
     model_output: Vec<nam_core::Sample>,
+    /// Pre-allocated chunk buffers for rubato (avoids allocations in process)
+    to_model_scratch: Vec<Vec<f64>>,
+    to_host_scratch: Vec<Vec<f64>>,
 }
 
 impl ResamplerState {
@@ -66,6 +69,8 @@ impl ResamplerState {
             to_host_chunk,
             model_input: vec![0.0; max_model_buf],
             model_output: vec![0.0; max_model_buf],
+            to_model_scratch: vec![vec![0.0; to_model_chunk]; 1],
+            to_host_scratch: vec![vec![0.0; to_host_chunk]; 1],
         })
     }
 
@@ -214,11 +219,12 @@ impl NamPlugin {
         // Resample pending input: host_rate -> model_rate, in fixed-size chunks
         let mut model_samples_ready = 0usize;
         while rs.input_pending.len() >= rs.to_model_chunk {
-            // Drain one chunk from pending into a Vec<Vec<f64>> for rubato
-            let chunk: Vec<f64> = rs.input_pending.drain(..rs.to_model_chunk).collect();
-            let input_frames = vec![chunk];
+            // Fill pre-allocated scratch from pending
+            for i in 0..rs.to_model_chunk {
+                rs.to_model_scratch[0][i] = rs.input_pending.pop_front().unwrap_or(0.0);
+            }
 
-            if let Ok(resampled) = rs.to_model.process(&input_frames, None) {
+            if let Ok(resampled) = rs.to_model.process(&rs.to_model_scratch, None) {
                 for &s in &resampled[0] {
                     if model_samples_ready < rs.model_input.len() {
                         rs.model_input[model_samples_ready] = s as nam_core::Sample;
@@ -241,14 +247,12 @@ impl NamPlugin {
             // Resample model output: model_rate -> host_rate
             let mut pos = 0;
             while pos + rs.to_host_chunk <= model_samples_ready {
-                let chunk: Vec<f64> = rs.model_output[pos..pos + rs.to_host_chunk]
-                    .iter()
-                    .map(|&s| s as f64)
-                    .collect();
+                for i in 0..rs.to_host_chunk {
+                    rs.to_host_scratch[0][i] = rs.model_output[pos + i] as f64;
+                }
                 pos += rs.to_host_chunk;
 
-                let input_frames = vec![chunk];
-                if let Ok(resampled) = rs.to_host.process(&input_frames, None) {
+                if let Ok(resampled) = rs.to_host.process(&rs.to_host_scratch, None) {
                     for &s in &resampled[0] {
                         rs.output_pending.push_back(s);
                     }
