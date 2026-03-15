@@ -1,19 +1,33 @@
 use nih_plug::prelude::*;
+use nih_plug_egui::resizable_window::ResizableWindow;
+use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// Background task for model loading (runs off the audio thread).
+enum NamTask {
+    LoadModel(PathBuf),
+}
 
 /// The NAM audio plugin.
 struct NamPlugin {
     params: Arc<NamParams>,
-    model: Option<Box<dyn nam_core::Dsp>>,
+    /// Shared model slot: GUI writes a new model here, audio thread reads it.
+    model: Arc<Mutex<Option<Box<dyn nam_core::Dsp>>>>,
     /// Pre-allocated buffers to avoid allocations in process().
     input_buf: Vec<nam_core::Sample>,
     output_buf: Vec<nam_core::Sample>,
     sample_rate: f64,
+    max_buffer_size: usize,
 }
 
 #[derive(Params)]
 struct NamParams {
+    /// Persisted editor window state.
+    #[persist = "editor-state"]
+    editor_state: Arc<EguiState>,
+
     /// Input gain in dB.
     #[id = "in_gain"]
     pub input_gain: FloatParam,
@@ -27,14 +41,30 @@ struct NamParams {
     pub model_path: Mutex<String>,
 }
 
+/// GUI-only state (not persisted with plugin state).
+struct GuiState {
+    model_name: String,
+    status: String,
+}
+
+impl Default for GuiState {
+    fn default() -> Self {
+        Self {
+            model_name: String::new(),
+            status: "No model loaded".to_string(),
+        }
+    }
+}
+
 impl Default for NamPlugin {
     fn default() -> Self {
         Self {
             params: Arc::new(NamParams::default()),
-            model: None,
+            model: Arc::new(Mutex::new(None)),
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             sample_rate: 48000.0,
+            max_buffer_size: 4096,
         }
     }
 }
@@ -42,6 +72,8 @@ impl Default for NamPlugin {
 impl Default for NamParams {
     fn default() -> Self {
         Self {
+            editor_state: EguiState::from_size(400, 250),
+
             input_gain: FloatParam::new(
                 "Input Gain",
                 0.0,
@@ -71,27 +103,6 @@ impl Default for NamParams {
     }
 }
 
-impl NamPlugin {
-    /// Load a model from the given path. Called from initialize() (off the audio thread).
-    fn load_model(&mut self, path: &str) {
-        if path.is_empty() {
-            return;
-        }
-        nih_log!("Loading model from: {}", path);
-        match nam_core::get_dsp(std::path::Path::new(path)) {
-            Ok(mut dsp) => {
-                dsp.reset(self.sample_rate, self.input_buf.len().max(4096));
-                dsp.prewarm();
-                self.model = Some(dsp);
-                nih_log!("Model loaded successfully");
-            }
-            Err(e) => {
-                nih_error!("Failed to load model: {}", e);
-            }
-        }
-    }
-}
-
 impl Plugin for NamPlugin {
     const NAME: &'static str = "NAM";
     const VENDOR: &'static str = "nam-rs";
@@ -108,38 +119,149 @@ impl Plugin for NamPlugin {
     }];
 
     type SysExMessage = ();
-    type BackgroundTask = ();
+    type BackgroundTask = NamTask;
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn task_executor(&mut self) -> TaskExecutor<Self> {
+        let model_slot = self.model.clone();
+        let params = self.params.clone();
+        let sample_rate = self.sample_rate;
+        let max_buf = self.max_buffer_size;
+
+        Box::new(move |task| match task {
+            NamTask::LoadModel(path) => {
+                nih_log!("Loading model from {:?}", path);
+                match nam_core::get_dsp(&path) {
+                    Ok(mut dsp) => {
+                        dsp.reset(sample_rate, max_buf);
+                        dsp.prewarm();
+                        *model_slot.lock().unwrap() = Some(dsp);
+                        if let Ok(mut p) = params.model_path.lock() {
+                            *p = path.to_string_lossy().to_string();
+                        }
+                        nih_log!("Model loaded successfully");
+                    }
+                    Err(e) => {
+                        nih_error!("Failed to load model: {}", e);
+                    }
+                }
+            }
+        })
+    }
+
+    fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let model_slot = self.model.clone();
+
+        create_egui_editor(
+            self.params.editor_state.clone(),
+            GuiState::default(),
+            |_, _| {},
+            move |egui_ctx, setter, state| {
+                let egui_state = params.editor_state.clone();
+
+                ResizableWindow::new("nam-editor")
+                    .min_size(egui::Vec2::new(300.0, 200.0))
+                    .show(egui_ctx, egui_state.as_ref(), |ui| {
+                        ui.heading("Neural Amp Modeler");
+                        ui.separator();
+
+                        // Model loading
+                        ui.horizontal(|ui| {
+                            if ui.button("Load Model").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("NAM Model", &["nam"])
+                                    .pick_file()
+                                {
+                                    state.model_name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    state.status = "Loading...".to_string();
+                                    async_executor
+                                        .execute_background(NamTask::LoadModel(path));
+                                }
+                            }
+
+                            if model_slot.lock().unwrap().is_some() {
+                                ui.label(
+                                    egui::RichText::new("●")
+                                        .color(egui::Color32::GREEN)
+                                        .size(14.0),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("●")
+                                        .color(egui::Color32::DARK_GRAY)
+                                        .size(14.0),
+                                );
+                            }
+                        });
+
+                        // Model name display
+                        if state.model_name.is_empty() {
+                            ui.label("No model loaded");
+                        } else {
+                            ui.label(&state.model_name);
+                        }
+
+                        // Update status when model finishes loading
+                        if model_slot.lock().unwrap().is_some()
+                            && state.status == "Loading..."
+                        {
+                            state.status = "Ready".to_string();
+                        }
+
+                        ui.separator();
+
+                        // Gain controls
+                        ui.label("Input Gain");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.input_gain,
+                            setter,
+                        ));
+
+                        ui.label("Output Gain");
+                        ui.add(widgets::ParamSlider::for_param(
+                            &params.output_gain,
+                            setter,
+                        ));
+                    });
+            },
+        )
     }
 
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate as f64;
-        let max_buf = buffer_config.max_buffer_size as usize;
+        self.max_buffer_size = buffer_config.max_buffer_size as usize;
 
         // Pre-allocate buffers
-        self.input_buf = vec![0.0; max_buf];
-        self.output_buf = vec![0.0; max_buf];
+        self.input_buf = vec![0.0; self.max_buffer_size];
+        self.output_buf = vec![0.0; self.max_buffer_size];
 
-        // Load persisted model path (initialize runs off audio thread, safe to do I/O)
+        // Load persisted model path
         let path = self.params.model_path.lock().unwrap().clone();
-        if !path.is_empty() {
-            self.load_model(&path);
+        if !path.is_empty() && self.model.lock().unwrap().is_none() {
+            context.execute(NamTask::LoadModel(PathBuf::from(path)));
         }
 
         true
     }
 
     fn reset(&mut self) {
-        if let Some(ref mut model) = self.model {
-            model.reset(self.sample_rate, self.input_buf.len());
-            model.prewarm();
+        if let Ok(mut model) = self.model.lock() {
+            if let Some(ref mut m) = *model {
+                m.reset(self.sample_rate, self.max_buffer_size);
+                m.prewarm();
+            }
         }
     }
 
@@ -154,28 +276,25 @@ impl Plugin for NamPlugin {
             return ProcessStatus::Normal;
         }
 
-        let model = match self.model {
-            Some(ref mut m) => m,
+        let mut model_guard = self.model.lock().unwrap();
+        let model = match model_guard.as_mut() {
+            Some(m) => m,
             None => return ProcessStatus::Normal,
         };
 
-        // Get raw channel slice (mono: 1 channel)
         let channel_data = buffer.as_slice();
         let channel = &mut channel_data[0];
 
-        // Copy input with gain applied
         let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
         for i in 0..num_samples {
             self.input_buf[i] = (channel[i] * in_gain) as nam_core::Sample;
         }
 
-        // Process through model
         model.process(
             &self.input_buf[..num_samples],
             &mut self.output_buf[..num_samples],
         );
 
-        // Copy output with gain applied
         let out_gain = util::db_to_gain_fast(self.params.output_gain.smoothed.next());
         for i in 0..num_samples {
             channel[i] = (self.output_buf[i] as f32) * out_gain;
