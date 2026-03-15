@@ -156,7 +156,8 @@ impl Dsp for Lstm {
             }
 
             // Head linear layer
-            let final_hidden = self.cells.last().unwrap().hidden_state();
+            // cells is always non-empty (populated in from_config)
+            let final_hidden = self.cells.last().expect("LSTM has no cells").hidden_state();
             let out = self.head_weight.row(0).dot(&final_hidden) + self.head_bias[0];
             output[i] = out as Sample;
         }

@@ -1453,9 +1453,7 @@ impl WaveNet {
                         .map(Activation::from_json)
                         .collect::<Result<Vec<_>, _>>()?
                 } else {
-                    // "Tanh" is a known-valid activation name, so the inner unwrap is safe.
-                    let act = Activation::from_json(act_val)
-                        .unwrap_or_else(|_| Activation::from_name("Tanh").unwrap());
+                    let act = Activation::from_json(act_val).unwrap_or(Activation::Tanh);
                     vec![act; num_layers]
                 }
             };

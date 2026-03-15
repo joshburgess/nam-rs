@@ -86,7 +86,8 @@ impl<'a> WeightIter<'a> {
         cols: usize,
     ) -> Result<ndarray::Array2<f32>, NamError> {
         let data = self.take(rows * cols)?;
-        Ok(ndarray::Array2::from_shape_vec((rows, cols), data.to_vec()).unwrap())
+        ndarray::Array2::from_shape_vec((rows, cols), data.to_vec())
+            .map_err(|e| NamError::InvalidConfig(format!("matrix shape error: {}", e)))
     }
 
     pub fn take_vector(&mut self, len: usize) -> Result<ndarray::Array1<f32>, NamError> {

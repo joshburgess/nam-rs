@@ -83,13 +83,24 @@ fn render(model_path: &Path, input_path: &Path, output_path: &Path) {
     let input_samples: Vec<nam_core::Sample> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
-            .map(|s| s.unwrap() as nam_core::Sample)
+            .map(|s| {
+                s.unwrap_or_else(|e| {
+                    eprintln!("Error reading WAV sample: {}", e);
+                    0.0
+                }) as nam_core::Sample
+            })
             .collect(),
         hound::SampleFormat::Int => {
             let max_val = (1i64 << (spec.bits_per_sample - 1)) as f64;
             reader
                 .samples::<i32>()
-                .map(|s| s.unwrap() as f64 / max_val)
+                .map(|s| {
+                    s.unwrap_or_else(|e| {
+                        eprintln!("Error reading WAV sample: {}", e);
+                        0
+                    }) as f64
+                        / max_val
+                })
                 .map(|s| s as nam_core::Sample)
                 .collect()
         }
@@ -121,9 +132,15 @@ fn render(model_path: &Path, input_path: &Path, output_path: &Path) {
     });
 
     for &sample in &output_samples {
-        writer.write_sample(sample as f32).unwrap();
+        if let Err(e) = writer.write_sample(sample as f32) {
+            eprintln!("Error writing WAV sample: {}", e);
+            std::process::exit(1);
+        }
     }
-    writer.finalize().unwrap();
+    if let Err(e) = writer.finalize() {
+        eprintln!("Error finalizing WAV: {}", e);
+        std::process::exit(1);
+    }
 
     eprintln!(
         "Rendered {} samples at {} Hz",

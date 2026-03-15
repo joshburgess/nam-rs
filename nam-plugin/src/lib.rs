@@ -175,7 +175,7 @@ impl Default for NamParams {
 impl NamPlugin {
     fn setup_resampler(&mut self) {
         let model_rate = {
-            let guard = self.model.lock().unwrap();
+            let guard = self.model.lock().expect("mutex poisoned");
             match guard.as_ref() {
                 Some(m) => m.metadata().expected_sample_rate.unwrap_or(0.0),
                 None => 0.0,
@@ -313,7 +313,7 @@ impl Plugin for NamPlugin {
                         let model_rate = dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
                         dsp.reset(model_rate, max_buf);
                         dsp.prewarm();
-                        *model_slot.lock().unwrap() = Some(dsp);
+                        *model_slot.lock().expect("mutex poisoned") = Some(dsp);
                         if let Ok(mut p) = params.model_path.lock() {
                             *p = path.to_string_lossy().to_string();
                         }
@@ -359,7 +359,7 @@ impl Plugin for NamPlugin {
                                 }
                             }
 
-                            if model_slot.lock().unwrap().is_some() {
+                            if model_slot.lock().expect("mutex poisoned").is_some() {
                                 ui.label(
                                     egui::RichText::new("●")
                                         .color(egui::Color32::GREEN)
@@ -380,7 +380,9 @@ impl Plugin for NamPlugin {
                             ui.label(&state.model_name);
                         }
 
-                        if model_slot.lock().unwrap().is_some() && state.status == "Loading..." {
+                        if model_slot.lock().expect("mutex poisoned").is_some()
+                            && state.status == "Loading..."
+                        {
                             state.status = "Ready".to_string();
                         }
 
@@ -420,8 +422,13 @@ impl Plugin for NamPlugin {
         self.input_buf = vec![0.0; self.max_buffer_size];
         self.output_buf = vec![0.0; self.max_buffer_size];
 
-        let path = self.params.model_path.lock().unwrap().clone();
-        if !path.is_empty() && self.model.lock().unwrap().is_none() {
+        let path = self
+            .params
+            .model_path
+            .lock()
+            .expect("mutex poisoned")
+            .clone();
+        if !path.is_empty() && self.model.lock().expect("mutex poisoned").is_none() {
             context.execute(NamTask::LoadModel(PathBuf::from(path)));
         }
 
@@ -458,7 +465,7 @@ impl Plugin for NamPlugin {
             return ProcessStatus::Normal;
         }
 
-        let mut model_guard = self.model.lock().unwrap();
+        let mut model_guard = self.model.lock().expect("mutex poisoned");
         let model = match model_guard.as_mut() {
             Some(m) => m,
             None => return ProcessStatus::Normal,
