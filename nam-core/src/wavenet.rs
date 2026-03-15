@@ -1,3 +1,6 @@
+// Allow index-based loops in GEMM hot paths where explicit indexing matches C++ Eigen order
+#![allow(clippy::needless_range_loop)]
+
 use crate::activations::Activation;
 use crate::dsp::{Dsp, DspMetadata, Sample};
 use crate::error::NamError;
@@ -52,17 +55,153 @@ impl FiLMParams {
     }
 }
 
+// ── Column-major 2D matrix helper ───────────────────────────────────────────
+// Storage: flat Vec<f32> in column-major order (like Eigen).
+// Element at (row, col) is at index: col * num_rows + row
+// A column slice for column c starts at: c * num_rows, length = num_rows
+
+/// A 2D matrix stored in column-major order (matching Eigen's default layout).
+/// rows = channels, cols = frames.
+struct ColMajorMatrix {
+    data: Vec<f32>,
+    rows: usize,
+    // cols is implicit: data.len() / rows (or max_cols for pre-allocated)
+    #[allow(dead_code)]
+    max_cols: usize,
+}
+
+impl ColMajorMatrix {
+    fn new(rows: usize, max_cols: usize) -> Self {
+        Self {
+            data: vec![0.0; rows * max_cols],
+            rows,
+            max_cols,
+        }
+    }
+
+    fn zero_cols(&mut self, num_cols: usize) {
+        let len = self.rows * num_cols;
+        self.data[..len].fill(0.0);
+    }
+
+    fn resize(&mut self, rows: usize, max_cols: usize) {
+        self.rows = rows;
+        self.max_cols = max_cols;
+        let needed = rows * max_cols;
+        if self.data.len() < needed {
+            self.data.resize(needed, 0.0);
+        }
+        self.data[..needed].fill(0.0);
+    }
+}
+
+// ── Ring Buffer 2D (column-major, matching C++ RingBuffer) ──────────────────
+
+struct RingBuffer2D {
+    storage: Vec<f32>, // column-major: [channels * storage_cols]
+    channels: usize,
+    storage_cols: usize,
+    write_pos: usize, // current write position (column index)
+    max_lookback: usize,
+    max_buffer_size: usize,
+}
+
+impl RingBuffer2D {
+    fn new() -> Self {
+        Self {
+            storage: Vec::new(),
+            channels: 0,
+            storage_cols: 0,
+            write_pos: 0,
+            max_lookback: 0,
+            max_buffer_size: 0,
+        }
+    }
+
+    fn set_max_lookback(&mut self, max_lookback: usize) {
+        self.max_lookback = max_lookback;
+    }
+
+    fn reset(&mut self, channels: usize, max_buffer_size: usize) {
+        self.channels = channels;
+        self.max_buffer_size = max_buffer_size;
+        // Storage size: 2 * max_lookback + max_buffer_size (matching C++)
+        self.storage_cols = 2 * self.max_lookback + max_buffer_size;
+        self.storage = vec![0.0; channels * self.storage_cols];
+        self.write_pos = self.max_lookback;
+    }
+
+    /// Write num_frames columns from src (column-major, channels rows) at write_pos
+    fn write(&mut self, src: &ColMajorMatrix, num_frames: usize) {
+        // Check if we need rewind
+        if self.write_pos + num_frames > self.storage_cols {
+            self.rewind();
+        }
+
+        let ch = self.channels;
+        for f in 0..num_frames {
+            let src_off = f * src.rows;
+            let dst_off = (self.write_pos + f) * ch;
+            self.storage[dst_off..dst_off + ch].copy_from_slice(&src.data[src_off..src_off + ch]);
+        }
+    }
+
+    /// Read num_frames columns starting at (write_pos - lookback).
+    /// Returns a pointer to the start; data is column-major with stride = channels.
+    #[inline]
+    fn read_ptr(&self, _num_frames: usize, lookback: usize) -> &[f32] {
+        let read_pos = self.write_pos - lookback;
+        let start = read_pos * self.channels;
+        &self.storage[start..]
+    }
+
+    fn advance(&mut self, num_frames: usize) {
+        self.write_pos += num_frames;
+    }
+
+    fn rewind(&mut self) {
+        if self.max_lookback == 0 {
+            self.write_pos = 0;
+            return;
+        }
+        let ch = self.channels;
+        let copy_start = self.write_pos - self.max_lookback;
+        // Copy max_lookback columns from copy_start to position 0
+        for c in 0..self.max_lookback {
+            let src_off = (copy_start + c) * ch;
+            let dst_off = c * ch;
+            // Can't use copy_from_slice because regions may overlap, but since
+            // copy_start >= max_lookback (by C++ invariant), they don't overlap.
+            for i in 0..ch {
+                self.storage[dst_off + i] = self.storage[src_off + i];
+            }
+        }
+        self.write_pos = self.max_lookback;
+    }
+
+    #[allow(dead_code)]
+    fn zero(&mut self) {
+        self.storage.fill(0.0);
+        self.write_pos = self.max_lookback;
+    }
+}
+
 // ── Conv1x1 (with groups support) ───────────────────────────────────────────
 
 /// 1x1 convolution (pointwise linear layer) with optional grouped convolution.
-/// Weight matrix is stored as full [out_channels, in_channels] with block-diagonal
-/// structure for grouped conv (zeros off-diagonal).
+/// Weight stored in column-major order matching Eigen: weight[j * out_channels + i]
+/// means weight(i, j) = W[row=i, col=j].
 struct Conv1x1 {
-    weight: Vec<f32>, // [out_channels * in_channels] row-major (or block-diagonal)
+    /// Weights stored column-major: [out_channels * in_channels]
+    /// weight[j * out_ch + i] = W(i, j)
+    weight_colmajor: Vec<f32>,
     bias: Option<Vec<f32>>,
     out_channels: usize,
     in_channels: usize,
+    #[allow(dead_code)]
     groups: usize,
+    // Pre-allocated output buffer for block processing
+    output_buf: ColMajorMatrix,
 }
 
 impl Conv1x1 {
@@ -76,8 +215,9 @@ impl Conv1x1 {
         let out_per_group = out_channels / groups;
         let in_per_group = in_channels / groups;
 
-        // Store as full matrix with block-diagonal structure
-        let mut weight = vec![0.0f32; out_channels * in_channels];
+        // Build weight in column-major order matching Eigen layout
+        // Eigen column-major: W(i,j) at index j * out_channels + i
+        let mut weight_colmajor = vec![0.0f32; out_channels * in_channels];
 
         // C++ weight order: for group, for out_per_group, for in_per_group
         for g in 0..groups {
@@ -86,7 +226,8 @@ impl Conv1x1 {
                     let val = iter.take(1)?[0];
                     let row = g * out_per_group + i;
                     let col = g * in_per_group + j;
-                    weight[row * in_channels + col] = val;
+                    // column-major: index = col * out_channels + row
+                    weight_colmajor[col * out_channels + row] = val;
                 }
             }
         }
@@ -98,49 +239,85 @@ impl Conv1x1 {
         };
 
         Ok(Self {
-            weight,
+            weight_colmajor,
             bias,
             out_channels,
             in_channels,
             groups,
+            output_buf: ColMajorMatrix::new(out_channels, 1),
         })
     }
 
-    /// out = W @ in (+ bias). Single frame.
-    #[inline]
-    #[allow(clippy::needless_range_loop)]
-    fn forward(&self, input: &[f32], output: &mut [f32]) {
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.output_buf.resize(self.out_channels, max_buffer_size);
+    }
+
+    /// Block processing: output = W @ input (+ bias), column-major.
+    /// Input: (in_channels x num_frames), Output: written to self.output_buf
+    /// Matches Eigen: output.noalias() = weight * input; output.colwise() += bias;
+    fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
+        let w = &self.weight_colmajor;
 
-        if self.groups == 1 {
-            for i in 0..out_ch {
+        // GEMM: C = A @ B where A is (out_ch x in_ch), B is (in_ch x num_frames)
+        // Column-major: compute column by column
+        for f in 0..num_frames {
+            let in_col_start = f * input.rows; // Note: input.rows may differ from in_ch for topRows
+            let out_col_start = f * out_ch;
+
+            for o in 0..out_ch {
                 let mut sum = 0.0f32;
-                let row_start = i * in_ch;
-                for j in 0..in_ch {
-                    sum += self.weight[row_start + j] * input[j];
+                for i in 0..in_ch {
+                    // w[i * out_ch + o] = W(o, i) in column-major
+                    sum += w[i * out_ch + o] * input.data[in_col_start + i];
                 }
-                if let Some(ref b) = self.bias {
-                    sum += b[i];
-                }
-                output[i] = sum;
+                self.output_buf.data[out_col_start + o] = sum;
             }
-        } else {
-            let out_per_group = out_ch / self.groups;
-            let in_per_group = in_ch / self.groups;
-            for g in 0..self.groups {
-                for i in 0..out_per_group {
-                    let out_idx = g * out_per_group + i;
-                    let mut sum = 0.0f32;
-                    let row_start = out_idx * in_ch;
-                    let in_start = g * in_per_group;
-                    for j in 0..in_per_group {
-                        sum += self.weight[row_start + in_start + j] * input[in_start + j];
-                    }
-                    if let Some(ref b) = self.bias {
-                        sum += b[out_idx];
-                    }
-                    output[out_idx] = sum;
+        }
+
+        // Add bias
+        if let Some(ref b) = self.bias {
+            for f in 0..num_frames {
+                let col_start = f * out_ch;
+                for o in 0..out_ch {
+                    self.output_buf.data[col_start + o] += b[o];
+                }
+            }
+        }
+    }
+
+    /// Block processing with a sub-matrix of input (topRows).
+    /// input_stride is the actual row count of the input matrix (for reading columns).
+    /// We read only the first in_channels rows from each column.
+    fn process_block_with_stride(
+        &mut self,
+        input_data: &[f32],
+        input_stride: usize,
+        num_frames: usize,
+    ) {
+        let out_ch = self.out_channels;
+        let in_ch = self.in_channels;
+        let w = &self.weight_colmajor;
+
+        for f in 0..num_frames {
+            let in_col_start = f * input_stride;
+            let out_col_start = f * out_ch;
+
+            for o in 0..out_ch {
+                let mut sum = 0.0f32;
+                for i in 0..in_ch {
+                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                }
+                self.output_buf.data[out_col_start + o] = sum;
+            }
+        }
+
+        if let Some(ref b) = self.bias {
+            for f in 0..num_frames {
+                let col_start = f * out_ch;
+                for o in 0..out_ch {
+                    self.output_buf.data[col_start + o] += b[o];
                 }
             }
         }
@@ -150,17 +327,21 @@ impl Conv1x1 {
 // ── Conv1D (dilated, with groups support) ───────────────────────────────────
 
 /// Dilated 1D convolution with ring buffer. Supports grouped convolution.
-/// Weight stored per kernel tap as full [out_channels, in_channels] block-diagonal.
+/// Weight stored per kernel tap in column-major order matching Eigen.
 struct Conv1d {
-    /// Weight per kernel tap. weights[k] is [out_channels * in_channels] row-major.
-    weights: Vec<Vec<f32>>,
+    /// Weight per kernel tap. weights_colmajor[k] is column-major [out_ch * in_ch]
+    /// where W_k(i, j) = weights_colmajor[k][j * out_ch + i]
+    weights_colmajor: Vec<Vec<f32>>,
     bias: Vec<f32>,
     kernel_size: usize,
     dilation: usize,
     out_channels: usize,
     in_channels: usize,
-    #[allow(dead_code)] // retained for future block-based processing
+    #[allow(dead_code)]
     groups: usize,
+    // Block processing state
+    input_buffer: RingBuffer2D,
+    output_buf: ColMajorMatrix,
 }
 
 impl Conv1d {
@@ -175,7 +356,7 @@ impl Conv1d {
         let out_per_group = out_channels / groups;
         let in_per_group = in_channels / groups;
 
-        let mut tap_weights: Vec<Vec<f32>> = (0..kernel_size)
+        let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
             .map(|_| vec![0.0f32; out_channels * in_channels])
             .collect();
 
@@ -187,7 +368,8 @@ impl Conv1d {
                     let row = g * out_per_group + i;
                     let col = g * in_per_group + j;
                     for k in 0..kernel_size {
-                        tap_weights[k][row * in_channels + col] = taps[k];
+                        // column-major: index = col * out_channels + row
+                        tap_weights_colmajor[k][col * out_channels + row] = taps[k];
                     }
                 }
             }
@@ -196,19 +378,86 @@ impl Conv1d {
         let bias = iter.take(out_channels)?.to_vec();
 
         Ok(Self {
-            weights: tap_weights,
+            weights_colmajor: tap_weights_colmajor,
             bias,
             kernel_size,
             dilation,
             out_channels,
             in_channels,
             groups,
+            input_buffer: RingBuffer2D::new(),
+            output_buf: ColMajorMatrix::new(out_channels, 1),
         })
     }
 
     /// Receptive field (zero-indexed): dilation * (kernel_size - 1).
     fn receptive_field(&self) -> usize {
         self.dilation * (self.kernel_size - 1)
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        let rf = self.receptive_field();
+        self.input_buffer.set_max_lookback(rf);
+        self.input_buffer.reset(self.in_channels, max_buffer_size);
+        self.output_buf.resize(self.out_channels, max_buffer_size);
+    }
+
+    /// Block processing matching C++ Conv1D::Process.
+    /// 1. Write input to ring buffer
+    /// 2. For each kernel tap k: read from ring buffer with lookback, accumulate GEMM
+    /// 3. Add bias
+    fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
+        // Write input to ring buffer
+        self.input_buffer.write(input, num_frames);
+
+        let out_ch = self.out_channels;
+        let in_ch = self.in_channels;
+        let ks = self.kernel_size;
+        let dil = self.dilation;
+
+        // Initialize output to zero, then accumulate
+        let out_len = out_ch * num_frames;
+        self.output_buf.data[..out_len].fill(0.0);
+
+        for k in 0..ks {
+            // C++ offset = dilation * (k + 1 - kernel_size), lookback = -offset
+            let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
+            let lookback = (-offset_signed) as usize;
+
+            let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
+            let w = &self.weights_colmajor[k];
+
+            // GEMM: output += W_k @ tap_data
+            // W_k is (out_ch x in_ch) column-major, tap_data is (in_ch x num_frames) column-major
+            for f in 0..num_frames {
+                let in_col_start = f * in_ch;
+                let out_col_start = f * out_ch;
+
+                for o in 0..out_ch {
+                    let mut sum = 0.0f32;
+                    for i in 0..in_ch {
+                        sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+                    }
+                    self.output_buf.data[out_col_start + o] += sum;
+                }
+            }
+        }
+
+        // Add bias (colwise)
+        for f in 0..num_frames {
+            let col_start = f * out_ch;
+            for o in 0..out_ch {
+                self.output_buf.data[col_start + o] += self.bias[o];
+            }
+        }
+
+        // Advance ring buffer write pointer
+        self.input_buffer.advance(num_frames);
+    }
+
+    #[allow(dead_code)]
+    fn zero_state(&mut self) {
+        self.input_buffer.zero();
     }
 }
 
@@ -218,6 +467,8 @@ struct FiLM {
     cond_to_scale_shift: Conv1x1,
     do_shift: bool,
     input_dim: usize,
+    // Pre-allocated output buffer
+    output_buf: ColMajorMatrix,
 }
 
 impl FiLM {
@@ -235,31 +486,122 @@ impl FiLM {
             cond_to_scale_shift,
             do_shift: shift,
             input_dim,
+            output_buf: ColMajorMatrix::new(input_dim, 1),
         })
     }
 
-    /// Apply FiLM: output = input * scale (+ shift)
-    /// scale_shift_buf must be at least cond_to_scale_shift.out_channels long.
-    #[inline]
-    fn forward(
-        &self,
-        input: &[f32],
-        condition: &[f32],
-        output: &mut [f32],
-        scale_shift_buf: &mut [f32],
-    ) {
-        let ss_len = self.cond_to_scale_shift.out_channels;
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
         self.cond_to_scale_shift
-            .forward(condition, &mut scale_shift_buf[..ss_len]);
+            .set_max_buffer_size(max_buffer_size);
+        self.output_buf.resize(self.input_dim, max_buffer_size);
+    }
 
+    /// Block FiLM: output = input * scale (+ shift)
+    /// Writes result to self.output_buf (input_dim x num_frames, column-major)
+    fn process_block(
+        &mut self,
+        input: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        self.cond_to_scale_shift
+            .process_block(condition, num_frames);
+        let scale_shift = &self.cond_to_scale_shift.output_buf;
+        let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
+
         if self.do_shift {
-            for i in 0..dim {
-                output[i] = input[i] * scale_shift_buf[i] + scale_shift_buf[dim + i];
+            for f in 0..num_frames {
+                let in_off = f * input.rows;
+                let ss_off = f * ss_rows;
+                let out_off = f * dim;
+                for i in 0..dim {
+                    self.output_buf.data[out_off + i] = input.data[in_off + i]
+                        * scale_shift.data[ss_off + i]
+                        + scale_shift.data[ss_off + dim + i];
+                }
             }
         } else {
-            for i in 0..dim {
-                output[i] = input[i] * scale_shift_buf[i];
+            for f in 0..num_frames {
+                let in_off = f * input.rows;
+                let ss_off = f * ss_rows;
+                let out_off = f * dim;
+                for i in 0..dim {
+                    self.output_buf.data[out_off + i] =
+                        input.data[in_off + i] * scale_shift.data[ss_off + i];
+                }
+            }
+        }
+    }
+
+    /// Block FiLM with input data that has a different stride (e.g. topRows of a larger matrix)
+    fn process_block_with_stride(
+        &mut self,
+        input_data: &[f32],
+        input_stride: usize,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        self.cond_to_scale_shift
+            .process_block(condition, num_frames);
+        let scale_shift = &self.cond_to_scale_shift.output_buf;
+        let ss_rows = self.cond_to_scale_shift.out_channels;
+        let dim = self.input_dim;
+
+        if self.do_shift {
+            for f in 0..num_frames {
+                let in_off = f * input_stride;
+                let ss_off = f * ss_rows;
+                let out_off = f * dim;
+                for i in 0..dim {
+                    self.output_buf.data[out_off + i] = input_data[in_off + i]
+                        * scale_shift.data[ss_off + i]
+                        + scale_shift.data[ss_off + dim + i];
+                }
+            }
+        } else {
+            for f in 0..num_frames {
+                let in_off = f * input_stride;
+                let ss_off = f * ss_rows;
+                let out_off = f * dim;
+                for i in 0..dim {
+                    self.output_buf.data[out_off + i] =
+                        input_data[in_off + i] * scale_shift.data[ss_off + i];
+                }
+            }
+        }
+    }
+
+    /// In-place FiLM: modifies target_data in-place
+    fn process_block_inplace(
+        &mut self,
+        target_data: &mut [f32],
+        target_stride: usize,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        self.cond_to_scale_shift
+            .process_block(condition, num_frames);
+        let scale_shift = &self.cond_to_scale_shift.output_buf;
+        let ss_rows = self.cond_to_scale_shift.out_channels;
+        let dim = self.input_dim;
+
+        if self.do_shift {
+            for f in 0..num_frames {
+                let t_off = f * target_stride;
+                let ss_off = f * ss_rows;
+                for i in 0..dim {
+                    target_data[t_off + i] = target_data[t_off + i] * scale_shift.data[ss_off + i]
+                        + scale_shift.data[ss_off + dim + i];
+                }
+            }
+        } else {
+            for f in 0..num_frames {
+                let t_off = f * target_stride;
+                let ss_off = f * ss_rows;
+                for i in 0..dim {
+                    target_data[t_off + i] *= scale_shift.data[ss_off + i];
+                }
             }
         }
     }
@@ -275,7 +617,6 @@ struct WaveNetLayer {
     activation: Activation,
     secondary_activation: Activation,
     gating_mode: GatingMode,
-    #[allow(dead_code)]
     channels: usize,
     bottleneck: usize,
     #[allow(dead_code)]
@@ -290,6 +631,14 @@ struct WaveNetLayer {
     activation_post_film: Option<FiLM>,
     layer1x1_post_film: Option<FiLM>,
     head1x1_post_film: Option<FiLM>,
+
+    // Skip the head copy optimization (C++ _skip_head_copy)
+    skip_head_copy: bool,
+
+    // Pre-allocated block processing buffers
+    z_buf: ColMajorMatrix,
+    output_next_layer: ColMajorMatrix,
+    output_head: ColMajorMatrix,
 }
 
 impl WaveNetLayer {
@@ -462,6 +811,9 @@ impl WaveNetLayer {
             None
         };
 
+        // C++ _skip_head_copy: when no head1x1 and no gating, GetOutputHead returns _z directly
+        let skip_head_copy = !head1x1_params.active && gating_mode == GatingMode::None;
+
         Ok(Self {
             conv,
             input_mixin,
@@ -481,7 +833,288 @@ impl WaveNetLayer {
             activation_post_film,
             layer1x1_post_film,
             head1x1_post_film,
+            skip_head_copy,
+            z_buf: ColMajorMatrix::new(conv_out, 1),
+            output_next_layer: ColMajorMatrix::new(channels, 1),
+            output_head: ColMajorMatrix::new(head_output_size, 1),
         })
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.conv.set_max_buffer_size(max_buffer_size);
+        self.input_mixin.set_max_buffer_size(max_buffer_size);
+
+        let z_channels = self.conv.out_channels;
+        self.z_buf.resize(z_channels, max_buffer_size);
+
+        if let Some(ref mut l) = self.layer1x1 {
+            l.set_max_buffer_size(max_buffer_size);
+        }
+
+        let channels = self.channels;
+        self.output_next_layer.resize(channels, max_buffer_size);
+
+        if let Some(ref mut h) = self.head1x1 {
+            self.output_head.resize(h.out_channels, max_buffer_size);
+            h.set_max_buffer_size(max_buffer_size);
+        } else {
+            self.output_head.resize(self.bottleneck, max_buffer_size);
+        }
+
+        // FiLM set_max_buffer_size
+        if let Some(ref mut f) = self.conv_pre_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.conv_post_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.input_mixin_pre_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.input_mixin_post_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.activation_pre_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.activation_post_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.layer1x1_post_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut f) = self.head1x1_post_film {
+            f.set_max_buffer_size(max_buffer_size);
+        }
+    }
+
+    /// Block processing matching C++ _Layer::Process.
+    /// input: (channels x num_frames), condition: (condition_size x num_frames)
+    /// Results stored in self.output_next_layer and self.output_head.
+    fn process_block(
+        &mut self,
+        input: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        let bottleneck = self.bottleneck;
+        let z_rows = self.conv.out_channels; // 2*bottleneck when gated, bottleneck when not
+
+        // Step 1: Input convolution
+        if let Some(ref mut film) = self.conv_pre_film {
+            // FiLM modulate input, then conv
+            film.process_block(input, condition, num_frames);
+            self.conv.process_block(&film.output_buf, num_frames);
+        } else {
+            self.conv.process_block(input, num_frames);
+        }
+
+        if let Some(ref mut film) = self.conv_post_film {
+            // In-place modulate conv output
+            film.process_block_inplace(
+                &mut self.conv.output_buf.data,
+                self.conv.out_channels,
+                condition,
+                num_frames,
+            );
+        }
+
+        // Step 2: Input mixin
+        if let Some(ref mut film) = self.input_mixin_pre_film {
+            // FiLM modulate condition, then mixin
+            film.process_block(condition, condition, num_frames);
+            self.input_mixin.process_block(&film.output_buf, num_frames);
+        } else {
+            self.input_mixin.process_block(condition, num_frames);
+        }
+
+        if let Some(ref mut film) = self.input_mixin_post_film {
+            film.process_block_inplace(
+                &mut self.input_mixin.output_buf.data,
+                self.input_mixin.out_channels,
+                condition,
+                num_frames,
+            );
+        }
+
+        // z = conv_output + mixin_output
+        let z_len = z_rows * num_frames;
+        for i in 0..z_len {
+            self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+        }
+
+        // Optional activation_pre_film
+        if let Some(ref mut film) = self.activation_pre_film {
+            film.process_block_inplace(&mut self.z_buf.data, z_rows, condition, num_frames);
+        }
+
+        // Step 3: Activation + gating/blending
+        match self.gating_mode {
+            GatingMode::None => {
+                // Apply activation in-place to z
+                self.activation.apply_colmajor_inplace(
+                    &mut self.z_buf.data,
+                    bottleneck,
+                    num_frames,
+                );
+
+                // Optional activation_post_film
+                if let Some(ref mut film) = self.activation_post_film {
+                    film.process_block_inplace(&mut self.z_buf.data, z_rows, condition, num_frames);
+                }
+
+                // layer1x1
+                if let Some(ref mut l1x1) = self.layer1x1 {
+                    l1x1.process_block(&self.z_buf, num_frames);
+                }
+            }
+            GatingMode::Gated => {
+                // Gating: top bottleneck = primary activation, bottom bottleneck = secondary
+                // output[i] = primary(z[i]) * secondary(z[i + bottleneck])
+                // Process column by column to match C++ per-sample gating
+                for f in 0..num_frames {
+                    let z_off = f * z_rows;
+                    for c in 0..bottleneck {
+                        let primary = self
+                            .activation
+                            .apply_scalar_channel(self.z_buf.data[z_off + c], c);
+                        let gate = self
+                            .secondary_activation
+                            .apply_scalar_channel(self.z_buf.data[z_off + bottleneck + c], c);
+                        // Store result in top rows of z
+                        self.z_buf.data[z_off + c] = primary * gate;
+                    }
+                }
+
+                // activation_post_film on topRows(bottleneck)
+                if let Some(ref mut film) = self.activation_post_film {
+                    // C++: Process() then copy back (non-inplace for gated/blended)
+                    film.process_block_with_stride(&self.z_buf.data, z_rows, condition, num_frames);
+                    // Copy back to z topRows
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        let film_off = f * bottleneck;
+                        self.z_buf.data[z_off..z_off + bottleneck].copy_from_slice(
+                            &film.output_buf.data[film_off..film_off + bottleneck],
+                        );
+                    }
+                }
+
+                // layer1x1 processes topRows(bottleneck)
+                if let Some(ref mut l1x1) = self.layer1x1 {
+                    l1x1.process_block_with_stride(&self.z_buf.data, z_rows, num_frames);
+                }
+            }
+            GatingMode::Blended => {
+                // Blending: alpha * activated + (1-alpha) * pre_activation
+                for f in 0..num_frames {
+                    let z_off = f * z_rows;
+                    for c in 0..bottleneck {
+                        let pre_act = self.z_buf.data[z_off + c];
+                        let activated = self.activation.apply_scalar_channel(pre_act, c);
+                        let alpha = self
+                            .secondary_activation
+                            .apply_scalar_channel(self.z_buf.data[z_off + bottleneck + c], c);
+                        self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
+                    }
+                }
+
+                // activation_post_film
+                if let Some(ref mut film) = self.activation_post_film {
+                    film.process_block_with_stride(&self.z_buf.data, z_rows, condition, num_frames);
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        let film_off = f * bottleneck;
+                        self.z_buf.data[z_off..z_off + bottleneck].copy_from_slice(
+                            &film.output_buf.data[film_off..film_off + bottleneck],
+                        );
+                    }
+                }
+
+                // layer1x1
+                if let Some(ref mut l1x1) = self.layer1x1 {
+                    l1x1.process_block_with_stride(&self.z_buf.data, z_rows, num_frames);
+
+                    // layer1x1_post_film only in BLENDED mode (matching C++)
+                    if let Some(ref mut film) = self.layer1x1_post_film {
+                        film.process_block_inplace(
+                            &mut l1x1.output_buf.data,
+                            l1x1.out_channels,
+                            condition,
+                            num_frames,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Step 4: Head output (head1x1 or direct from z/activated)
+        if let Some(ref mut h1x1) = self.head1x1 {
+            if self.gating_mode == GatingMode::None {
+                h1x1.process_block(&self.z_buf, num_frames);
+            } else {
+                h1x1.process_block_with_stride(&self.z_buf.data, z_rows, num_frames);
+            }
+
+            if let Some(ref mut film) = self.head1x1_post_film {
+                film.process_block_inplace(
+                    &mut h1x1.output_buf.data,
+                    h1x1.out_channels,
+                    condition,
+                    num_frames,
+                );
+            }
+
+            // Copy to output_head
+            let h_out = h1x1.out_channels;
+            let len = h_out * num_frames;
+            self.output_head.data[..len].copy_from_slice(&h1x1.output_buf.data[..len]);
+        } else if !self.skip_head_copy {
+            // Copy from z (topRows if gated)
+            let head_rows = self.output_head.rows;
+            if self.gating_mode == GatingMode::None {
+                let len = head_rows * num_frames;
+                self.output_head.data[..len].copy_from_slice(&self.z_buf.data[..len]);
+            } else {
+                // Copy topRows(bottleneck) from z which has z_rows stride
+                for f in 0..num_frames {
+                    let z_off = f * z_rows;
+                    let out_off = f * head_rows;
+                    self.output_head.data[out_off..out_off + head_rows]
+                        .copy_from_slice(&self.z_buf.data[z_off..z_off + head_rows]);
+                }
+            }
+        }
+        // If skip_head_copy, output_head is z itself (caller reads from z_buf)
+
+        // Step 5: Output to next layer = input + layer1x1_output (or just input)
+        let ch = self.channels;
+        if let Some(ref l1x1) = self.layer1x1 {
+            let total = ch * num_frames;
+            for i in 0..total {
+                self.output_next_layer.data[i] = input.data[i] + l1x1.output_buf.data[i];
+            }
+        } else {
+            let total = ch * num_frames;
+            self.output_next_layer.data[..total].copy_from_slice(&input.data[..total]);
+        }
+    }
+
+    /// Get head output data (may be z_buf if skip_head_copy)
+    fn get_output_head_data(&self) -> &[f32] {
+        if self.skip_head_copy {
+            &self.z_buf.data
+        } else {
+            &self.output_head.data
+        }
+    }
+
+    fn get_output_head_rows(&self) -> usize {
+        if self.skip_head_copy {
+            self.z_buf.rows
+        } else {
+            self.output_head.rows
+        }
     }
 }
 
@@ -516,49 +1149,115 @@ struct WaveNetLayerArray {
     head_rechannel: Conv1x1,
     channels: usize,
     head_output_size: usize, // head1x1.out_channels if active, else bottleneck
+
+    // Pre-allocated block buffers
+    layer_outputs: ColMajorMatrix,
+    head_inputs: ColMajorMatrix,
 }
 
 impl WaveNetLayerArray {
     fn receptive_field(&self) -> usize {
         self.layers.iter().map(|l| l.conv.receptive_field()).sum()
     }
-}
 
-// ── Ring buffer for Conv1D history ──────────────────────────────────────────
-
-struct RingBuffer {
-    data: Vec<Vec<f32>>, // [buffer_size][channels]
-    pos: usize,
-    size: usize,
-}
-
-impl RingBuffer {
-    fn new(size: usize, channels: usize) -> Self {
-        Self {
-            data: vec![vec![0.0; channels]; size],
-            pos: 0,
-            size,
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.rechannel.set_max_buffer_size(max_buffer_size);
+        self.head_rechannel.set_max_buffer_size(max_buffer_size);
+        for layer in &mut self.layers {
+            layer.set_max_buffer_size(max_buffer_size);
         }
+        self.layer_outputs.resize(self.channels, max_buffer_size);
+        self.head_inputs
+            .resize(self.head_output_size, max_buffer_size);
     }
 
-    fn push(&mut self, frame: &[f32]) {
-        self.data[self.pos].copy_from_slice(frame);
-        self.pos = (self.pos + 1) % self.size;
+    /// Process without previous head input (first layer array).
+    /// Matches C++ _LayerArray::Process (2-arg version)
+    fn process_first(
+        &mut self,
+        layer_inputs: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        // Zero head inputs accumulator
+        self.head_inputs.zero_cols(num_frames);
+        self.process_inner(layer_inputs, condition, num_frames);
     }
 
-    /// Get frame at `offset` steps before the current write position.
-    /// offset=0 means the most recently pushed frame.
-    #[inline]
-    fn get(&self, offset: usize) -> &[f32] {
-        let idx = (self.pos + self.size - 1 - offset) % self.size;
-        &self.data[idx]
+    /// Process with previous head input (subsequent layer arrays).
+    /// Matches C++ _LayerArray::Process (3-arg version)
+    fn process_subsequent(
+        &mut self,
+        layer_inputs: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        head_inputs: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        // Copy head inputs from previous layer array
+        let len = self.head_output_size * num_frames;
+        self.head_inputs.data[..len].copy_from_slice(&head_inputs.data[..len]);
+        self.process_inner(layer_inputs, condition, num_frames);
     }
 
-    fn reset(&mut self) {
-        for frame in &mut self.data {
-            frame.fill(0.0);
+    /// Common inner processing. Matches C++ _LayerArray::ProcessInner
+    fn process_inner(
+        &mut self,
+        layer_inputs: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        num_frames: usize,
+    ) {
+        // Rechannel: project input to layer channels
+        self.rechannel.process_block(layer_inputs, num_frames);
+
+        // Process layers
+        let num_layers = self.layers.len();
+
+        // We need to handle the borrowing carefully.
+        // Layer i reads from: rechannel output (if i==0) or layer[i-1].output_next_layer
+        // Layer i writes to: its own output_next_layer and output_head
+        // Head inputs accumulate from each layer's output_head
+
+        for i in 0..num_layers {
+            // Get the input for this layer
+            // We use unsafe to work around the borrow checker, since we're reading from
+            // layer[i-1].output_next_layer while writing to layer[i].
+            // This is safe because we're accessing different layers.
+            if i == 0 {
+                // First layer uses rechannel output
+                let input_ptr = &self.rechannel.output_buf as *const ColMajorMatrix;
+                let layer = &mut self.layers[i];
+                layer.process_block(unsafe { &*input_ptr }, condition, num_frames);
+            } else {
+                // Subsequent layers use previous layer's output
+                let prev_output = &self.layers[i - 1].output_next_layer as *const ColMajorMatrix;
+                let layer = &mut self.layers[i];
+                layer.process_block(unsafe { &*prev_output }, condition, num_frames);
+            }
+
+            // Accumulate head output from this layer
+            let head_out_size = self.head_output_size;
+            let layer = &self.layers[i];
+            let head_data = layer.get_output_head_data();
+            let head_rows = layer.get_output_head_rows();
+            for f in 0..num_frames {
+                let src_off = f * head_rows;
+                let dst_off = f * head_out_size;
+                for c in 0..head_out_size {
+                    self.head_inputs.data[dst_off + c] += head_data[src_off + c];
+                }
+            }
         }
-        self.pos = 0;
+
+        // Store output from last layer
+        let last = num_layers - 1;
+        let ch = self.channels;
+        let len = ch * num_frames;
+        self.layer_outputs.data[..len]
+            .copy_from_slice(&self.layers[last].output_next_layer.data[..len]);
+
+        // Head rechannel
+        self.head_rechannel
+            .process_block(&self.head_inputs, num_frames);
     }
 }
 
@@ -569,31 +1268,15 @@ pub struct WaveNet {
     head_scale: f32,
     prewarm_samples_count: usize,
     metadata: DspMetadata,
+    in_channels: usize,
 
     // Optional condition DSP
     condition_dsp: Option<Box<dyn Dsp>>,
 
-    // Per-layer-array ring buffers for the dilated conv history.
-    ring_buffers: Vec<Vec<RingBuffer>>,
-
-    // Scratch buffers (pre-allocated, reused each sample)
-    condition_input_buf: Vec<f32>,  // [in_channels] (raw input)
-    condition_output_buf: Vec<f32>, // [condition_size] (after condition_dsp)
-    rechannel_buf: Vec<f32>,
-    conv_out_buf: Vec<f32>,
-    mixin_out_buf: Vec<f32>,
-    z_buf: Vec<f32>,
-    activated_buf: Vec<f32>,
-    layer1x1_buf: Vec<f32>,
-    head1x1_buf: Vec<f32>,
-    residual_buf: Vec<f32>,
-    head_accum_buf: Vec<f32>,
-    head_rechannel_buf: Vec<f32>,
-    prev_layer_output: Vec<f32>,
-    prev_head_output: Vec<f32>,
-    film_scratch_buf: Vec<f32>, // scratch for FiLM scale/shift computation
-    film_input_buf: Vec<f32>,   // scratch for FiLM input modulation
-    film_condition_buf: Vec<f32>, // scratch for condition modulation via FiLM
+    // Block processing buffers
+    condition_input: ColMajorMatrix,
+    condition_output: ColMajorMatrix,
+    max_buffer_size: usize,
 }
 
 impl WaveNet {
@@ -617,14 +1300,12 @@ impl WaveNet {
 
         let mut iter = WeightIter::new(weights);
         let mut layer_arrays = Vec::new();
-        let mut ring_buffers_all = Vec::new();
-        let mut max_conv_out = 0usize;
-        let mut max_channels = 0usize;
-        let mut max_bottleneck = 0usize;
-        let mut max_head_output_size = 0usize;
-        let mut max_head_size = 0usize;
         let mut condition_size = 0usize;
-        let mut max_film_scratch = 0usize;
+
+        let in_channels = config
+            .get("in_channels")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as usize;
 
         for la_json in layers_json {
             let input_size = la_json["input_size"].as_u64().unwrap() as usize;
@@ -751,45 +1432,15 @@ impl WaveNet {
             };
 
             condition_size = cond_size;
-            let conv_out = if gating_modes.iter().any(|g| *g != GatingMode::None) {
-                2 * bottleneck
-            } else {
-                bottleneck
-            };
-            max_conv_out = max_conv_out.max(conv_out);
-            max_channels = max_channels.max(channels);
-            max_bottleneck = max_bottleneck.max(bottleneck);
-            max_head_output_size = max_head_output_size.max(head_out_size);
-            max_head_size = max_head_size.max(head_size);
-
-            // Estimate max FiLM scratch needed
-            let max_film_dim = [
-                channels * 2,
-                conv_out * 2,
-                cond_size * 2,
-                bottleneck * 2,
-                head_out_size * 2,
-            ]
-            .into_iter()
-            .max()
-            .unwrap_or(0);
-            max_film_scratch = max_film_scratch.max(max_film_dim);
 
             // Build layer array
             // Per C++ weight order: rechannel, then each layer, then head_rechannel
             let rechannel = Conv1x1::from_weights(input_size, channels, false, 1, &mut iter)?;
 
             let mut layers = Vec::new();
-            let mut ring_bufs = Vec::new();
 
             for (layer_idx, &dil) in dilations.iter().enumerate() {
                 let layer_gating = gating_modes[layer_idx];
-                let layer_conv_out = if layer_gating != GatingMode::None {
-                    2 * bottleneck
-                } else {
-                    bottleneck
-                };
-                max_conv_out = max_conv_out.max(layer_conv_out);
 
                 let layer = WaveNetLayer::from_weights(
                     channels,
@@ -809,8 +1460,6 @@ impl WaveNet {
                     &mut iter,
                 )?;
 
-                let rf = layer.conv.receptive_field();
-                ring_bufs.push(RingBuffer::new(rf + 1, channels));
                 layers.push(layer);
             }
 
@@ -823,8 +1472,9 @@ impl WaveNet {
                 head_rechannel,
                 channels,
                 head_output_size: head_out_size,
+                layer_outputs: ColMajorMatrix::new(channels, 1),
+                head_inputs: ColMajorMatrix::new(head_out_size, 1),
             });
-            ring_buffers_all.push(ring_bufs);
         }
 
         let head_scale_from_weights = iter.take(1)?[0];
@@ -843,354 +1493,207 @@ impl WaveNet {
                 .map(|la| la.receptive_field())
                 .sum::<usize>();
 
-        let in_channels = 1; // NAM standard
+        // Determine condition output channels
+        let cond_out_ch = if let Some(ref cdsp) = condition_dsp {
+            cdsp.num_output_channels()
+        } else {
+            in_channels
+        };
 
         Ok(Self {
             layer_arrays,
             head_scale,
             prewarm_samples_count,
             metadata,
+            in_channels,
             condition_dsp,
-            ring_buffers: ring_buffers_all,
-            condition_input_buf: vec![0.0; in_channels.max(1)],
-            condition_output_buf: vec![0.0; condition_size.max(1)],
-            rechannel_buf: vec![0.0; max_channels],
-            conv_out_buf: vec![0.0; max_conv_out],
-            mixin_out_buf: vec![0.0; max_conv_out],
-            z_buf: vec![0.0; max_conv_out],
-            activated_buf: vec![0.0; max_bottleneck],
-            layer1x1_buf: vec![0.0; max_channels],
-            head1x1_buf: vec![0.0; max_head_output_size],
-            residual_buf: vec![0.0; max_channels],
-            head_accum_buf: vec![0.0; max_head_output_size],
-            head_rechannel_buf: vec![0.0; max_head_size],
-            prev_layer_output: vec![0.0; max_channels],
-            prev_head_output: vec![0.0; max_head_size],
-            film_scratch_buf: vec![0.0; max_film_scratch + 64],
-            film_input_buf: vec![0.0; max_conv_out.max(max_channels).max(condition_size) + 64],
-            film_condition_buf: vec![0.0; condition_size.max(1) + 64],
+            condition_input: ColMajorMatrix::new(in_channels, 1),
+            condition_output: ColMajorMatrix::new(cond_out_ch.max(condition_size), 1),
+            max_buffer_size: 0,
         })
     }
 
-    fn process_sample(&mut self, input_sample: f32) -> f32 {
-        // Condition input
-        self.condition_input_buf[0] = input_sample;
+    fn ensure_buffer_size(&mut self, num_frames: usize) {
+        if num_frames <= self.max_buffer_size {
+            return;
+        }
+        // Growing the buffer size requires re-initializing ring buffers,
+        // which loses accumulated state. This mirrors C++ behavior where
+        // SetMaxBufferSize is called during Reset before prewarm.
+        self.set_max_buffer_size_internal(num_frames);
+    }
 
-        // Process condition DSP if present
+    fn set_max_buffer_size_internal(&mut self, max_buffer_size: usize) {
+        self.max_buffer_size = max_buffer_size;
+
+        self.condition_input
+            .resize(self.in_channels, max_buffer_size);
+        let cond_rows = self.condition_output.rows;
+        self.condition_output.resize(cond_rows, max_buffer_size);
+
+        for la in &mut self.layer_arrays {
+            la.set_max_buffer_size(max_buffer_size);
+        }
+    }
+
+    /// Block processing matching C++ WaveNet::process
+    fn process_block(&mut self, input: &[Sample], output: &mut [Sample]) {
+        let num_frames = input.len();
+        if num_frames == 0 {
+            return;
+        }
+
+        self.ensure_buffer_size(num_frames);
+
+        // Step 1: Fill condition_input (in_channels x num_frames)
+        // For standard NAM, in_channels = 1, so each column has one element
+        let in_ch = self.in_channels;
+        for f in 0..num_frames {
+            let col_start = f * in_ch;
+            self.condition_input.data[col_start] = input[f] as f32;
+            // Zero remaining channels if any (unlikely for NAM)
+            for c in 1..in_ch {
+                self.condition_input.data[col_start + c] = 0.0;
+            }
+        }
+
+        // Step 2: Process condition
         if let Some(ref mut cdsp) = self.condition_dsp {
-            let cond_len = self.condition_output_buf.len();
+            // Process condition_dsp per-sample for multi-channel output
+            let cond_out_ch = cdsp.num_output_channels();
+            for f in 0..num_frames {
+                let in_sample = input[f];
+                let col_start = f * self.condition_output.rows;
+                cdsp.process_sample_multi_channel(
+                    in_sample,
+                    &mut self.condition_output.data[col_start..col_start + cond_out_ch],
+                );
+            }
+        } else {
+            // No condition DSP: condition_output = condition_input
+            let cond_rows = self.condition_output.rows;
+            let in_rows = self.condition_input.rows;
+            let copy_rows = cond_rows.min(in_rows);
+            for f in 0..num_frames {
+                let cond_off = f * cond_rows;
+                let in_off = f * in_rows;
+                self.condition_output.data[cond_off..cond_off + copy_rows]
+                    .copy_from_slice(&self.condition_input.data[in_off..in_off + copy_rows]);
+            }
+        }
+
+        // Step 3: Process layer arrays
+        let num_arrays = self.layer_arrays.len();
+
+        for arr_idx in 0..num_arrays {
+            if arr_idx == 0 {
+                // First layer array: use condition_input as layer_inputs, condition_output as condition
+                let cond_input_ptr = &self.condition_input as *const ColMajorMatrix;
+                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
+                self.layer_arrays[arr_idx].process_first(
+                    unsafe { &*cond_input_ptr },
+                    unsafe { &*cond_output_ptr },
+                    num_frames,
+                );
+            } else {
+                // Subsequent: use previous array's layer_outputs and head_outputs
+                let prev_layer_outputs =
+                    &self.layer_arrays[arr_idx - 1].layer_outputs as *const ColMajorMatrix;
+                let prev_head_outputs = &self.layer_arrays[arr_idx - 1].head_rechannel.output_buf
+                    as *const ColMajorMatrix;
+                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
+                self.layer_arrays[arr_idx].process_subsequent(
+                    unsafe { &*prev_layer_outputs },
+                    unsafe { &*cond_output_ptr },
+                    unsafe { &*prev_head_outputs },
+                    num_frames,
+                );
+            }
+        }
+
+        // Step 4: Extract output from final head
+        let last = num_arrays - 1;
+        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
+        let out_ch = self.layer_arrays[last].head_rechannel.out_channels;
+
+        // For single-channel output (typical NAM): data is contiguous
+        if out_ch == 1 {
+            let scale = self.head_scale;
+            for s in 0..num_frames {
+                output[s] = (scale * final_head.data[s]) as Sample;
+            }
+        } else {
+            // Multi-channel: take first channel (or scale all)
+            let scale = self.head_scale;
+            for s in 0..num_frames {
+                output[s] = (scale * final_head.data[s * out_ch]) as Sample;
+            }
+        }
+    }
+
+    /// Per-sample processing (fallback for process_sample_multi_channel).
+    /// Uses the block path with num_frames=1.
+    fn process_sample_for_multi_channel(&mut self, input_sample: f32) {
+        self.ensure_buffer_size(1);
+
+        let in_ch = self.in_channels;
+        self.condition_input.data[0] = input_sample;
+        for c in 1..in_ch {
+            self.condition_input.data[c] = 0.0;
+        }
+
+        // Process condition
+        if let Some(ref mut cdsp) = self.condition_dsp {
+            let cond_out_ch = cdsp.num_output_channels();
             cdsp.process_sample_multi_channel(
                 input_sample as Sample,
-                &mut self.condition_output_buf[..cond_len],
+                &mut self.condition_output.data[..cond_out_ch],
             );
         } else {
-            // No condition DSP: condition = raw input
-            let cond_len = self.condition_output_buf.len();
-            self.condition_output_buf[..cond_len.min(self.condition_input_buf.len())]
-                .copy_from_slice(
-                    &self.condition_input_buf[..cond_len.min(self.condition_input_buf.len())],
+            let cond_rows = self.condition_output.rows;
+            let in_rows = self.condition_input.rows;
+            let copy_rows = cond_rows.min(in_rows);
+            self.condition_output.data[..copy_rows]
+                .copy_from_slice(&self.condition_input.data[..copy_rows]);
+        }
+
+        // Process layer arrays with num_frames=1
+        let num_arrays = self.layer_arrays.len();
+        for arr_idx in 0..num_arrays {
+            if arr_idx == 0 {
+                let cond_input_ptr = &self.condition_input as *const ColMajorMatrix;
+                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
+                self.layer_arrays[arr_idx].process_first(
+                    unsafe { &*cond_input_ptr },
+                    unsafe { &*cond_output_ptr },
+                    1,
                 );
-        }
-
-        let mut _final_head_size = 0usize;
-
-        for (arr_idx, la) in self.layer_arrays.iter().enumerate() {
-            let channels = la.channels;
-            let head_output_size = la.head_output_size;
-            let head_size = la.head_rechannel.out_channels;
-            _final_head_size = head_size;
-
-            // Rechannel: project input to channels
-            // C++: first array uses condition_input; subsequent use prev layer output
-            let rechannel_input = if arr_idx == 0 {
-                &self.condition_input_buf[..]
             } else {
-                &self.prev_layer_output[..self.layer_arrays[arr_idx - 1].channels]
-            };
-
-            la.rechannel
-                .forward(rechannel_input, &mut self.rechannel_buf[..channels]);
-
-            // Zero head accumulator
-            self.head_accum_buf[..head_output_size].fill(0.0);
-
-            // If subsequent array, copy previous head output
-            if arr_idx > 0 {
-                let prev_head_size = self.layer_arrays[arr_idx - 1].head_rechannel.out_channels;
-                let copy_size = head_output_size.min(prev_head_size);
-                self.head_accum_buf[..copy_size]
-                    .copy_from_slice(&self.prev_head_output[..copy_size]);
+                let prev_layer_outputs =
+                    &self.layer_arrays[arr_idx - 1].layer_outputs as *const ColMajorMatrix;
+                let prev_head_outputs = &self.layer_arrays[arr_idx - 1].head_rechannel.output_buf
+                    as *const ColMajorMatrix;
+                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
+                self.layer_arrays[arr_idx].process_subsequent(
+                    unsafe { &*prev_layer_outputs },
+                    unsafe { &*cond_output_ptr },
+                    unsafe { &*prev_head_outputs },
+                    1,
+                );
             }
-
-            // Process each layer
-            for (layer_idx, layer) in la.layers.iter().enumerate() {
-                let conv = &layer.conv;
-                let dilation = conv.dilation;
-                let kernel_size = conv.kernel_size;
-                let conv_out_ch = conv.out_channels;
-                let bottleneck = layer.bottleneck;
-                let gating_mode = layer.gating_mode;
-
-                // Push current input into ring buffer
-                if layer_idx == 0 {
-                    self.ring_buffers[arr_idx][layer_idx].push(&self.rechannel_buf[..channels]);
-                } else {
-                    self.ring_buffers[arr_idx][layer_idx].push(&self.residual_buf[..channels]);
-                }
-
-                // ── Step 1: Dilated convolution ──
-                // Optional conv_pre_film: modulate input before conv
-                if let Some(ref film) = layer.conv_pre_film {
-                    // We need to apply FiLM to each input frame read from ring buffer.
-                    // For the per-sample processing, we modulate the current frame that was just pushed.
-                    // Actually in the C++ block processing, conv_pre_film modulates the whole input
-                    // before the conv reads it. In per-sample mode, we need to modulate the ring buffer
-                    // content. Since the conv reads multiple taps from the ring buffer, we'd need
-                    // to modulate each tap separately, which is expensive and different from the
-                    // block-processing C++ approach.
-                    //
-                    // A simpler approach: for per-sample mode, we can modulate the most recently
-                    // pushed frame in the ring buffer (the only one that changes between samples).
-                    // This is correct for causal processing because each frame only gets modulated once
-                    // when it enters the buffer.
-                    let rb = &self.ring_buffers[arr_idx][layer_idx];
-                    let frame = rb.get(0);
-                    self.film_input_buf[..channels].copy_from_slice(&frame[..channels]);
-                    film.forward(
-                        &self.film_input_buf[..channels],
-                        &self.condition_output_buf,
-                        &mut self.film_condition_buf[..channels],
-                        &mut self.film_scratch_buf,
-                    );
-                    // Overwrite the ring buffer frame
-                    // Safety: we just pushed this frame, so we can overwrite it
-                    let rb = &mut self.ring_buffers[arr_idx][layer_idx];
-                    let pos = (rb.pos + rb.size - 1) % rb.size;
-                    rb.data[pos][..channels].copy_from_slice(&self.film_condition_buf[..channels]);
-                }
-
-                // Dilated convolution: read from ring buffer
-                self.conv_out_buf[..conv_out_ch].copy_from_slice(&conv.bias[..conv_out_ch]);
-
-                for k in 0..kernel_size {
-                    let offset = dilation * (kernel_size - 1 - k);
-                    let frame = self.ring_buffers[arr_idx][layer_idx].get(offset);
-
-                    let w = &conv.weights[k];
-                    let in_ch = conv.in_channels;
-                    for i in 0..conv_out_ch {
-                        let mut sum = 0.0f32;
-                        let row_start = i * in_ch;
-                        for j in 0..in_ch {
-                            sum += w[row_start + j] * frame[j];
-                        }
-                        self.conv_out_buf[i] += sum;
-                    }
-                }
-
-                // Optional conv_post_film
-                if let Some(ref film) = layer.conv_post_film {
-                    self.film_input_buf[..conv_out_ch]
-                        .copy_from_slice(&self.conv_out_buf[..conv_out_ch]);
-                    film.forward(
-                        &self.film_input_buf[..conv_out_ch],
-                        &self.condition_output_buf,
-                        &mut self.conv_out_buf[..conv_out_ch],
-                        &mut self.film_scratch_buf,
-                    );
-                }
-
-                // ── Step 2: Input mixin ──
-                // Optional input_mixin_pre_film
-                let mixin_condition = if let Some(ref film) = layer.input_mixin_pre_film {
-                    let cond_len = self.condition_output_buf.len();
-                    self.film_condition_buf[..cond_len]
-                        .copy_from_slice(&self.condition_output_buf[..cond_len]);
-                    film.forward(
-                        &self.film_condition_buf[..cond_len],
-                        &self.condition_output_buf,
-                        &mut self.film_input_buf[..cond_len],
-                        &mut self.film_scratch_buf,
-                    );
-                    &self.film_input_buf[..cond_len]
-                } else {
-                    &self.condition_output_buf[..]
-                };
-
-                layer
-                    .input_mixin
-                    .forward(mixin_condition, &mut self.mixin_out_buf[..conv_out_ch]);
-
-                // Optional input_mixin_post_film
-                if let Some(ref film) = layer.input_mixin_post_film {
-                    self.film_input_buf[..conv_out_ch]
-                        .copy_from_slice(&self.mixin_out_buf[..conv_out_ch]);
-                    film.forward(
-                        &self.film_input_buf[..conv_out_ch],
-                        &self.condition_output_buf,
-                        &mut self.mixin_out_buf[..conv_out_ch],
-                        &mut self.film_scratch_buf,
-                    );
-                }
-
-                // z = conv_out + mixin_out
-                for i in 0..conv_out_ch {
-                    self.z_buf[i] = self.conv_out_buf[i] + self.mixin_out_buf[i];
-                }
-
-                // Optional activation_pre_film
-                if let Some(ref film) = layer.activation_pre_film {
-                    self.film_input_buf[..conv_out_ch].copy_from_slice(&self.z_buf[..conv_out_ch]);
-                    film.forward(
-                        &self.film_input_buf[..conv_out_ch],
-                        &self.condition_output_buf,
-                        &mut self.z_buf[..conv_out_ch],
-                        &mut self.film_scratch_buf,
-                    );
-                }
-
-                // ── Step 3: Activation (with optional gating/blending) ──
-                // Use apply_scalar_channel for PReLU per-channel support
-                match gating_mode {
-                    GatingMode::None => {
-                        for i in 0..bottleneck {
-                            self.activated_buf[i] =
-                                layer.activation.apply_scalar_channel(self.z_buf[i], i);
-                        }
-                    }
-                    GatingMode::Gated => {
-                        for i in 0..bottleneck {
-                            let primary = layer.activation.apply_scalar_channel(self.z_buf[i], i);
-                            let gate = layer
-                                .secondary_activation
-                                .apply_scalar_channel(self.z_buf[i + bottleneck], i);
-                            self.activated_buf[i] = primary * gate;
-                        }
-                    }
-                    GatingMode::Blended => {
-                        for i in 0..bottleneck {
-                            let pre_activation = self.z_buf[i];
-                            let activated =
-                                layer.activation.apply_scalar_channel(pre_activation, i);
-                            let alpha = layer
-                                .secondary_activation
-                                .apply_scalar_channel(self.z_buf[i + bottleneck], i);
-                            self.activated_buf[i] =
-                                alpha * activated + (1.0 - alpha) * pre_activation;
-                        }
-                    }
-                }
-
-                // Optional activation_post_film
-                if let Some(ref film) = layer.activation_post_film {
-                    self.film_input_buf[..bottleneck]
-                        .copy_from_slice(&self.activated_buf[..bottleneck]);
-                    film.forward(
-                        &self.film_input_buf[..bottleneck],
-                        &self.condition_output_buf,
-                        &mut self.activated_buf[..bottleneck],
-                        &mut self.film_scratch_buf,
-                    );
-                }
-
-                // ── Step 4: layer1x1 for residual ──
-                let rb_input = self.ring_buffers[arr_idx][layer_idx].get(0);
-                if let Some(ref l1x1) = layer.layer1x1 {
-                    l1x1.forward(
-                        &self.activated_buf[..bottleneck],
-                        &mut self.layer1x1_buf[..channels],
-                    );
-
-                    // Optional layer1x1_post_film — C++ only applies this in BLENDED mode
-                    if gating_mode == GatingMode::Blended {
-                        if let Some(ref film) = layer.layer1x1_post_film {
-                            self.film_input_buf[..channels]
-                                .copy_from_slice(&self.layer1x1_buf[..channels]);
-                            film.forward(
-                                &self.film_input_buf[..channels],
-                                &self.condition_output_buf,
-                                &mut self.layer1x1_buf[..channels],
-                                &mut self.film_scratch_buf,
-                            );
-                        }
-                    }
-
-                    for (i, &rb_val) in rb_input[..channels].iter().enumerate() {
-                        self.residual_buf[i] = rb_val + self.layer1x1_buf[i];
-                    }
-                } else {
-                    self.residual_buf[..channels].copy_from_slice(&rb_input[..channels]);
-                }
-
-                // ── Step 5: head output (skip connection) ──
-                if let Some(ref h1x1) = layer.head1x1 {
-                    let h_out = h1x1.out_channels;
-                    h1x1.forward(
-                        &self.activated_buf[..bottleneck],
-                        &mut self.head1x1_buf[..h_out],
-                    );
-
-                    // Optional head1x1_post_film
-                    if let Some(ref film) = layer.head1x1_post_film {
-                        self.film_input_buf[..h_out].copy_from_slice(&self.head1x1_buf[..h_out]);
-                        film.forward(
-                            &self.film_input_buf[..h_out],
-                            &self.condition_output_buf,
-                            &mut self.head1x1_buf[..h_out],
-                            &mut self.film_scratch_buf,
-                        );
-                    }
-
-                    for i in 0..h_out.min(head_output_size) {
-                        self.head_accum_buf[i] += self.head1x1_buf[i];
-                    }
-                } else {
-                    // No head1x1: accumulate activated output (or z for GatingMode::None)
-                    if gating_mode == GatingMode::None && layer.activation_post_film.is_none() {
-                        // For no gating, no post-film: head output is z (same as activated)
-                        for i in 0..bottleneck.min(head_output_size) {
-                            self.head_accum_buf[i] += self.activated_buf[i];
-                        }
-                    } else {
-                        for i in 0..bottleneck.min(head_output_size) {
-                            self.head_accum_buf[i] += self.activated_buf[i];
-                        }
-                    }
-                }
-            }
-
-            // Store layer output for next array's input
-            self.prev_layer_output[..channels].copy_from_slice(&self.residual_buf[..channels]);
-
-            // Head rechannel: head_accum -> head_size output
-            la.head_rechannel.forward(
-                &self.head_accum_buf[..head_output_size],
-                &mut self.head_rechannel_buf[..head_size],
-            );
-
-            // Store for next array
-            self.prev_head_output[..head_size]
-                .copy_from_slice(&self.head_rechannel_buf[..head_size]);
         }
-
-        // Output = head_scale * last head_rechannel output
-        self.head_scale * self.prev_head_output[0]
     }
 }
 
 impl Dsp for WaveNet {
     fn process(&mut self, input: &[Sample], output: &mut [Sample]) {
-        for (i, &sample) in input.iter().enumerate() {
-            output[i] = self.process_sample(sample as f32) as Sample;
-        }
+        self.process_block(input, output);
     }
 
     fn reset(&mut self, sample_rate: f64, max_buffer_size: usize) {
-        for arr_bufs in &mut self.ring_buffers {
-            for rb in arr_bufs.iter_mut() {
-                rb.reset();
-            }
-        }
+        // Match C++ Reset: SetMaxBufferSize first (re-allocates and zeros all buffers),
+        // then reset condition_dsp. Prewarm is called separately by the caller.
+        self.set_max_buffer_size_internal(max_buffer_size);
         if let Some(ref mut cdsp) = self.condition_dsp {
             cdsp.reset(sample_rate, max_buffer_size);
         }
@@ -1204,13 +1707,17 @@ impl Dsp for WaveNet {
     }
 
     fn process_sample_multi_channel(&mut self, input_sample: Sample, out: &mut [f32]) {
-        self.process_sample(input_sample as f32);
-        let head_size = self.num_output_channels();
-        for (o, &h) in out
-            .iter_mut()
-            .zip(self.prev_head_output[..head_size].iter())
-        {
-            *o = self.head_scale * h;
+        self.process_sample_for_multi_channel(input_sample as f32);
+
+        let last = self.layer_arrays.len() - 1;
+        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
+        let out_ch = self.layer_arrays[last].head_rechannel.out_channels;
+        let scale = self.head_scale;
+
+        for (i, o) in out.iter_mut().enumerate() {
+            if i < out_ch {
+                *o = scale * final_head.data[i];
+            }
         }
     }
 
@@ -1220,6 +1727,34 @@ impl Dsp for WaveNet {
 
     fn metadata(&self) -> &DspMetadata {
         &self.metadata
+    }
+}
+
+// ── Activation helper for column-major block processing ─────────────────────
+
+impl Activation {
+    /// Apply activation in-place to a column-major matrix.
+    /// The matrix has `rows` per column and `num_cols` columns.
+    /// Applies per-channel (row) for PReLU.
+    fn apply_colmajor_inplace(&self, data: &mut [f32], rows: usize, num_cols: usize) {
+        match self {
+            Activation::PReLU(slopes) => {
+                for f in 0..num_cols {
+                    let off = f * rows;
+                    for c in 0..rows {
+                        let x = data[off + c];
+                        let alpha = slopes.get(c).copied().unwrap_or(0.01);
+                        data[off + c] = if x >= 0.0 { x } else { alpha * x };
+                    }
+                }
+            }
+            _ => {
+                let len = rows * num_cols;
+                for x in data[..len].iter_mut() {
+                    *x = self.apply_scalar(*x);
+                }
+            }
+        }
     }
 }
 

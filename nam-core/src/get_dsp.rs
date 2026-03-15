@@ -590,20 +590,14 @@ mod tests {
         // This model uses every advanced feature (FiLM, grouped convs, head1x1,
         // gated+blended activations, nested condition_dsp with gating).
         //
-        // There is a known divergence from C++ output caused by floating-point
-        // non-associativity: our per-sample scalar processing accumulates rounding
-        // differently from C++'s Eigen vectorized block processing. The error
-        // grows exponentially with weight magnitude through the deep network
-        // (verified: scaling weights to 10% eliminates divergence completely).
-        //
-        // This is NOT a logic bug — the same code with small weights matches
-        // C++ to within 1e-10. To match C++ bit-for-bit would require switching
-        // to block-based matrix processing (a performance optimization, not a
-        // correctness fix).
+        // With block-based matrix processing matching C++ Eigen computation order,
+        // this model now matches C++ output closely. The remaining difference is
+        // from floating-point non-associativity in activation functions (tanh, sigmoid)
+        // and the condition_dsp's per-sample processing.
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
             assert!(
-                max_diff < 2.0,
-                "wavenet_a2_max regression: max_diff={:.2e} (expected ~0.9 from FP accumulation)",
+                max_diff < 1e-4,
+                "wavenet_a2_max regression: max_diff={:.2e}",
                 max_diff
             );
         }
