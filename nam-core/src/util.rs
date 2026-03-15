@@ -1,4 +1,64 @@
 use crate::error::NamError;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global toggle for fast tanh/sigmoid approximations.
+/// When enabled, uses polynomial approximations matching C++ NAM's fast_tanh.
+/// Faster (~1.5-2x) but introduces ~3e-4 error per call.
+static USE_FAST_TANH: AtomicBool = AtomicBool::new(false);
+
+/// Enable fast tanh/sigmoid polynomial approximations (performance mode).
+pub fn enable_fast_tanh() {
+    USE_FAST_TANH.store(true, Ordering::Relaxed);
+}
+
+/// Disable fast tanh/sigmoid, using standard math (accuracy mode, default).
+pub fn disable_fast_tanh() {
+    USE_FAST_TANH.store(false, Ordering::Relaxed);
+}
+
+/// Returns true if fast tanh/sigmoid is currently enabled.
+pub fn is_fast_tanh_enabled() -> bool {
+    USE_FAST_TANH.load(Ordering::Relaxed)
+}
+
+/// Fast tanh polynomial approximation matching C++ NAM implementation.
+/// Max error ~3e-4 vs std::tanh.
+#[inline]
+pub fn fast_tanh(x: f32) -> f32 {
+    let ax = x.abs();
+    let x2 = x * x;
+    (x * (2.45550750702956f32
+        + 2.45550750702956f32 * ax
+        + (0.893229853513558f32 + 0.821226666969744f32 * ax) * x2))
+        / (2.44506634652299f32
+            + (2.44506634652299f32 + x2) * (x + 0.814642734961073f32 * x * ax).abs())
+}
+
+/// Fast sigmoid using fast_tanh: sigmoid(x) = 0.5 * (fast_tanh(x/2) + 1)
+#[inline]
+pub fn fast_sigmoid(x: f32) -> f32 {
+    0.5 * (fast_tanh(x * 0.5) + 1.0)
+}
+
+/// Tanh that respects the fast_tanh toggle.
+#[inline]
+pub fn tanh_auto(x: f32) -> f32 {
+    if USE_FAST_TANH.load(Ordering::Relaxed) {
+        fast_tanh(x)
+    } else {
+        x.tanh()
+    }
+}
+
+/// Sigmoid that respects the fast_tanh toggle.
+#[inline]
+pub fn sigmoid_auto(x: f32) -> f32 {
+    if USE_FAST_TANH.load(Ordering::Relaxed) {
+        fast_sigmoid(x)
+    } else {
+        1.0 / (1.0 + (-x).exp())
+    }
+}
 
 /// Helper to consume chunks from a flat weight array in order.
 pub struct WeightIter<'a> {
@@ -50,7 +110,7 @@ impl<'a> WeightIter<'a> {
 
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    sigmoid_auto(x)
 }
 
 #[cfg(test)]
@@ -119,6 +179,38 @@ mod tests {
         let mut iter = WeightIter::new(&data);
         let chunk = iter.take(0).unwrap();
         assert!(chunk.is_empty());
+    }
+
+    #[test]
+    fn test_fast_tanh_accuracy() {
+        // fast_tanh should be within 4e-4 of std tanh
+        for &x in &[0.0, 0.1, 0.5, 1.0, 2.0, 3.0, 5.0, -1.0, -3.0] {
+            let diff = (fast_tanh(x) - x.tanh()).abs();
+            assert!(diff < 4e-4, "fast_tanh({}) diff={:.2e}", x, diff);
+        }
+    }
+
+    #[test]
+    fn test_fast_sigmoid_accuracy() {
+        for &x in &[0.0f32, 0.5, 1.0, 2.0, -1.0, -2.0] {
+            let expected = 1.0f32 / (1.0f32 + (-x).exp());
+            let diff = (fast_sigmoid(x) - expected).abs();
+            assert!(diff < 4e-4, "fast_sigmoid({}) diff={:.2e}", x, diff);
+        }
+    }
+
+    #[test]
+    fn test_fast_tanh_toggle() {
+        disable_fast_tanh();
+        let std_result = tanh_auto(1.0);
+        assert_eq!(std_result, 1.0f32.tanh());
+
+        enable_fast_tanh();
+        let fast_result = tanh_auto(1.0);
+        assert_eq!(fast_result, fast_tanh(1.0));
+        assert!(fast_result != std_result); // they should differ
+
+        disable_fast_tanh(); // restore default
     }
 
     #[test]

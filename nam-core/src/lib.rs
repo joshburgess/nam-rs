@@ -12,3 +12,4 @@ pub mod wavenet;
 pub use dsp::{Dsp, Sample};
 pub use error::NamError;
 pub use get_dsp::get_dsp;
+pub use util::{disable_fast_tanh, enable_fast_tanh, is_fast_tanh_enabled};

@@ -36,6 +36,10 @@ struct NamParams {
     #[id = "out_gain"]
     pub output_gain: FloatParam,
 
+    /// Fast tanh mode (performance vs accuracy toggle).
+    #[id = "fast_mode"]
+    pub fast_mode: BoolParam,
+
     /// Persisted model file path (restored when the DAW reloads the session).
     #[persist = "model_path"]
     pub model_path: Mutex<String>,
@@ -97,6 +101,14 @@ impl Default for NamParams {
             .with_unit(" dB")
             .with_step_size(0.1)
             .with_smoother(SmoothingStyle::Logarithmic(50.0)),
+
+            fast_mode: BoolParam::new("Fast Mode", false).with_callback(Arc::new(|val| {
+                if val {
+                    nam_core::enable_fast_tanh();
+                } else {
+                    nam_core::disable_fast_tanh();
+                }
+            })),
 
             model_path: Mutex::new(String::new()),
         }
@@ -220,6 +232,19 @@ impl Plugin for NamPlugin {
 
                         ui.label("Output Gain");
                         ui.add(widgets::ParamSlider::for_param(&params.output_gain, setter));
+
+                        ui.separator();
+
+                        // Fast mode toggle
+                        let mut fast = params.fast_mode.value();
+                        if ui
+                            .checkbox(&mut fast, "Fast Mode (lower accuracy, better performance)")
+                            .changed()
+                        {
+                            setter.begin_set_parameter(&params.fast_mode);
+                            setter.set_parameter(&params.fast_mode, fast);
+                            setter.end_set_parameter(&params.fast_mode);
+                        }
                     });
             },
         )

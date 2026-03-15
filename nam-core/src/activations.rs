@@ -1,4 +1,5 @@
 use crate::error::NamError;
+use crate::util::{sigmoid_auto, tanh_auto};
 
 #[derive(Debug, Clone)]
 pub enum Activation {
@@ -25,8 +26,8 @@ impl Activation {
     pub fn apply_scalar(&self, x: f32) -> f32 {
         match self {
             Activation::Relu => x.max(0.0),
-            Activation::Tanh => x.tanh(),
-            Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Activation::Tanh => tanh_auto(x),
+            Activation::Sigmoid => sigmoid_auto(x),
             Activation::HardTanh => x.clamp(-1.0, 1.0),
             Activation::LeakyRelu(alpha) => {
                 if x >= 0.0 {
@@ -35,7 +36,7 @@ impl Activation {
                     alpha * x
                 }
             }
-            Activation::Silu => x * (1.0 / (1.0 + (-x).exp())),
+            Activation::Silu => x * sigmoid_auto(x),
             Activation::Softsign => x / (1.0 + x.abs()),
             Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) * (1.0 / 6.0),
             Activation::LeakyHardTanh {

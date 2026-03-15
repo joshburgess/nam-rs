@@ -30,6 +30,9 @@ enum Commands {
         /// Number of iterations
         #[arg(default_value = "1000")]
         iterations: usize,
+        /// Use fast tanh approximation (faster but less accurate)
+        #[arg(long)]
+        fast: bool,
     },
 }
 
@@ -48,7 +51,12 @@ fn main() {
             model,
             buffer_size,
             iterations,
+            fast,
         } => {
+            if fast {
+                nam_core::enable_fast_tanh();
+                eprintln!("Fast tanh: enabled");
+            }
             bench(&model, buffer_size, iterations);
         }
     }
