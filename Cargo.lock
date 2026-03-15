@@ -1732,6 +1732,7 @@ dependencies = [
  "approx",
  "criterion",
  "hound",
+ "matrixmultiply",
  "ndarray",
  "serde",
  "serde_json",

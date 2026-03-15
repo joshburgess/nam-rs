@@ -6,6 +6,29 @@ use crate::dsp::{Dsp, DspMetadata, Sample};
 use crate::error::NamError;
 use crate::util::WeightIter;
 
+/// Use matrixmultiply::sgemm for matrices at or above this size (out_ch * in_ch).
+/// Below this threshold, use the hand-written dot-product loop which preserves
+/// exact floating-point order for bit-identical results on small models.
+const SGEMM_MIN_SIZE: usize = 32;
+
+/// Column-major GEMM: C = alpha * A @ B + beta * C
+/// A is (m x k), B is (k x n), C is (m x n), all column-major.
+#[inline]
+unsafe fn sgemm_colmajor(
+    m: usize, k: usize, n: usize,
+    alpha: f32, a: *const f32,
+    b: *const f32, b_col_stride: isize,
+    beta: f32, c: *mut f32,
+) {
+    matrixmultiply::sgemm(
+        m, k, n, alpha,
+        a, 1, m as isize,           // A: col-major
+        b, 1, b_col_stride,         // B: col-major with given stride
+        beta,
+        c, 1, m as isize,           // C: col-major
+    );
+}
+
 // ── Gating mode ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,30 +281,45 @@ impl Conv1x1 {
     fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
-        let w = &self.weight_colmajor;
 
-        // GEMM: C = A @ B where A is (out_ch x in_ch), B is (in_ch x num_frames)
-        // Column-major: compute column by column
-        for f in 0..num_frames {
-            let in_col_start = f * input.rows; // Note: input.rows may differ from in_ch for topRows
-            let out_col_start = f * out_ch;
-
-            for o in 0..out_ch {
-                let mut sum = 0.0f32;
-                for i in 0..in_ch {
-                    // w[i * out_ch + o] = W(o, i) in column-major
-                    sum += w[i * out_ch + o] * input.data[in_col_start + i];
+        if out_ch * in_ch >= SGEMM_MIN_SIZE {
+            // Large matrix: SIMD-optimized sgemm
+            if let Some(ref b) = self.bias {
+                for f in 0..num_frames {
+                    let s = f * out_ch;
+                    self.output_buf.data[s..s + out_ch].copy_from_slice(&b[..out_ch]);
                 }
-                self.output_buf.data[out_col_start + o] = sum;
+            } else {
+                self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-        }
-
-        // Add bias
-        if let Some(ref b) = self.bias {
+            unsafe {
+                sgemm_colmajor(
+                    out_ch, in_ch, num_frames, 1.0,
+                    self.weight_colmajor.as_ptr(),
+                    input.data.as_ptr(), input.rows as isize,
+                    1.0, self.output_buf.data.as_mut_ptr(),
+                );
+            }
+        } else {
+            // Small matrix: exact dot-product loop (preserves bit-identical results)
+            let w = &self.weight_colmajor;
             for f in 0..num_frames {
-                let col_start = f * out_ch;
+                let in_col_start = f * input.rows;
+                let out_col_start = f * out_ch;
                 for o in 0..out_ch {
-                    self.output_buf.data[col_start + o] += b[o];
+                    let mut sum = 0.0f32;
+                    for i in 0..in_ch {
+                        sum += w[i * out_ch + o] * input.data[in_col_start + i];
+                    }
+                    self.output_buf.data[out_col_start + o] = sum;
+                }
+            }
+            if let Some(ref b) = self.bias {
+                for f in 0..num_frames {
+                    let col_start = f * out_ch;
+                    for o in 0..out_ch {
+                        self.output_buf.data[col_start + o] += b[o];
+                    }
                 }
             }
         }
@@ -298,26 +336,43 @@ impl Conv1x1 {
     ) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
-        let w = &self.weight_colmajor;
 
-        for f in 0..num_frames {
-            let in_col_start = f * input_stride;
-            let out_col_start = f * out_ch;
-
-            for o in 0..out_ch {
-                let mut sum = 0.0f32;
-                for i in 0..in_ch {
-                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+        if out_ch * in_ch >= SGEMM_MIN_SIZE {
+            if let Some(ref b) = self.bias {
+                for f in 0..num_frames {
+                    let s = f * out_ch;
+                    self.output_buf.data[s..s + out_ch].copy_from_slice(&b[..out_ch]);
                 }
-                self.output_buf.data[out_col_start + o] = sum;
+            } else {
+                self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-        }
-
-        if let Some(ref b) = self.bias {
+            unsafe {
+                sgemm_colmajor(
+                    out_ch, in_ch, num_frames, 1.0,
+                    self.weight_colmajor.as_ptr(),
+                    input_data.as_ptr(), input_stride as isize,
+                    1.0, self.output_buf.data.as_mut_ptr(),
+                );
+            }
+        } else {
+            let w = &self.weight_colmajor;
             for f in 0..num_frames {
-                let col_start = f * out_ch;
+                let in_col_start = f * input_stride;
+                let out_col_start = f * out_ch;
                 for o in 0..out_ch {
-                    self.output_buf.data[col_start + o] += b[o];
+                    let mut sum = 0.0f32;
+                    for i in 0..in_ch {
+                        sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                    }
+                    self.output_buf.data[out_col_start + o] = sum;
+                }
+            }
+            if let Some(ref b) = self.bias {
+                for f in 0..num_frames {
+                    let col_start = f * out_ch;
+                    for o in 0..out_ch {
+                        self.output_buf.data[col_start + o] += b[o];
+                    }
                 }
             }
         }
@@ -415,6 +470,8 @@ impl Conv1d {
         let ks = self.kernel_size;
         let dil = self.dilation;
 
+        let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
+
         // Initialize output to zero, then accumulate
         let out_len = out_ch * num_frames;
         self.output_buf.data[..out_len].fill(0.0);
@@ -427,18 +484,26 @@ impl Conv1d {
             let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
             let w = &self.weights_colmajor[k];
 
-            // GEMM: output += W_k @ tap_data
-            // W_k is (out_ch x in_ch) column-major, tap_data is (in_ch x num_frames) column-major
-            for f in 0..num_frames {
-                let in_col_start = f * in_ch;
-                let out_col_start = f * out_ch;
-
-                for o in 0..out_ch {
-                    let mut sum = 0.0f32;
-                    for i in 0..in_ch {
-                        sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+            if use_sgemm {
+                unsafe {
+                    sgemm_colmajor(
+                        out_ch, in_ch, num_frames, 1.0,
+                        w.as_ptr(),
+                        tap_data.as_ptr(), in_ch as isize,
+                        1.0, self.output_buf.data.as_mut_ptr(),
+                    );
+                }
+            } else {
+                for f in 0..num_frames {
+                    let in_col_start = f * in_ch;
+                    let out_col_start = f * out_ch;
+                    for o in 0..out_ch {
+                        let mut sum = 0.0f32;
+                        for i in 0..in_ch {
+                            sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+                        }
+                        self.output_buf.data[out_col_start + o] += sum;
                     }
-                    self.output_buf.data[out_col_start + o] += sum;
                 }
             }
         }
