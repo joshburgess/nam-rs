@@ -255,33 +255,34 @@ impl Conv1x1 {
     /// Block processing: output = W @ input (+ bias), column-major.
     /// Input: (in_channels x num_frames), Output: written to self.output_buf
     /// Matches Eigen: output.noalias() = weight * input; output.colwise() += bias;
+    /// Uses axpy-style GEMM for SIMD-friendly contiguous memory access.
     fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
         let w = &self.weight_colmajor;
+        let out = &mut self.output_buf.data;
 
-        // GEMM: C = A @ B where A is (out_ch x in_ch), B is (in_ch x num_frames)
-        // Column-major: compute column by column
-        for f in 0..num_frames {
-            let in_col_start = f * input.rows; // Note: input.rows may differ from in_ch for topRows
-            let out_col_start = f * out_ch;
-
-            for o in 0..out_ch {
-                let mut sum = 0.0f32;
-                for i in 0..in_ch {
-                    // w[i * out_ch + o] = W(o, i) in column-major
-                    sum += w[i * out_ch + o] * input.data[in_col_start + i];
-                }
-                self.output_buf.data[out_col_start + o] = sum;
-            }
-        }
-
-        // Add bias
+        // Initialize output with bias (or zero)
         if let Some(ref b) = self.bias {
             for f in 0..num_frames {
                 let col_start = f * out_ch;
-                for o in 0..out_ch {
-                    self.output_buf.data[col_start + o] += b[o];
+                out[col_start..col_start + out_ch].copy_from_slice(&b[..out_ch]);
+            }
+        } else {
+            out[..out_ch * num_frames].fill(0.0);
+        }
+
+        // GEMM: C += A @ B using axpy-style (rank-1 updates)
+        // Inner loop accesses w and output contiguously → auto-vectorizes.
+        // Slice-based access eliminates bounds checks in the hot loop.
+        for f in 0..num_frames {
+            let in_col = &input.data[f * input.rows..f * input.rows + in_ch];
+            let out_col = &mut out[f * out_ch..(f + 1) * out_ch];
+
+            for (i, &input_val) in in_col.iter().enumerate() {
+                let w_col = &w[i * out_ch..(i + 1) * out_ch];
+                for (o, w_val) in w_col.iter().enumerate() {
+                    out_col[o] += w_val * input_val;
                 }
             }
         }
@@ -299,25 +300,26 @@ impl Conv1x1 {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
         let w = &self.weight_colmajor;
+        let out = &mut self.output_buf.data;
 
-        for f in 0..num_frames {
-            let in_col_start = f * input_stride;
-            let out_col_start = f * out_ch;
-
-            for o in 0..out_ch {
-                let mut sum = 0.0f32;
-                for i in 0..in_ch {
-                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
-                }
-                self.output_buf.data[out_col_start + o] = sum;
-            }
-        }
-
+        // Initialize with bias or zero
         if let Some(ref b) = self.bias {
             for f in 0..num_frames {
                 let col_start = f * out_ch;
-                for o in 0..out_ch {
-                    self.output_buf.data[col_start + o] += b[o];
+                out[col_start..col_start + out_ch].copy_from_slice(&b[..out_ch]);
+            }
+        } else {
+            out[..out_ch * num_frames].fill(0.0);
+        }
+
+        // Axpy-style GEMM with slice-based access for bounds-check elimination
+        for f in 0..num_frames {
+            let in_col = &input_data[f * input_stride..f * input_stride + in_ch];
+            let out_col = &mut out[f * out_ch..(f + 1) * out_ch];
+            for (i, &input_val) in in_col.iter().enumerate() {
+                let w_col = &w[i * out_ch..(i + 1) * out_ch];
+                for (o, w_val) in w_col.iter().enumerate() {
+                    out_col[o] += w_val * input_val;
                 }
             }
         }
@@ -415,39 +417,31 @@ impl Conv1d {
         let ks = self.kernel_size;
         let dil = self.dilation;
 
-        // Initialize output to zero, then accumulate
-        let out_len = out_ch * num_frames;
-        self.output_buf.data[..out_len].fill(0.0);
+        // Initialize output with bias
+        let out = &mut self.output_buf.data;
+        let bias = &self.bias;
+        for f in 0..num_frames {
+            let col_start = f * out_ch;
+            out[col_start..col_start + out_ch].copy_from_slice(&bias[..out_ch]);
+        }
 
+        // Accumulate GEMM per tap, axpy-style with slice access for vectorization
         for k in 0..ks {
-            // C++ offset = dilation * (k + 1 - kernel_size), lookback = -offset
             let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
             let lookback = (-offset_signed) as usize;
 
             let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
             let w = &self.weights_colmajor[k];
 
-            // GEMM: output += W_k @ tap_data
-            // W_k is (out_ch x in_ch) column-major, tap_data is (in_ch x num_frames) column-major
             for f in 0..num_frames {
-                let in_col_start = f * in_ch;
-                let out_col_start = f * out_ch;
-
-                for o in 0..out_ch {
-                    let mut sum = 0.0f32;
-                    for i in 0..in_ch {
-                        sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+                let in_col = &tap_data[f * in_ch..(f + 1) * in_ch];
+                let out_col = &mut out[f * out_ch..(f + 1) * out_ch];
+                for (i, &input_val) in in_col.iter().enumerate() {
+                    let w_col = &w[i * out_ch..(i + 1) * out_ch];
+                    for (o, w_val) in w_col.iter().enumerate() {
+                        out_col[o] += w_val * input_val;
                     }
-                    self.output_buf.data[out_col_start + o] += sum;
                 }
-            }
-        }
-
-        // Add bias (colwise)
-        for f in 0..num_frames {
-            let col_start = f * out_ch;
-            for o in 0..out_ch {
-                self.output_buf.data[col_start + o] += self.bias[o];
             }
         }
 
