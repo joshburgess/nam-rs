@@ -14,18 +14,33 @@ const SGEMM_MIN_SIZE: usize = 32;
 /// Column-major GEMM: C = alpha * A @ B + beta * C
 /// A is (m x k), B is (k x n), C is (m x n), all column-major.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn sgemm_colmajor(
-    m: usize, k: usize, n: usize,
-    alpha: f32, a: *const f32,
-    b: *const f32, b_col_stride: isize,
-    beta: f32, c: *mut f32,
+    m: usize,
+    k: usize,
+    n: usize,
+    alpha: f32,
+    a: *const f32,
+    b: *const f32,
+    b_col_stride: isize,
+    beta: f32,
+    c: *mut f32,
 ) {
     matrixmultiply::sgemm(
-        m, k, n, alpha,
-        a, 1, m as isize,           // A: col-major
-        b, 1, b_col_stride,         // B: col-major with given stride
+        m,
+        k,
+        n,
+        alpha,
+        a,
+        1,
+        m as isize, // A: col-major
+        b,
+        1,
+        b_col_stride, // B: col-major with given stride
         beta,
-        c, 1, m as isize,           // C: col-major
+        c,
+        1,
+        m as isize, // C: col-major
     );
 }
 
@@ -294,10 +309,15 @@ impl Conv1x1 {
             }
             unsafe {
                 sgemm_colmajor(
-                    out_ch, in_ch, num_frames, 1.0,
+                    out_ch,
+                    in_ch,
+                    num_frames,
+                    1.0,
                     self.weight_colmajor.as_ptr(),
-                    input.data.as_ptr(), input.rows as isize,
-                    1.0, self.output_buf.data.as_mut_ptr(),
+                    input.data.as_ptr(),
+                    input.rows as isize,
+                    1.0,
+                    self.output_buf.data.as_mut_ptr(),
                 );
             }
         } else {
@@ -348,10 +368,15 @@ impl Conv1x1 {
             }
             unsafe {
                 sgemm_colmajor(
-                    out_ch, in_ch, num_frames, 1.0,
+                    out_ch,
+                    in_ch,
+                    num_frames,
+                    1.0,
                     self.weight_colmajor.as_ptr(),
-                    input_data.as_ptr(), input_stride as isize,
-                    1.0, self.output_buf.data.as_mut_ptr(),
+                    input_data.as_ptr(),
+                    input_stride as isize,
+                    1.0,
+                    self.output_buf.data.as_mut_ptr(),
                 );
             }
         } else {
@@ -487,10 +512,15 @@ impl Conv1d {
             if use_sgemm {
                 unsafe {
                     sgemm_colmajor(
-                        out_ch, in_ch, num_frames, 1.0,
+                        out_ch,
+                        in_ch,
+                        num_frames,
+                        1.0,
                         w.as_ptr(),
-                        tap_data.as_ptr(), in_ch as isize,
-                        1.0, self.output_buf.data.as_mut_ptr(),
+                        tap_data.as_ptr(),
+                        in_ch as isize,
+                        1.0,
+                        self.output_buf.data.as_mut_ptr(),
                     );
                 }
             } else {

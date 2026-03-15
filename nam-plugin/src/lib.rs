@@ -213,7 +213,7 @@ impl NamPlugin {
 
         // Push host-rate input into pending buffer
         for &s in input {
-            rs.input_pending.push_back(s as f64);
+            rs.input_pending.push_back(s);
         }
 
         // Resample pending input: host_rate -> model_rate, in fixed-size chunks
@@ -248,7 +248,7 @@ impl NamPlugin {
             let mut pos = 0;
             while pos + rs.to_host_chunk <= model_samples_ready {
                 for i in 0..rs.to_host_chunk {
-                    rs.to_host_scratch[0][i] = rs.model_output[pos + i] as f64;
+                    rs.to_host_scratch[0][i] = rs.model_output[pos + i];
                 }
                 pos += rs.to_host_chunk;
 
@@ -301,8 +301,7 @@ impl Plugin for NamPlugin {
                 nih_log!("Loading model from {:?}", path);
                 match nam_core::get_dsp(&path) {
                     Ok(mut dsp) => {
-                        let model_rate =
-                            dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
+                        let model_rate = dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
                         dsp.reset(model_rate, max_buf);
                         dsp.prewarm();
                         *model_slot.lock().unwrap() = Some(dsp);
@@ -425,7 +424,10 @@ impl Plugin for NamPlugin {
     fn reset(&mut self) {
         if let Ok(mut model) = self.model.lock() {
             if let Some(ref mut m) = *model {
-                let model_rate = m.metadata().expected_sample_rate.unwrap_or(self.sample_rate);
+                let model_rate = m
+                    .metadata()
+                    .expected_sample_rate
+                    .unwrap_or(self.sample_rate);
                 m.reset(model_rate, self.max_buffer_size);
                 m.prewarm();
             }
@@ -461,12 +463,14 @@ impl Plugin for NamPlugin {
             self.input_buf[i] = (channel[i] * in_gain) as nam_core::Sample;
         }
 
-        if self.resampler.is_some() {
-            // Copy input to avoid borrow conflict with self
-            let input_copy: Vec<nam_core::Sample> =
-                self.input_buf[..num_samples].to_vec();
-            let rs = self.resampler.as_mut().unwrap();
-            Self::process_resampled(rs, &mut **model, &input_copy, &mut self.output_buf[..num_samples]);
+        if let Some(ref mut rs) = self.resampler {
+            let input_copy: Vec<nam_core::Sample> = self.input_buf[..num_samples].to_vec();
+            Self::process_resampled(
+                rs,
+                &mut **model,
+                &input_copy,
+                &mut self.output_buf[..num_samples],
+            );
         } else {
             model.process(
                 &self.input_buf[..num_samples],
