@@ -181,8 +181,7 @@ impl Plugin for NamPlugin {
                                         .map(|n| n.to_string_lossy().to_string())
                                         .unwrap_or_default();
                                     state.status = "Loading...".to_string();
-                                    async_executor
-                                        .execute_background(NamTask::LoadModel(path));
+                                    async_executor.execute_background(NamTask::LoadModel(path));
                                 }
                             }
 
@@ -209,9 +208,7 @@ impl Plugin for NamPlugin {
                         }
 
                         // Update status when model finishes loading
-                        if model_slot.lock().unwrap().is_some()
-                            && state.status == "Loading..."
-                        {
+                        if model_slot.lock().unwrap().is_some() && state.status == "Loading..." {
                             state.status = "Ready".to_string();
                         }
 
@@ -219,16 +216,10 @@ impl Plugin for NamPlugin {
 
                         // Gain controls
                         ui.label("Input Gain");
-                        ui.add(widgets::ParamSlider::for_param(
-                            &params.input_gain,
-                            setter,
-                        ));
+                        ui.add(widgets::ParamSlider::for_param(&params.input_gain, setter));
 
                         ui.label("Output Gain");
-                        ui.add(widgets::ParamSlider::for_param(
-                            &params.output_gain,
-                            setter,
-                        ));
+                        ui.add(widgets::ParamSlider::for_param(&params.output_gain, setter));
                     });
             },
         )
