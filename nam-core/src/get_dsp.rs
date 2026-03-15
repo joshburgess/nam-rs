@@ -532,9 +532,8 @@ mod tests {
 
     // ── Strict accuracy guards ────────────────────────────────────────────
     //
-    // These thresholds are the EXACT known-good accuracy levels as of the
-    // block-based processing implementation. Any code change that makes
-    // accuracy worse on ANY model will fail these tests.
+    // These thresholds are the EXACT known-good accuracy levels. Any code
+    // change that makes accuracy worse on ANY model will fail these tests.
     //
     // Current known-good values (max_diff vs C++ reference):
     //   wavenet:              0.0       (bit-identical)
@@ -543,6 +542,9 @@ mod tests {
     //   wavenet_a1_standard:  1.13e-06  (f32 precision floor for 20-layer model)
     //   my_model:             1.13e-06  (same architecture as a1_standard)
     //   wavenet_a2_max:       4.77e-06  (deep network with condition_dsp)
+    //
+    // Thresholds are set slightly above actual values to allow for
+    // platform-specific floating-point variation.
 
     #[test]
     fn test_regression_wavenet() {
@@ -581,8 +583,8 @@ mod tests {
     fn test_regression_wavenet_a1_standard() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a1_standard") {
             assert!(
-                max_diff <= 1.2e-06,
-                "wavenet_a1_standard: accuracy regressed, max_diff={:.2e} (limit 1.2e-06)",
+                max_diff <= 1.15e-06,
+                "wavenet_a1_standard: accuracy regressed, max_diff={:.2e} (limit 1.15e-06)",
                 max_diff
             );
         }
@@ -592,8 +594,8 @@ mod tests {
     fn test_regression_my_model() {
         if let Some((max_diff, _rms)) = regression_compare("my_model") {
             assert!(
-                max_diff <= 1.2e-06,
-                "my_model: accuracy regressed, max_diff={:.2e} (limit 1.2e-06)",
+                max_diff <= 1.15e-06,
+                "my_model: accuracy regressed, max_diff={:.2e} (limit 1.15e-06)",
                 max_diff
             );
         }
@@ -603,8 +605,8 @@ mod tests {
     fn test_regression_wavenet_a2_max() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
             assert!(
-                max_diff <= 5.0e-06,
-                "wavenet_a2_max: accuracy regressed, max_diff={:.2e} (limit 5.0e-06)",
+                max_diff <= 4.8e-06,
+                "wavenet_a2_max: accuracy regressed, max_diff={:.2e} (limit 4.8e-06)",
                 max_diff
             );
         }
