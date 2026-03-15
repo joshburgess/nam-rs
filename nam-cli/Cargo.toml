@@ -1,0 +1,9 @@
+[package]
+name = "nam-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nam-core = { path = "../nam-core" }
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"

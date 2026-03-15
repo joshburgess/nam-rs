@@ -1,0 +1,3 @@
+[workspace]
+members = ["nam-core", "nam-cli", "nam-plugin", "xtask"]
+resolver = "2"

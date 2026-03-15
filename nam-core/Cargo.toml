@@ -1,0 +1,25 @@
+[package]
+name = "nam-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust DSP inference engine for Neural Amp Modeler"
+
+[features]
+default = []
+float_io = []  # Use f32 instead of f64 for process() I/O (matches C++ DSP_SAMPLE_FLOAT)
+
+[dependencies]
+ndarray = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+approx = "0.5"
+criterion = "0.5"
+hound = "3.5"
+
+[[bench]]
+name = "inference"
+harness = false

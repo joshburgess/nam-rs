@@ -1,0 +1,16 @@
+/target
+/upstream-core
+/upstream-trainer
+
+# Test fixture audio files (generated, not checked in)
+nam-core/test_fixtures/audio/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
