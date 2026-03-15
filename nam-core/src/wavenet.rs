@@ -1403,21 +1403,45 @@ impl WaveNet {
             .unwrap_or(1) as usize;
 
         for la_json in layers_json {
-            let input_size = la_json["input_size"].as_u64().unwrap() as usize;
-            let cond_size = la_json["condition_size"].as_u64().unwrap() as usize;
-            let head_size = la_json["head_size"].as_u64().unwrap() as usize;
-            let channels = la_json["channels"].as_u64().unwrap() as usize;
+            let input_size = la_json["input_size"]
+                .as_u64()
+                .ok_or_else(|| NamError::MissingField("layer_array.input_size".into()))?
+                as usize;
+            let cond_size = la_json["condition_size"]
+                .as_u64()
+                .ok_or_else(|| NamError::MissingField("layer_array.condition_size".into()))?
+                as usize;
+            let head_size = la_json["head_size"]
+                .as_u64()
+                .ok_or_else(|| NamError::MissingField("layer_array.head_size".into()))?
+                as usize;
+            let channels = la_json["channels"]
+                .as_u64()
+                .ok_or_else(|| NamError::MissingField("layer_array.channels".into()))?
+                as usize;
             let bottleneck = la_json
                 .get("bottleneck")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(channels as u64) as usize;
-            let kernel_size = la_json["kernel_size"].as_u64().unwrap() as usize;
-            let dilations: Vec<usize> = la_json["dilations"]
+            let kernel_size = la_json["kernel_size"]
+                .as_u64()
+                .ok_or_else(|| NamError::MissingField("layer_array.kernel_size".into()))?
+                as usize;
+            let dilations_arr = la_json["dilations"]
                 .as_array()
-                .unwrap()
+                .ok_or_else(|| NamError::MissingField("layer_array.dilations".into()))?;
+            let dilations: Vec<usize> = dilations_arr
                 .iter()
-                .map(|v| v.as_u64().unwrap() as usize)
-                .collect();
+                .map(|v| {
+                    v.as_u64()
+                        .ok_or_else(|| {
+                            NamError::InvalidConfig(
+                                "layer_array.dilations contains non-integer value".into(),
+                            )
+                        })
+                        .map(|n| n as usize)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             let num_layers = dilations.len();
 
@@ -1429,6 +1453,7 @@ impl WaveNet {
                         .map(Activation::from_json)
                         .collect::<Result<Vec<_>, _>>()?
                 } else {
+                    // "Tanh" is a known-valid activation name, so the inner unwrap is safe.
                     let act = Activation::from_json(act_val)
                         .unwrap_or_else(|_| Activation::from_name("Tanh").unwrap());
                     vec![act; num_layers]
