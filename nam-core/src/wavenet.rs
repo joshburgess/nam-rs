@@ -9,7 +9,7 @@ use crate::util::WeightIter;
 /// Use matrixmultiply::sgemm for matrices at or above this size (out_ch * in_ch).
 /// Below this threshold, use the hand-written dot-product loop which preserves
 /// exact floating-point order for bit-identical results on small models.
-const SGEMM_MIN_SIZE: usize = 32;
+const SGEMM_MIN_SIZE: usize = 64;
 
 /// Column-major GEMM: C = alpha * A @ B + beta * C
 /// A is (m x k), B is (k x n), C is (m x n), all column-major.
