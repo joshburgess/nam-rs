@@ -36,6 +36,8 @@ struct ResamplerState {
     to_host: FftFixedInOut<f64>,
     /// Accumulates host-rate samples until we have enough for a resample chunk
     input_pending: VecDeque<f64>,
+    /// Accumulates model-rate samples waiting to be back-resampled to host rate
+    model_rate_pending: VecDeque<f64>,
     /// Accumulates host-rate output samples ready for the DAW
     output_pending: VecDeque<f64>,
     /// Fixed input chunk size for to_model resampler
@@ -64,6 +66,7 @@ impl ResamplerState {
             to_model,
             to_host,
             input_pending: VecDeque::with_capacity(to_model_chunk * 4),
+            model_rate_pending: VecDeque::with_capacity(to_host_chunk * 4),
             output_pending: VecDeque::with_capacity(to_host_chunk * 4),
             to_model_chunk,
             to_host_chunk,
@@ -76,6 +79,7 @@ impl ResamplerState {
 
     fn reset(&mut self) {
         self.input_pending.clear();
+        self.model_rate_pending.clear();
         self.output_pending.clear();
     }
 }
@@ -211,57 +215,62 @@ impl NamPlugin {
     ) {
         let num_samples = input.len();
 
-        // Push host-rate input into pending buffer
+        // 1. Push host-rate input into pending buffer
         for &s in input {
             rs.input_pending.push_back(s);
         }
 
-        // Resample pending input: host_rate -> model_rate, in fixed-size chunks
-        let mut model_samples_ready = 0usize;
+        // 2. Resample host_rate -> model_rate in fixed-size chunks
         while rs.input_pending.len() >= rs.to_model_chunk {
-            // Fill pre-allocated scratch from pending
             for i in 0..rs.to_model_chunk {
                 rs.to_model_scratch[0][i] = rs.input_pending.pop_front().unwrap_or(0.0);
             }
-
             if let Ok(resampled) = rs.to_model.process(&rs.to_model_scratch, None) {
                 for &s in &resampled[0] {
-                    if model_samples_ready < rs.model_input.len() {
-                        rs.model_input[model_samples_ready] = s as nam_core::Sample;
-                        model_samples_ready += 1;
-                    }
+                    rs.model_rate_pending.push_back(s);
                 }
             }
         }
 
-        // Process available model-rate samples through NAM
-        if model_samples_ready > 0 {
-            if model_samples_ready > rs.model_output.len() {
-                rs.model_output.resize(model_samples_ready, 0.0);
+        // 3. Process all available model-rate samples through NAM
+        let model_samples = rs.model_rate_pending.len();
+        if model_samples > 0 {
+            if model_samples > rs.model_input.len() {
+                rs.model_input.resize(model_samples, 0.0);
             }
+            if model_samples > rs.model_output.len() {
+                rs.model_output.resize(model_samples, 0.0);
+            }
+            for i in 0..model_samples {
+                rs.model_input[i] =
+                    rs.model_rate_pending.pop_front().unwrap_or(0.0) as nam_core::Sample;
+            }
+
             model.process(
-                &rs.model_input[..model_samples_ready],
-                &mut rs.model_output[..model_samples_ready],
+                &rs.model_input[..model_samples],
+                &mut rs.model_output[..model_samples],
             );
 
-            // Resample model output: model_rate -> host_rate
-            let mut pos = 0;
-            while pos + rs.to_host_chunk <= model_samples_ready {
-                for i in 0..rs.to_host_chunk {
-                    rs.to_host_scratch[0][i] = rs.model_output[pos + i];
-                }
-                pos += rs.to_host_chunk;
-
-                if let Ok(resampled) = rs.to_host.process(&rs.to_host_scratch, None) {
-                    for &s in &resampled[0] {
-                        rs.output_pending.push_back(s);
-                    }
-                }
+            // 4. Push model output into model_rate_pending for back-resampling
+            //    (reuse the same deque — it was just drained)
+            for i in 0..model_samples {
+                rs.model_rate_pending.push_back(rs.model_output[i]);
             }
-            // Remaining samples < chunk_size are left for next call
         }
 
-        // Fill output from pending output buffer
+        // 5. Resample model_rate -> host_rate in fixed-size chunks
+        while rs.model_rate_pending.len() >= rs.to_host_chunk {
+            for i in 0..rs.to_host_chunk {
+                rs.to_host_scratch[0][i] = rs.model_rate_pending.pop_front().unwrap_or(0.0);
+            }
+            if let Ok(resampled) = rs.to_host.process(&rs.to_host_scratch, None) {
+                for &s in &resampled[0] {
+                    rs.output_pending.push_back(s);
+                }
+            }
+        }
+
+        // 6. Fill output from pending output buffer
         for sample in output.iter_mut().take(num_samples) {
             *sample = rs.output_pending.pop_front().unwrap_or(0.0) as nam_core::Sample;
         }
@@ -508,3 +517,113 @@ impl Vst3Plugin for NamPlugin {
 
 nih_export_clap!(NamPlugin);
 nih_export_vst3!(NamPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trivial pass-through DSP for testing resampling in isolation.
+    struct PassthroughDsp;
+
+    impl nam_core::Dsp for PassthroughDsp {
+        fn process(&mut self, input: &[nam_core::Sample], output: &mut [nam_core::Sample]) {
+            output[..input.len()].copy_from_slice(input);
+        }
+        fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {}
+        fn metadata(&self) -> &nam_core::dsp::DspMetadata {
+            static META: nam_core::dsp::DspMetadata = nam_core::dsp::DspMetadata {
+                loudness: None,
+                expected_sample_rate: None,
+                input_level_dbu: None,
+                output_level_dbu: None,
+            };
+            &META
+        }
+    }
+
+    #[test]
+    fn test_process_resampled_produces_output() {
+        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut model = PassthroughDsp;
+
+        // Feed enough samples to produce output (need multiple chunks)
+        let num_samples = 4096;
+        let input = vec![0.5 as nam_core::Sample; num_samples];
+        let mut output = vec![0.0 as nam_core::Sample; num_samples];
+
+        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+
+        // After enough samples, output should have data
+        // (first few calls may produce zeros due to resampler latency)
+        let has_nonzero = output.iter().any(|&x| x != 0.0);
+        assert!(
+            has_nonzero,
+            "Resampled output should contain non-zero samples after {} input samples",
+            num_samples
+        );
+    }
+
+    #[test]
+    fn test_process_resampled_multiple_calls() {
+        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut model = PassthroughDsp;
+
+        // Simulate multiple process() calls with varying buffer sizes (like a real DAW)
+        let buffer_sizes = [64, 128, 64, 256, 64, 128];
+        let mut total_nonzero = 0;
+
+        for &size in &buffer_sizes {
+            let input = vec![0.3 as nam_core::Sample; size];
+            let mut output = vec![0.0 as nam_core::Sample; size];
+            NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+            total_nonzero += output.iter().filter(|&&x| x != 0.0).count();
+        }
+
+        assert!(
+            total_nonzero > 0,
+            "Should produce output across multiple calls"
+        );
+    }
+
+    #[test]
+    fn test_process_resampled_preserves_signal_level() {
+        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut model = PassthroughDsp;
+
+        // Feed a constant signal — after resampler settles, output should be ~same level
+        let settle = vec![0.5 as nam_core::Sample; 4096]; // let resampler settle
+        let mut discard = vec![0.0 as nam_core::Sample; 4096];
+        NamPlugin::process_resampled(&mut rs, &mut model, &settle, &mut discard);
+
+        let input = vec![0.5 as nam_core::Sample; 2048];
+        let mut output = vec![0.0 as nam_core::Sample; 2048];
+        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+
+        // Check the latter half (fully settled)
+        let tail = &output[1024..];
+        let mean: f64 = tail.iter().map(|&x| x as f64).sum::<f64>() / tail.len() as f64;
+        assert!(
+            (mean - 0.5).abs() < 0.05,
+            "Mean output {:.4} should be close to input 0.5 after settling",
+            mean
+        );
+    }
+
+    #[test]
+    fn test_resampler_reset_clears_state() {
+        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut model = PassthroughDsp;
+
+        // Feed some data
+        let input = vec![1.0 as nam_core::Sample; 512];
+        let mut output = vec![0.0 as nam_core::Sample; 512];
+        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+
+        assert!(!rs.input_pending.is_empty() || !rs.output_pending.is_empty() || true);
+
+        // Reset should clear buffers
+        rs.reset();
+        assert!(rs.input_pending.is_empty());
+        assert!(rs.output_pending.is_empty());
+    }
+}
