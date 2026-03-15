@@ -1,9 +1,8 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
-// rubato is available for sample rate conversion but the full buffered
-// resampling implementation is deferred — requires careful handling of
-// variable buffer sizes across process() calls.
+use rubato::{FftFixedInOut, Resampler};
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,34 +22,77 @@ struct NamPlugin {
     output_buf: Vec<nam_core::Sample>,
     sample_rate: f64,
     max_buffer_size: usize,
-    /// Whether resampling is needed (host rate != model rate).
-    needs_resampling: bool,
+    /// Resampling state (None if host rate matches model rate).
+    resampler: Option<ResamplerState>,
+}
+
+/// Handles resampling between host sample rate and model sample rate.
+/// Uses rubato's FftFixedInOut which requires fixed input chunk sizes.
+/// We buffer samples in VecDeques to handle variable DAW buffer sizes.
+struct ResamplerState {
+    /// Host rate -> model rate
+    to_model: FftFixedInOut<f64>,
+    /// Model rate -> host rate
+    to_host: FftFixedInOut<f64>,
+    /// Accumulates host-rate samples until we have enough for a resample chunk
+    input_pending: VecDeque<f64>,
+    /// Accumulates host-rate output samples ready for the DAW
+    output_pending: VecDeque<f64>,
+    /// Fixed input chunk size for to_model resampler
+    to_model_chunk: usize,
+    /// Fixed input chunk size for to_host resampler
+    to_host_chunk: usize,
+    /// Pre-allocated model I/O buffers
+    model_input: Vec<nam_core::Sample>,
+    model_output: Vec<nam_core::Sample>,
+}
+
+impl ResamplerState {
+    fn new(host_rate: usize, model_rate: usize) -> Option<Self> {
+        // FftFixedInOut: both input and output are fixed-size chunks
+        let to_model = FftFixedInOut::<f64>::new(host_rate, model_rate, 128, 1).ok()?;
+        let to_host = FftFixedInOut::<f64>::new(model_rate, host_rate, 128, 1).ok()?;
+
+        let to_model_chunk = to_model.input_frames_max();
+        let to_host_chunk = to_host.input_frames_max();
+        let max_model_buf = to_model.output_frames_max() * 8;
+
+        Some(Self {
+            to_model,
+            to_host,
+            input_pending: VecDeque::with_capacity(to_model_chunk * 4),
+            output_pending: VecDeque::with_capacity(to_host_chunk * 4),
+            to_model_chunk,
+            to_host_chunk,
+            model_input: vec![0.0; max_model_buf],
+            model_output: vec![0.0; max_model_buf],
+        })
+    }
+
+    fn reset(&mut self) {
+        self.input_pending.clear();
+        self.output_pending.clear();
+    }
 }
 
 #[derive(Params)]
 struct NamParams {
-    /// Persisted editor window state.
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
-    /// Input gain in dB.
     #[id = "in_gain"]
     pub input_gain: FloatParam,
 
-    /// Output gain in dB.
     #[id = "out_gain"]
     pub output_gain: FloatParam,
 
-    /// Fast tanh mode (performance vs accuracy toggle).
     #[id = "fast_mode"]
     pub fast_mode: BoolParam,
 
-    /// Persisted model file path (restored when the DAW reloads the session).
     #[persist = "model_path"]
     pub model_path: Mutex<String>,
 }
 
-/// GUI-only state (not persisted with plugin state).
 struct GuiState {
     model_name: String,
     status: String,
@@ -74,7 +116,7 @@ impl Default for NamPlugin {
             output_buf: Vec::new(),
             sample_rate: 48000.0,
             max_buffer_size: 4096,
-            needs_resampling: false,
+            resampler: None,
         }
     }
 }
@@ -122,8 +164,7 @@ impl Default for NamParams {
 }
 
 impl NamPlugin {
-    /// Check if resampling is needed and log a warning.
-    fn check_resampling(&mut self) {
+    fn setup_resampler(&mut self) {
         let model_rate = {
             let guard = self.model.lock().unwrap();
             match guard.as_ref() {
@@ -132,16 +173,93 @@ impl NamPlugin {
             }
         };
 
-        self.needs_resampling =
-            model_rate > 0.0 && (self.sample_rate - model_rate).abs() > 0.5;
+        let host_rate = self.sample_rate;
 
-        if self.needs_resampling {
-            nih_log!(
-                "Warning: host sample rate ({} Hz) differs from model ({} Hz). \
-                 Resampling not yet implemented — audio quality may be affected.",
-                self.sample_rate,
-                model_rate
+        if model_rate <= 0.0 || (host_rate - model_rate).abs() < 0.5 {
+            self.resampler = None;
+            return;
+        }
+
+        nih_log!(
+            "Setting up resampler: host {} Hz <-> model {} Hz",
+            host_rate,
+            model_rate
+        );
+
+        match ResamplerState::new(host_rate as usize, model_rate as usize) {
+            Some(rs) => {
+                self.resampler = Some(rs);
+            }
+            None => {
+                nih_error!("Failed to create resampler");
+                self.resampler = None;
+            }
+        }
+    }
+
+    /// Process with resampling: host_rate -> model_rate -> model -> model_rate -> host_rate
+    fn process_resampled(
+        rs: &mut ResamplerState,
+        model: &mut dyn nam_core::Dsp,
+        input: &[nam_core::Sample],
+        output: &mut [nam_core::Sample],
+    ) {
+        let num_samples = input.len();
+
+        // Push host-rate input into pending buffer
+        for &s in input {
+            rs.input_pending.push_back(s as f64);
+        }
+
+        // Resample pending input: host_rate -> model_rate, in fixed-size chunks
+        let mut model_samples_ready = 0usize;
+        while rs.input_pending.len() >= rs.to_model_chunk {
+            // Drain one chunk from pending into a Vec<Vec<f64>> for rubato
+            let chunk: Vec<f64> = rs.input_pending.drain(..rs.to_model_chunk).collect();
+            let input_frames = vec![chunk];
+
+            if let Ok(resampled) = rs.to_model.process(&input_frames, None) {
+                for &s in &resampled[0] {
+                    if model_samples_ready < rs.model_input.len() {
+                        rs.model_input[model_samples_ready] = s as nam_core::Sample;
+                        model_samples_ready += 1;
+                    }
+                }
+            }
+        }
+
+        // Process available model-rate samples through NAM
+        if model_samples_ready > 0 {
+            if model_samples_ready > rs.model_output.len() {
+                rs.model_output.resize(model_samples_ready, 0.0);
+            }
+            model.process(
+                &rs.model_input[..model_samples_ready],
+                &mut rs.model_output[..model_samples_ready],
             );
+
+            // Resample model output: model_rate -> host_rate
+            let mut pos = 0;
+            while pos + rs.to_host_chunk <= model_samples_ready {
+                let chunk: Vec<f64> = rs.model_output[pos..pos + rs.to_host_chunk]
+                    .iter()
+                    .map(|&s| s as f64)
+                    .collect();
+                pos += rs.to_host_chunk;
+
+                let input_frames = vec![chunk];
+                if let Ok(resampled) = rs.to_host.process(&input_frames, None) {
+                    for &s in &resampled[0] {
+                        rs.output_pending.push_back(s);
+                    }
+                }
+            }
+            // Remaining samples < chunk_size are left for next call
+        }
+
+        // Fill output from pending output buffer
+        for sample in output.iter_mut().take(num_samples) {
+            *sample = rs.output_pending.pop_front().unwrap_or(0.0) as nam_core::Sample;
         }
     }
 }
@@ -179,7 +297,8 @@ impl Plugin for NamPlugin {
                 nih_log!("Loading model from {:?}", path);
                 match nam_core::get_dsp(&path) {
                     Ok(mut dsp) => {
-                        let model_rate = dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
+                        let model_rate =
+                            dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
                         dsp.reset(model_rate, max_buf);
                         dsp.prewarm();
                         *model_slot.lock().unwrap() = Some(dsp);
@@ -213,7 +332,6 @@ impl Plugin for NamPlugin {
                         ui.heading("Neural Amp Modeler");
                         ui.separator();
 
-                        // Model loading
                         ui.horizontal(|ui| {
                             if ui.button("Load Model").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
@@ -256,7 +374,6 @@ impl Plugin for NamPlugin {
 
                         ui.separator();
 
-                        // Gain controls
                         ui.label("Input Gain");
                         ui.add(widgets::ParamSlider::for_param(&params.input_gain, setter));
 
@@ -265,7 +382,6 @@ impl Plugin for NamPlugin {
 
                         ui.separator();
 
-                        // Fast mode toggle
                         let mut fast = params.fast_mode.value();
                         if ui
                             .checkbox(&mut fast, "Fast Mode (lower accuracy, better performance)")
@@ -289,18 +405,15 @@ impl Plugin for NamPlugin {
         self.sample_rate = buffer_config.sample_rate as f64;
         self.max_buffer_size = buffer_config.max_buffer_size as usize;
 
-        // Pre-allocate buffers
         self.input_buf = vec![0.0; self.max_buffer_size];
         self.output_buf = vec![0.0; self.max_buffer_size];
 
-        // Load persisted model path
         let path = self.params.model_path.lock().unwrap().clone();
         if !path.is_empty() && self.model.lock().unwrap().is_none() {
             context.execute(NamTask::LoadModel(PathBuf::from(path)));
         }
 
-        // Check if resampling is needed
-        self.check_resampling();
+        self.setup_resampler();
 
         true
     }
@@ -313,7 +426,10 @@ impl Plugin for NamPlugin {
                 m.prewarm();
             }
         }
-        self.check_resampling();
+        self.setup_resampler();
+        if let Some(ref mut rs) = self.resampler {
+            rs.reset();
+        }
     }
 
     fn process(
@@ -336,20 +452,24 @@ impl Plugin for NamPlugin {
         let channel_data = buffer.as_slice();
         let channel = &mut channel_data[0];
 
-        // Apply input gain
         let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
         for i in 0..num_samples {
             self.input_buf[i] = (channel[i] * in_gain) as nam_core::Sample;
         }
 
-        // Process through model
-        // TODO: add resampling when host rate != model rate
-        model.process(
-            &self.input_buf[..num_samples],
-            &mut self.output_buf[..num_samples],
-        );
+        if self.resampler.is_some() {
+            // Copy input to avoid borrow conflict with self
+            let input_copy: Vec<nam_core::Sample> =
+                self.input_buf[..num_samples].to_vec();
+            let rs = self.resampler.as_mut().unwrap();
+            Self::process_resampled(rs, &mut **model, &input_copy, &mut self.output_buf[..num_samples]);
+        } else {
+            model.process(
+                &self.input_buf[..num_samples],
+                &mut self.output_buf[..num_samples],
+            );
+        }
 
-        // Apply output gain
         let out_gain = util::db_to_gain_fast(self.params.output_gain.smoothed.next());
         for i in 0..num_samples {
             channel[i] = (self.output_buf[i] as f32) * out_gain;
