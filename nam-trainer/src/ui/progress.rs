@@ -44,33 +44,31 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             let available = ui.available_height();
 
             if has_plot {
-                // Give ~65% of remaining space to the plot, ~35% to the log
-                let plot_height = (available * 0.65).clamp(120.0, 300.0);
-                let log_height = (available * 0.30).clamp(60.0, 200.0);
+                // Give ~55% to the plot, ~40% to the log
+                let plot_height = (available * 0.55).clamp(120.0, 300.0);
+                let log_height = (available * 0.40).clamp(100.0, 300.0);
 
                 ui.add_space(6.0);
                 show_loss_plot(app, ui, plot_height);
                 ui.add_space(4.0);
 
-                egui::ScrollArea::vertical()
-                    .max_height(log_height)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &app.training_log {
-                            ui.label(egui::RichText::new(line).monospace().size(11.0));
-                        }
-                    });
+                show_log(app, ui, log_height);
             } else {
                 // No plot — give all remaining space to the log
-                let log_height = available.max(80.0);
-                egui::ScrollArea::vertical()
-                    .max_height(log_height)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &app.training_log {
-                            ui.label(egui::RichText::new(line).monospace().size(11.0));
-                        }
-                    });
+                let log_height = available.max(100.0);
+                show_log(app, ui, log_height);
+            }
+        });
+}
+
+fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
+    egui::ScrollArea::vertical()
+        .max_height(height)
+        .stick_to_bottom(true)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width() - 14.0); // leave room for scrollbar
+            for line in &app.training_log {
+                ui.label(egui::RichText::new(line).monospace().size(11.0));
             }
         });
 }
