@@ -124,7 +124,7 @@ def main():
                 save_plot=request.get("save_plot", True),
                 silent=True,  # No matplotlib popups
                 modelname=basename,
-                ignore_checks=False,
+                ignore_checks=request.get("ignore_checks", True),
                 fit_mrstft=request.get("fit_mrstft", True),
                 threshold_esr=request.get("threshold_esr"),
                 user_metadata=user_metadata,
