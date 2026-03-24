@@ -144,19 +144,20 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             app.discovered_pythons = Some(discover_pythons());
         }
 
+        let combo_width = ui.available_width();
         ui.horizontal(|ui| {
             let discovered = app.discovered_pythons.as_ref().cloned().unwrap_or_default();
 
             let current_label = if app.python_path.is_empty() {
                 "(select Python)".to_string()
             } else {
-                truncate_path(&app.python_path, 50)
+                truncate_path(&app.python_path, 55)
             };
 
             let mut changed = false;
             egui::ComboBox::from_id_salt("python_combo")
                 .selected_text(current_label)
-                .width(ui.available_width() - 8.0)
+                .width(combo_width - 8.0)
                 .show_ui(ui, |ui| {
                     for entry in &discovered {
                         let label = format!("{} ({})", entry.label, entry.path);
@@ -449,6 +450,7 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
     egui::Frame::group(ui.style())
         .inner_margin(SECTION_MARGIN)
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.strong(title);
             ui.add_space(4.0);
             content(ui);
