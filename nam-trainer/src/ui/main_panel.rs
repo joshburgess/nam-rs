@@ -450,8 +450,9 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
         .inner_margin(SECTION_MARGIN)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 6.0;
             ui.strong(title);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             content(ui);
         });
 }
