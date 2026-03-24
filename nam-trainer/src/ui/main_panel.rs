@@ -103,11 +103,49 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
 
-    // Python path
+    // Python executable selector
+    // Auto-discover on first frame
+    if app.discovered_pythons.is_none() {
+        app.discovered_pythons = Some(discover_pythons());
+    }
+
     ui.horizontal(|ui| {
         ui.label("Python:");
-        let response = ui.text_edit_singleline(&mut app.python_path);
-        if response.lost_focus() {
+
+        let discovered = app.discovered_pythons.as_ref().cloned().unwrap_or_default();
+
+        // Show combo box with discovered Pythons + current selection + "Browse..." option
+        let current_label = if app.python_path.is_empty() {
+            "(select)".to_string()
+        } else {
+            // Show just the path, truncated
+            truncate_path(&app.python_path, 45)
+        };
+
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("python_combo")
+            .selected_text(current_label)
+            .width(350.0)
+            .show_ui(ui, |ui| {
+                for entry in &discovered {
+                    let label = format!("{} ({})", entry.label, entry.path);
+                    if ui
+                        .selectable_value(&mut app.python_path, entry.path.clone(), label)
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+                ui.separator();
+                if ui.selectable_label(false, "Browse for Python executable...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        app.python_path = path.display().to_string();
+                        changed = true;
+                    }
+                }
+            });
+
+        if changed {
             app.settings.python_path = Some(app.python_path.clone());
             app.settings.save();
             app.python_status = crate::app::PythonStatus::Unknown;
@@ -183,6 +221,95 @@ fn start_training(app: &mut TrainerApp) {
     let (handle, rx) = worker::spawn(app);
     app.worker = Some(handle);
     app.message_rx = Some(rx);
+}
+
+#[derive(Clone)]
+pub struct PythonEntry {
+    pub label: String,
+    pub path: String,
+}
+
+fn discover_pythons() -> Vec<PythonEntry> {
+    let mut found: Vec<PythonEntry> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Candidates to search for on PATH
+    let candidates = ["python3", "python"];
+
+    for name in &candidates {
+        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // Resolve symlinks to get the real path
+                let resolved = std::fs::canonicalize(&path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| path.clone());
+                if !seen.contains(&resolved) {
+                    seen.insert(resolved.clone());
+                    // Try to get version
+                    let version = std::process::Command::new(&path)
+                        .args(["--version"])
+                        .output()
+                        .ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let label = if version.is_empty() {
+                        name.to_string()
+                    } else {
+                        version
+                    };
+                    found.push(PythonEntry {
+                        label,
+                        path: path.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Look for conda environments
+    if let Some(home) = dirs_for_home() {
+        let conda_dirs = [
+            home.join("miniconda3").join("envs"),
+            home.join("anaconda3").join("envs"),
+            home.join("miniforge3").join("envs"),
+            home.join(".conda").join("envs"),
+        ];
+        for envs_dir in &conda_dirs {
+            if let Ok(entries) = std::fs::read_dir(envs_dir) {
+                for entry in entries.flatten() {
+                    let env_python = entry.path().join("bin").join("python");
+                    if env_python.exists() {
+                        let path = env_python.display().to_string();
+                        let resolved = std::fs::canonicalize(&path)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| path.clone());
+                        if !seen.contains(&resolved) {
+                            seen.insert(resolved);
+                            let env_name = entry.file_name().to_string_lossy().to_string();
+                            found.push(PythonEntry {
+                                label: format!("conda: {}", env_name),
+                                path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    found
+}
+
+fn dirs_for_home() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+    }
 }
 
 fn truncate_path(path: &str, max_len: usize) -> String {

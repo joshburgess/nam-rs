@@ -32,7 +32,8 @@ pub struct TrainerApp {
     // Python executable path
     pub python_path: String,
 
-    // Python environment status
+    // Python discovery and environment status
+    pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
     pub python_status: PythonStatus,
     python_check_rx: Option<mpsc::Receiver<PythonStatus>>,
 }
@@ -235,6 +236,7 @@ impl TrainerApp {
                 .python_path
                 .clone()
                 .unwrap_or_else(|| "python3".to_string()),
+            discovered_pythons: None,
             python_status: PythonStatus::Unknown,
             python_check_rx: None,
             settings,
