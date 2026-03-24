@@ -482,39 +482,53 @@ fn discover_pythons() -> Vec<PythonEntry> {
     let mut found: Vec<PythonEntry> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for name in &["python3", "python"] {
-        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
+    // Platform-specific: which command and candidate names
+    #[cfg(not(target_os = "windows"))]
+    let (which_cmd, candidates) = ("which", vec!["python3", "python"]);
+    #[cfg(target_os = "windows")]
+    let (which_cmd, candidates) = ("where", vec!["python", "python3"]);
+
+    for name in &candidates {
+        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
             if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let resolved = std::fs::canonicalize(&path)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| path.clone());
-                if seen.insert(resolved) {
-                    let version = std::process::Command::new(&path)
-                        .args(["--version"])
-                        .output()
-                        .ok()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_default();
-                    found.push(PythonEntry {
-                        label: if version.is_empty() {
-                            name.to_string()
-                        } else {
-                            version
-                        },
-                        path,
-                    });
+                // `where` on Windows can return multiple lines; take each one
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let path = line.trim().to_string();
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let resolved = std::fs::canonicalize(&path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| path.clone());
+                    if seen.insert(resolved) {
+                        let version = std::process::Command::new(&path)
+                            .args(["--version"])
+                            .output()
+                            .ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                            .unwrap_or_default();
+                        found.push(PythonEntry {
+                            label: if version.is_empty() {
+                                name.to_string()
+                            } else {
+                                version
+                            },
+                            path,
+                        });
+                    }
                 }
             }
         }
     }
 
+    // Conda environments
     if let Some(home) = home_dir() {
         for base in &["miniconda3", "anaconda3", "miniforge3", ".conda"] {
             let envs_dir = home.join(base).join("envs");
             if let Ok(entries) = std::fs::read_dir(&envs_dir) {
                 for entry in entries.flatten() {
-                    let env_python = entry.path().join("bin").join("python");
+                    let env_python = conda_python_path(&entry.path());
                     if env_python.exists() {
                         let path = env_python.display().to_string();
                         let resolved = std::fs::canonicalize(&path)
@@ -534,6 +548,18 @@ fn discover_pythons() -> Vec<PythonEntry> {
     }
 
     found
+}
+
+/// Returns the path to the python executable inside a conda environment.
+fn conda_python_path(env_dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(not(target_os = "windows"))]
+    {
+        env_dir.join("bin").join("python")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        env_dir.join("python.exe")
+    }
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {

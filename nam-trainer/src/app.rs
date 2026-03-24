@@ -272,7 +272,7 @@ impl TrainerApp {
             python_path: settings
                 .python_path
                 .clone()
-                .unwrap_or_else(|| "python3".to_string()),
+                .unwrap_or_else(default_python_name),
             discovered_pythons: None,
             python_status: PythonStatus::Unknown,
             python_check_rx: None,
@@ -411,45 +411,41 @@ print(json.dumps(result))
         self.install_log
             .push("Installing Python via Miniforge...".into());
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let home = home_dir_string();
         let install_dir = format!("{home}/miniforge3");
 
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
 
-            let installer_url = if cfg!(target_os = "macos") {
-                if cfg!(target_arch = "aarch64") {
-                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
-                } else {
-                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh"
+            // Platform-specific installer URL and file extension
+            let (installer_url, installer_ext) = miniforge_installer_info();
+            let installer_url = match installer_url {
+                Some(url) => url,
+                None => {
+                    let _ = tx.send(InstallMessage::Log(
+                        "Automatic Python install is not supported on this platform.".into(),
+                    ));
+                    let _ = tx.send(InstallMessage::Done { success: false });
+                    return;
                 }
-            } else if cfg!(target_os = "linux") {
-                if cfg!(target_arch = "aarch64") {
-                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
-                } else {
-                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-                }
-            } else {
-                let _ = tx.send(InstallMessage::Log(
-                    "Automatic Python install is only supported on macOS and Linux.".into(),
-                ));
-                let _ = tx.send(InstallMessage::Done { success: false });
-                return;
             };
 
-            let installer_path = format!("{}/miniforge_installer.sh", std::env::temp_dir().display());
+            let installer_path = format!(
+                "{}/miniforge_installer{}",
+                std::env::temp_dir().display(),
+                installer_ext
+            );
 
             // Step 1: Download
-            let _ = tx.send(InstallMessage::Log(format!("Downloading Miniforge from {installer_url}...")));
-            let dl = std::process::Command::new("curl")
-                .args(["-fSL", "-o", &installer_path, installer_url])
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let _ = tx.send(InstallMessage::Log(format!(
+                "Downloading Miniforge from {installer_url}..."
+            )));
 
+            let dl = download_file(installer_url, &installer_path);
             let mut dl_child = match dl {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!("Failed to start curl: {e}")));
+                    let _ = tx.send(InstallMessage::Log(format!("Failed to start download: {e}")));
                     let _ = tx.send(InstallMessage::Done { success: false });
                     return;
                 }
@@ -472,11 +468,7 @@ print(json.dumps(result))
 
             // Step 2: Run installer in batch mode
             let _ = tx.send(InstallMessage::Log(format!("Installing to {install_dir}...")));
-            let install = std::process::Command::new("bash")
-                .args([&installer_path, "-b", "-u", "-p", &install_dir])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let install = run_miniforge_installer(&installer_path, &install_dir);
 
             let mut inst_child = match install {
                 Ok(c) => c,
@@ -505,7 +497,7 @@ print(json.dumps(result))
             // Clean up installer
             let _ = std::fs::remove_file(&installer_path);
 
-            let python_path = format!("{install_dir}/bin/python");
+            let python_path = miniforge_python_path(&install_dir);
             let _ = tx.send(InstallMessage::Log(format!(
                 "Python installed at {python_path}"
             )));
@@ -568,7 +560,7 @@ print(json.dumps(result))
         self.install_log.push("Removing ~/miniforge3 (includes NAM if installed there)...".into());
 
         std::thread::spawn(move || {
-            let home = std::env::var("HOME").unwrap_or_default();
+            let home = home_dir_string();
             let miniforge_dir = std::path::PathBuf::from(&home).join("miniforge3");
 
             if miniforge_dir.exists() {
@@ -599,8 +591,9 @@ print(json.dumps(result))
         });
 
         // Reset to system python immediately so the UI updates
-        self.python_path = "python3".to_string();
-        self.settings.python_path = Some("python3".to_string());
+        let default_python = default_python_name();
+        self.python_path = default_python.clone();
+        self.settings.python_path = Some(default_python);
         self.settings.save();
         self.discovered_pythons = None;
         self.python_status = PythonStatus::Unknown;
@@ -712,6 +705,109 @@ print(json.dumps(result))
         }
     }
 
+}
+
+// ── Platform helpers ────────────────────────────────────────────────────
+
+fn home_dir_string() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/tmp".into())
+}
+
+fn default_python_name() -> String {
+    if cfg!(target_os = "windows") {
+        "python".to_string()
+    } else {
+        "python3".to_string()
+    }
+}
+
+/// Returns (Option<url>, file_extension) for the Miniforge installer.
+fn miniforge_installer_info() -> (Option<&'static str>, &'static str) {
+    if cfg!(target_os = "macos") {
+        let url = if cfg!(target_arch = "aarch64") {
+            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
+        } else {
+            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh"
+        };
+        (Some(url), ".sh")
+    } else if cfg!(target_os = "linux") {
+        let url = if cfg!(target_arch = "aarch64") {
+            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+        } else {
+            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+        };
+        (Some(url), ".sh")
+    } else if cfg!(target_os = "windows") {
+        (
+            Some("https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe"),
+            ".exe",
+        )
+    } else {
+        (None, "")
+    }
+}
+
+/// Download a file using curl (macOS/Linux) or PowerShell (Windows).
+fn download_file(
+    url: &str,
+    dest: &str,
+) -> Result<std::process::Child, std::io::Error> {
+    if cfg!(target_os = "windows") {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
+                    url, dest
+                ),
+            ])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    } else {
+        std::process::Command::new("curl")
+            .args(["-fSL", "-o", dest, url])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    }
+}
+
+/// Run the Miniforge installer in silent/batch mode.
+fn run_miniforge_installer(
+    installer_path: &str,
+    install_dir: &str,
+) -> Result<std::process::Child, std::io::Error> {
+    if cfg!(target_os = "windows") {
+        // Windows .exe installer with /S (silent) /D=path (destination)
+        std::process::Command::new(installer_path)
+            .args([
+                "/S",
+                "/InstallationType=JustMe",
+                "/RegisterPython=0",
+                "/AddToPath=0",
+                &format!("/D={}", install_dir),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    } else {
+        std::process::Command::new("bash")
+            .args([installer_path, "-b", "-u", "-p", install_dir])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    }
+}
+
+/// Returns the path to the python executable inside a miniforge install.
+fn miniforge_python_path(install_dir: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{install_dir}\\python.exe")
+    } else {
+        format!("{install_dir}/bin/python")
+    }
 }
 
 fn parse_version_tuple(version: &str) -> Option<(u32, u32)> {
