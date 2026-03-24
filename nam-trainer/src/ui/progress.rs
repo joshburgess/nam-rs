@@ -64,7 +64,7 @@ fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
     ui.add_space(8.0);
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(20, 20, 25))
-        .rounding(4.0)
+        .corner_radius(4.0)
         .inner_margin(8.0)
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 60)))
         .show(ui, |ui| {
