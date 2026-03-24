@@ -363,6 +363,12 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.add_space(8.0);
 
     // ── Train button ────────────────────────────────────────────────────
+    // Only show when Python + NAM are ready and no install/uninstall is in progress
+    let env_ready = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
+    let no_active_install = !matches!(app.install_state, crate::app::InstallState::Installing(_))
+        && app.install_log.is_empty();
+
+    if env_ready && no_active_install {
     match &app.training_state {
         TrainingState::Idle => {
             let can_train = app.can_train();
@@ -442,6 +448,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
         }
     }
+    } // env_ready && no_active_install
 
     // ── Progress / Log ──────────────────────────────────────────────────
     if !app.training_log.is_empty() {
