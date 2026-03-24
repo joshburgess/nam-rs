@@ -3,7 +3,28 @@ use crate::worker::{self, TrainingState};
 
 pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.heading("NAM Trainer");
-    ui.add_space(8.0);
+
+    // Python/GPU status line
+    ui.horizontal(|ui| {
+        match &app.python_status {
+            crate::app::PythonStatus::Unknown => {
+                ui.colored_label(egui::Color32::GRAY, "Checking Python...");
+            }
+            crate::app::PythonStatus::Ok { gpu } => {
+                let gpu_label = match gpu.as_deref() {
+                    Some("cuda") => "CUDA",
+                    Some("mps") => "MPS",
+                    _ => "CPU only",
+                };
+                ui.colored_label(egui::Color32::GREEN, format!("Python OK ({gpu_label})"));
+            }
+            crate::app::PythonStatus::Error(msg) => {
+                ui.colored_label(egui::Color32::RED, format!("Python: {msg}"));
+            }
+        }
+    });
+
+    ui.add_space(4.0);
 
     // Input audio
     ui.horizontal(|ui| {
@@ -22,6 +43,11 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             ui.label(truncate_path(p, 50));
         } else {
             ui.colored_label(egui::Color32::GRAY, "No file selected");
+        }
+        if ui.small_button("Download standard input").clicked() {
+            let _ = open::that(
+                "https://drive.google.com/drive/folders/1cZTalC-9sSugQn3pn5JGBxuUxJbmHEoZ",
+            );
         }
     });
 
@@ -84,6 +110,8 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         if response.lost_focus() {
             app.settings.python_path = Some(app.python_path.clone());
             app.settings.save();
+            app.python_status = crate::app::PythonStatus::Unknown;
+            app.check_python();
         }
     });
 

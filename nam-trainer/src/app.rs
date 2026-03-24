@@ -31,6 +31,17 @@ pub struct TrainerApp {
 
     // Python executable path
     pub python_path: String,
+
+    // Python environment status
+    pub python_status: PythonStatus,
+    python_check_rx: Option<mpsc::Receiver<PythonStatus>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PythonStatus {
+    Unknown,
+    Ok { gpu: Option<String> },
+    Error(String),
 }
 
 #[derive(Clone)]
@@ -207,7 +218,7 @@ pub struct EpochStats {
 impl TrainerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
-        Self {
+        let mut app = Self {
             input_path: settings.last_input_path.clone(),
             output_paths: Vec::new(),
             destination_dir: settings.last_destination.clone(),
@@ -224,8 +235,68 @@ impl TrainerApp {
                 .python_path
                 .clone()
                 .unwrap_or_else(|| "python3".to_string()),
+            python_status: PythonStatus::Unknown,
+            python_check_rx: None,
             settings,
-        }
+        };
+        app.check_python();
+        app
+    }
+
+    /// Spawn a background thread to verify Python + NAM are available and detect GPU.
+    pub fn check_python(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.python_check_rx = Some(rx);
+        let python = self.python_path.clone();
+
+        std::thread::spawn(move || {
+            let script = r#"
+import json, sys
+result = {"nam": False, "gpu": None}
+try:
+    from nam.train import core
+    result["nam"] = True
+except ImportError:
+    pass
+try:
+    import torch
+    if torch.cuda.is_available():
+        result["gpu"] = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        result["gpu"] = "mps"
+except ImportError:
+    pass
+print(json.dumps(result))
+"#;
+            let output = std::process::Command::new(&python)
+                .args(["-c", script])
+                .output();
+
+            let status = match output {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                        let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let gpu = val.get("gpu").and_then(|v| v.as_str()).map(String::from);
+                        if nam_ok {
+                            PythonStatus::Ok { gpu }
+                        } else {
+                            PythonStatus::Error(
+                                "NAM not installed. Run: pip install neural-amp-modeler".into(),
+                            )
+                        }
+                    } else {
+                        PythonStatus::Error("Unexpected Python output".into())
+                    }
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    PythonStatus::Error(format!("Python error: {}", stderr.lines().next().unwrap_or("unknown")))
+                }
+                Err(e) => PythonStatus::Error(format!("Cannot run '{}': {}", python, e)),
+            };
+            let _ = tx.send(status);
+        });
     }
 
     pub fn can_train(&self) -> bool {
@@ -285,11 +356,21 @@ impl TrainerApp {
             }
         }
     }
+
+    fn poll_python_check(&mut self) {
+        if let Some(ref rx) = self.python_check_rx {
+            if let Ok(status) = rx.try_recv() {
+                self.python_status = status;
+                self.python_check_rx = None;
+            }
+        }
+    }
 }
 
 impl eframe::App for TrainerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
+        self.poll_python_check();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui::main_panel::show(self, ui);

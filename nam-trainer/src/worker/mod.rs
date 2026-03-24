@@ -2,7 +2,7 @@ pub mod protocol;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::app::TrainerApp;
@@ -33,13 +33,16 @@ pub enum WorkerMessage {
 }
 
 pub struct WorkerHandle {
-    child: Option<Child>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl WorkerHandle {
     pub fn cancel(&mut self) {
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+            }
+            *guard = None;
         }
     }
 }
@@ -81,9 +84,10 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
 
     let request_json = serde_json::to_string(&request).unwrap_or_default();
     let python_path = app.python_path.clone();
-
-    // Find the worker script relative to the executable
     let worker_script = find_worker_script();
+
+    let child_arc: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let child_arc_thread = Arc::clone(&child_arc);
 
     thread::spawn(move || {
         let result = Command::new(&python_path)
@@ -109,8 +113,16 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
             let _ = writeln!(stdin, "{}", request_json);
         }
 
+        // Take stdout before storing child in the Arc
+        let stdout = child.stdout.take();
+
+        // Store child in the shared Arc so the main thread can kill it
+        if let Ok(mut guard) = child_arc_thread.lock() {
+            *guard = Some(child);
+        }
+
         // Read stdout line by line
-        if let Some(stdout) = child.stdout.take() {
+        if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let line = match line {
@@ -140,14 +152,16 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
         }
 
         // Wait for process to finish
-        let _ = child.wait();
+        if let Ok(mut guard) = child_arc_thread.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.wait();
+            }
+            *guard = None;
+        }
         let _ = tx.send(WorkerMessage::WorkerExited);
     });
 
-    // We don't have the Child in the main thread (it's in the spawned thread),
-    // so we can't kill it directly. For now, we'll use a simple handle.
-    // A more robust solution would use Arc<Mutex<Child>>.
-    let handle = WorkerHandle { child: None };
+    let handle = WorkerHandle { child: child_arc };
     (handle, rx)
 }
 
@@ -183,14 +197,13 @@ fn event_to_message(event: protocol::WorkerEvent) -> WorkerMessage {
 }
 
 fn find_worker_script() -> String {
-    // Look for the worker script relative to the executable, then in common locations
     let candidates = [
         // Next to the binary
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("python").join("nam_worker.py")))
             .unwrap_or_default(),
-        // Development location
+        // Development: binary is in target/debug/, project root is ../../
         std::env::current_exe()
             .ok()
             .and_then(|p| {
@@ -213,7 +226,6 @@ fn find_worker_script() -> String {
         }
     }
 
-    // Fallback
     "nam_worker.py".to_string()
 }
 
