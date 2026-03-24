@@ -306,9 +306,18 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 let btn = egui::Button::new(btn_text)
                     .min_size(egui::vec2(ui.available_width(), 34.0));
 
-                if ui.add_enabled(can_train, btn).clicked() {
-                    start_training(app);
-                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can_train, btn).clicked() {
+                        start_training(app);
+                    }
+                    if ui
+                        .small_button("Demo")
+                        .on_hover_text("Simulate training to preview the progress UI")
+                        .clicked()
+                    {
+                        app.start_demo_training();
+                    }
+                });
                 if !can_train {
                     let mut missing = Vec::new();
                     if app.input_path.is_none() {

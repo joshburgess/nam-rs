@@ -647,6 +647,46 @@ print(json.dumps(result))
         });
     }
 
+    /// Start a demo training simulation (for testing the progress UI).
+    pub fn start_demo_training(&mut self) {
+        use crate::worker::{TrainingState, WorkerMessage};
+
+        self.training_state = TrainingState::Training;
+        self.training_log.clear();
+        self.epoch_history.clear();
+        self.training_log.push("Demo training started...".into());
+
+        let (tx, rx) = mpsc::channel();
+        self.message_rx = Some(rx);
+
+        let epochs = self.config.epochs;
+        std::thread::spawn(move || {
+            for epoch in 1..=epochs {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // Simulate decreasing loss with some noise
+                let progress = epoch as f64 / epochs as f64;
+                let noise = ((epoch as f64 * 7.3).sin() * 0.02).abs();
+                let train_loss = 0.5 * (-3.0 * progress).exp() + noise;
+                let val_loss = 0.55 * (-2.8 * progress).exp() + noise * 1.2;
+                let esr = 0.4 * (-2.5 * progress).exp() + noise * 0.5;
+
+                let _ = tx.send(WorkerMessage::EpochEnd {
+                    epoch,
+                    train_loss,
+                    val_loss,
+                    esr,
+                });
+                let _ = tx.send(WorkerMessage::Log(format!(
+                    "Epoch {epoch}/{epochs}: train={train_loss:.6} val={val_loss:.6} ESR={esr:.6}"
+                )));
+            }
+            let _ = tx.send(WorkerMessage::TrainingComplete {
+                model_path: "/tmp/demo_model.nam".into(),
+                esr: 0.01,
+            });
+        });
+    }
+
     pub fn can_train(&self) -> bool {
         self.input_path.is_some()
             && !self.output_paths.is_empty()
