@@ -228,7 +228,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             if ui.add_enabled(can_train, btn).clicked() {
                 start_training(app);
             }
-            if !can_train && matches!(app.python_status, crate::app::PythonStatus::Ok { .. }) {
+            if !can_train {
                 let mut missing = Vec::new();
                 if app.input_path.is_none() {
                     missing.push("input audio");
