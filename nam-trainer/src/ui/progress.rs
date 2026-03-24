@@ -23,8 +23,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 let fraction = current as f32 / total.max(1) as f32;
                 ui.add(
                     egui::ProgressBar::new(fraction)
-                        .text(format!("{current}/{total} epochs"))
-                        .animate(true),
+                        .text(format!("{current}/{total} epochs")),
                 );
 
                 // Stats row
