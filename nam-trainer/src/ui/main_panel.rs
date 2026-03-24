@@ -11,13 +11,22 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             // Python/GPU status badge
             // Show install_state spinner during active installs, otherwise show python_status
             let (min_maj, min_min) = crate::app::NAM_MIN_PYTHON;
-            let installing = app.install_state == crate::app::InstallState::Installing;
+            let active_action = match &app.install_state {
+                crate::app::InstallState::Installing(action) => Some(action.clone()),
+                _ => None,
+            };
 
-            if installing {
+            if let Some(action) = &active_action {
                 ui.spinner();
+                let label = match action {
+                    crate::app::InstallAction::InstallingPython => "Installing Python...",
+                    crate::app::InstallAction::InstallingNam => "Installing NAM...",
+                    crate::app::InstallAction::UninstallingNam => "Uninstalling NAM...",
+                    crate::app::InstallAction::UninstallingMiniforge => "Removing Miniforge...",
+                };
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 180, 60),
-                    "Installing...",
+                    label,
                 );
             } else {
                 match &app.python_status {
@@ -258,7 +267,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             });
 
             // Management buttons — only when not mid-install
-            let not_installing = app.install_state != crate::app::InstallState::Installing;
+            let not_installing = !matches!(app.install_state, crate::app::InstallState::Installing(_));
             if not_installing {
                 let miniforge_dir = home_dir()
                     .map(|h| h.join("miniforge3"))
@@ -309,8 +318,17 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             .inner_margin(8.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Installation");
-                    if app.install_state == crate::app::InstallState::Installing {
+                    let header = match &app.install_state {
+                        crate::app::InstallState::Installing(action) => match action {
+                            crate::app::InstallAction::InstallingPython => "Installing Python",
+                            crate::app::InstallAction::InstallingNam => "Installing NAM",
+                            crate::app::InstallAction::UninstallingNam => "Uninstalling NAM",
+                            crate::app::InstallAction::UninstallingMiniforge => "Removing Miniforge",
+                        },
+                        _ => "Setup",
+                    };
+                    ui.strong(header);
+                    if matches!(app.install_state, crate::app::InstallState::Installing(_)) {
                         ui.spinner();
                     }
                     if matches!(

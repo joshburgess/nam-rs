@@ -46,9 +46,17 @@ pub struct TrainerApp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstallState {
     Idle,
-    Installing,
+    Installing(InstallAction),
     Done,
     Failed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstallAction {
+    InstallingPython,
+    InstallingNam,
+    UninstallingNam,
+    UninstallingMiniforge,
 }
 
 /// Minimum Python version required by neural-amp-modeler.
@@ -354,7 +362,7 @@ print(json.dumps(result))
     pub fn install_nam(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.install_rx = Some(rx);
-        self.install_state = InstallState::Installing;
+        self.install_state = InstallState::Installing(InstallAction::InstallingNam);
         self.install_log.clear();
         self.install_log
             .push("Installing neural-amp-modeler...".into());
@@ -398,7 +406,7 @@ print(json.dumps(result))
     pub fn install_python(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.install_rx = Some(rx);
-        self.install_state = InstallState::Installing;
+        self.install_state = InstallState::Installing(InstallAction::InstallingPython);
         self.install_log.clear();
         self.install_log
             .push("Installing Python via Miniforge...".into());
@@ -555,9 +563,9 @@ print(json.dumps(result))
     pub fn uninstall_miniforge(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.install_rx = Some(rx);
-        self.install_state = InstallState::Installing;
+        self.install_state = InstallState::Installing(InstallAction::UninstallingMiniforge);
         self.install_log.clear();
-        self.install_log.push("Removing ~/miniforge3...".into());
+        self.install_log.push("Removing ~/miniforge3 (includes NAM if installed there)...".into());
 
         std::thread::spawn(move || {
             let home = std::env::var("HOME").unwrap_or_default();
@@ -603,7 +611,7 @@ print(json.dumps(result))
     pub fn uninstall_nam(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.install_rx = Some(rx);
-        self.install_state = InstallState::Installing;
+        self.install_state = InstallState::Installing(InstallAction::UninstallingNam);
         self.install_log.clear();
         self.install_log
             .push("Uninstalling neural-amp-modeler...".into());
