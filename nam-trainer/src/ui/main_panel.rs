@@ -144,20 +144,19 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             app.discovered_pythons = Some(discover_pythons());
         }
 
-        let combo_width = ui.available_width();
-        ui.horizontal(|ui| {
-            let discovered = app.discovered_pythons.as_ref().cloned().unwrap_or_default();
+        let full_width = ui.available_width();
+        let mut changed = false;
+        let discovered = app.discovered_pythons.as_ref().cloned().unwrap_or_default();
 
-            let current_label = if app.python_path.is_empty() {
-                "(select Python)".to_string()
-            } else {
-                truncate_path(&app.python_path, 55)
-            };
+        let current_label = if app.python_path.is_empty() {
+            "(select Python)".to_string()
+        } else {
+            truncate_path(&app.python_path, 55)
+        };
 
-            let mut changed = false;
-            egui::ComboBox::from_id_salt("python_combo")
-                .selected_text(current_label)
-                .width(combo_width - 8.0)
+        egui::ComboBox::from_id_salt("python_combo")
+            .selected_text(current_label)
+            .width(full_width)
                 .show_ui(ui, |ui| {
                     for entry in &discovered {
                         let label = format!("{} ({})", entry.label, entry.path);
@@ -184,13 +183,12 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     }
                 });
 
-            if changed {
-                app.settings.python_path = Some(app.python_path.clone());
-                app.settings.save();
-                app.python_status = crate::app::PythonStatus::Unknown;
-                app.check_python();
-            }
-        });
+        if changed {
+            app.settings.python_path = Some(app.python_path.clone());
+            app.settings.save();
+            app.python_status = crate::app::PythonStatus::Unknown;
+            app.check_python();
+        }
 
         // Management buttons
         let not_installing =
