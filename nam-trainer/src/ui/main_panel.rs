@@ -121,14 +121,28 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         });
 
         // Device selector — only show when multiple devices available
-        if let crate::app::PythonStatus::Ok { devices, .. } = &app.python_status {
+        if let crate::app::PythonStatus::Ok {
+            devices, warnings, ..
+        } = &app.python_status
+        {
             if devices.len() > 1 {
                 ui.horizontal(|ui| {
                     ui.label("Device:");
                     ui.add_space(4.0);
                     for dev in devices {
-                        ui.selectable_value(&mut app.selected_device, dev.id.clone(), &dev.name);
+                        ui.selectable_value(
+                            &mut app.selected_device,
+                            dev.id.clone(),
+                            &dev.name,
+                        );
                     }
+                });
+            }
+
+            // GPU warnings (e.g., NVIDIA hardware detected but PyTorch lacks CUDA)
+            for warning in warnings {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(AMBER, format!("\u{26A0} {warning}"));
                 });
             }
         }
@@ -429,7 +443,7 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 ui.spinner();
                 ui.colored_label(DIM, "Checking Python...");
             }
-            crate::app::PythonStatus::Ok { version, devices } => {
+            crate::app::PythonStatus::Ok { version, devices, .. } => {
                 let best = devices
                     .iter()
                     .find(|d| d.id.starts_with("cuda") || d.id == "mps")
