@@ -62,14 +62,23 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 }
 
 fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
-    egui::ScrollArea::vertical()
-        .max_height(height)
-        .stick_to_bottom(true)
+    ui.add_space(8.0);
+    egui::Frame::default()
+        .fill(egui::Color32::from_rgb(20, 20, 25))
+        .rounding(4.0)
+        .inner_margin(8.0)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 60)))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width() - 14.0); // leave room for scrollbar
-            for line in &app.training_log {
-                ui.label(egui::RichText::new(line).monospace().size(11.0));
-            }
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width() - 14.0);
+                    for line in &app.training_log {
+                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                    }
+                });
         });
 }
 
