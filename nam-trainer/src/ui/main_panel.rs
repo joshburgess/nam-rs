@@ -9,32 +9,34 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         ui.heading("NAM Trainer");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Python/GPU status badge
+            // Show install_state spinner during active installs, otherwise show python_status
             let (min_maj, min_min) = crate::app::NAM_MIN_PYTHON;
-            match &app.python_status {
-                crate::app::PythonStatus::Unknown => {
-                    ui.spinner();
-                    ui.colored_label(egui::Color32::GRAY, "Checking Python...");
-                }
-                crate::app::PythonStatus::Ok { gpu, version } => {
-                    let gpu_label = match gpu.as_deref() {
-                        Some("cuda") => "CUDA GPU",
-                        Some("mps") => "Apple GPU",
-                        _ => "CPU",
-                    };
-                    ui.colored_label(
-                        egui::Color32::from_rgb(80, 200, 120),
-                        format!("Ready — Python {version}, {gpu_label}"),
-                    );
-                }
-                crate::app::PythonStatus::VersionTooOld { version } => {
-                    let installing = app.install_state == crate::app::InstallState::Installing;
-                    if installing {
+            let installing = app.install_state == crate::app::InstallState::Installing;
+
+            if installing {
+                ui.spinner();
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 60),
+                    "Installing...",
+                );
+            } else {
+                match &app.python_status {
+                    crate::app::PythonStatus::Unknown => {
                         ui.spinner();
+                        ui.colored_label(egui::Color32::GRAY, "Checking Python...");
+                    }
+                    crate::app::PythonStatus::Ok { gpu, version } => {
+                        let gpu_label = match gpu.as_deref() {
+                            Some("cuda") => "CUDA GPU",
+                            Some("mps") => "Apple GPU",
+                            _ => "CPU",
+                        };
                         ui.colored_label(
-                            egui::Color32::from_rgb(255, 180, 60),
-                            "Installing Python...",
+                            egui::Color32::from_rgb(80, 200, 120),
+                            format!("Ready — Python {version}, {gpu_label}"),
                         );
-                    } else {
+                    }
+                    crate::app::PythonStatus::VersionTooOld { version } => {
                         let clicked = ui
                             .button("Install Python")
                             .on_hover_text(
@@ -49,46 +51,25 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                             app.install_python();
                         }
                     }
-                }
-                crate::app::PythonStatus::Error(msg) => {
-                    if msg.contains("not installed") {
-                        let ist = app.install_state.clone();
-                        match ist {
-                            crate::app::InstallState::Idle
-                            | crate::app::InstallState::Failed => {
-                                let clicked = ui
-                                    .button("Install NAM")
-                                    .on_hover_text(
-                                        "Runs: pip install neural-amp-modeler",
-                                    )
-                                    .clicked();
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 180, 60),
-                                    "NAM not installed",
-                                );
-                                if clicked {
-                                    app.install_nam();
-                                }
+                    crate::app::PythonStatus::Error(msg) => {
+                        if msg.contains("not installed") {
+                            let clicked = ui
+                                .button("Install NAM")
+                                .on_hover_text("Runs: pip install neural-amp-modeler")
+                                .clicked();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 180, 60),
+                                "NAM not installed",
+                            );
+                            if clicked {
+                                app.install_nam();
                             }
-                            crate::app::InstallState::Installing => {
-                                ui.spinner();
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 180, 60),
-                                    "Installing...",
-                                );
-                            }
-                            crate::app::InstallState::Done => {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(80, 200, 120),
-                                    "Installed!",
-                                );
-                            }
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 100, 100),
+                                msg.as_str(),
+                            );
                         }
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
-                            msg.as_str(),
-                        );
                     }
                 }
             }
