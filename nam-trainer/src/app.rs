@@ -36,6 +36,19 @@ pub struct TrainerApp {
     pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
     pub python_status: PythonStatus,
     python_check_rx: Option<mpsc::Receiver<PythonStatus>>,
+
+    // NAM install state
+    pub install_state: InstallState,
+    pub install_log: Vec<String>,
+    pub install_rx: Option<mpsc::Receiver<InstallMessage>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstallState {
+    Idle,
+    Installing,
+    Done,
+    Failed,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +56,12 @@ pub enum PythonStatus {
     Unknown,
     Ok { gpu: Option<String> },
     Error(String),
+}
+
+#[derive(Debug)]
+pub enum InstallMessage {
+    Log(String),
+    Done { success: bool },
 }
 
 #[derive(Clone)]
@@ -239,6 +258,9 @@ impl TrainerApp {
             discovered_pythons: None,
             python_status: PythonStatus::Unknown,
             python_check_rx: None,
+            install_state: InstallState::Idle,
+            install_log: Vec::new(),
+            install_rx: None,
             settings,
         };
         app.check_python();
@@ -299,6 +321,83 @@ print(json.dumps(result))
             };
             let _ = tx.send(status);
         });
+    }
+
+    /// Install neural-amp-modeler into the selected Python environment.
+    pub fn install_nam(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_state = InstallState::Installing;
+        self.install_log.clear();
+        self.install_log
+            .push("Installing neural-amp-modeler...".into());
+
+        let python = self.python_path.clone();
+
+        std::thread::spawn(move || {
+            let result = std::process::Command::new(&python)
+                .args(["-m", "pip", "install", "neural-amp-modeler"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
+                    let _ = tx.send(InstallMessage::Done { success: false });
+                    return;
+                }
+            };
+
+            // Stream stderr (pip writes progress there)
+            if let Some(stderr) = child.stderr.take() {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let _ = tx.send(InstallMessage::Log(line));
+                    }
+                }
+            }
+
+            let status = child.wait();
+            let success = status.map(|s| s.success()).unwrap_or(false);
+            let _ = tx.send(InstallMessage::Done { success });
+        });
+    }
+
+    pub fn poll_install(&mut self) {
+        let rx = match self.install_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        let mut done = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                InstallMessage::Log(line) => {
+                    self.install_log.push(line);
+                }
+                InstallMessage::Done { success } => {
+                    if success {
+                        self.install_state = InstallState::Done;
+                        self.install_log.push("Installation complete!".into());
+                        self.python_status = PythonStatus::Unknown;
+                        self.check_python();
+                    } else {
+                        self.install_state = InstallState::Failed;
+                        self.install_log.push("Installation failed.".into());
+                    }
+                    done = true;
+                }
+            }
+        }
+
+        if !done {
+            // Put the receiver back if we're not done yet
+            self.install_rx = Some(rx);
+        }
     }
 
     pub fn can_train(&self) -> bool {
@@ -373,6 +472,7 @@ impl eframe::App for TrainerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker();
         self.poll_python_check();
+        self.poll_install();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui::main_panel::show(self, ui);

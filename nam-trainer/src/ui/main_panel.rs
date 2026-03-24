@@ -26,7 +26,44 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     );
                 }
                 crate::app::PythonStatus::Error(msg) => {
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), msg.as_str());
+                    if msg.contains("not installed") {
+                        match &app.install_state {
+                            crate::app::InstallState::Idle
+                            | crate::app::InstallState::Failed => {
+                                if ui
+                                    .button("Install NAM")
+                                    .on_hover_text(
+                                        "Runs: pip install neural-amp-modeler",
+                                    )
+                                    .clicked()
+                                {
+                                    app.install_nam();
+                                }
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 180, 60),
+                                    "NAM not installed",
+                                );
+                            }
+                            crate::app::InstallState::Installing => {
+                                ui.spinner();
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 180, 60),
+                                    "Installing...",
+                                );
+                            }
+                            crate::app::InstallState::Done => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 200, 120),
+                                    "Installed!",
+                                );
+                            }
+                        }
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            msg.as_str(),
+                        );
+                    }
                 }
             }
         });
@@ -213,6 +250,46 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             });
         });
+
+    // ── Install log (shown during/after install) ─────────────────────────
+    if !app.install_log.is_empty() {
+        ui.add_space(4.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Installation");
+                    if app.install_state == crate::app::InstallState::Installing {
+                        ui.spinner();
+                    }
+                    if matches!(
+                        app.install_state,
+                        crate::app::InstallState::Done | crate::app::InstallState::Failed
+                    ) {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("Dismiss").clicked() {
+                                    app.install_log.clear();
+                                    app.install_state = crate::app::InstallState::Idle;
+                                }
+                            },
+                        );
+                    }
+                });
+                ui.add_space(2.0);
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &app.install_log {
+                            ui.label(
+                                egui::RichText::new(line).monospace().size(11.0),
+                            );
+                        }
+                    });
+            });
+    }
 
     ui.add_space(8.0);
 
