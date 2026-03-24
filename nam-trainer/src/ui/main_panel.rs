@@ -45,7 +45,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                             .clicked();
                         ui.colored_label(
                             egui::Color32::from_rgb(255, 100, 100),
-                            format!("Python {version} — requires {min_maj}.{min_min}+"),
+                            format!("Python {version} too old — NAM requires {min_maj}.{min_min}+"),
                         );
                         if clicked {
                             app.install_python();
@@ -257,27 +257,48 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             });
 
-            // Uninstall miniforge option — only when it exists and we're not mid-install
-            let miniforge_dir = home_dir()
-                .map(|h| h.join("miniforge3"))
-                .unwrap_or_default();
+            // Management buttons — only when not mid-install
             let not_installing = app.install_state != crate::app::InstallState::Installing;
-            if miniforge_dir.exists() && not_installing {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("Uninstall Miniforge")
-                            .on_hover_text(format!(
-                                "Removes {}",
-                                miniforge_dir.display()
-                            ))
-                            .clicked()
-                        {
-                            app.uninstall_miniforge();
-                        }
+            if not_installing {
+                let miniforge_dir = home_dir()
+                    .map(|h| h.join("miniforge3"))
+                    .unwrap_or_default();
+                let has_miniforge = miniforge_dir.exists();
+                let has_nam = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
+
+                if has_miniforge || has_nam {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if has_miniforge {
+                                    if ui
+                                        .small_button("Uninstall Miniforge")
+                                        .on_hover_text(format!(
+                                            "Removes {}",
+                                            miniforge_dir.display()
+                                        ))
+                                        .clicked()
+                                    {
+                                        app.uninstall_miniforge();
+                                    }
+                                }
+                                if has_nam {
+                                    if ui
+                                        .small_button("Uninstall NAM")
+                                        .on_hover_text(
+                                            "Runs: pip uninstall neural-amp-modeler",
+                                        )
+                                        .clicked()
+                                    {
+                                        app.uninstall_nam();
+                                    }
+                                }
+                            },
+                        );
                     });
-                });
+                }
             }
         });
 

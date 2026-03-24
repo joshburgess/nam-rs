@@ -599,6 +599,53 @@ print(json.dumps(result))
         self.check_python();
     }
 
+    /// Uninstall neural-amp-modeler from the selected Python environment.
+    pub fn uninstall_nam(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_state = InstallState::Installing;
+        self.install_log.clear();
+        self.install_log
+            .push("Uninstalling neural-amp-modeler...".into());
+
+        let python = self.python_path.clone();
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            let result = std::process::Command::new(&python)
+                .args(["-m", "pip", "uninstall", "-y", "neural-amp-modeler"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
+                    let _ = tx.send(InstallMessage::Done { success: false });
+                    return;
+                }
+            };
+
+            if let Some(stderr) = child.stderr.take() {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let _ = tx.send(InstallMessage::Log(line));
+                }
+            }
+
+            let status = child.wait();
+            let success = status.map(|s| s.success()).unwrap_or(false);
+            if success {
+                let _ = tx.send(InstallMessage::Log(
+                    "NAM uninstalled successfully.".into(),
+                ));
+            }
+            let _ = tx.send(InstallMessage::Done { success });
+        });
+    }
+
     pub fn can_train(&self) -> bool {
         self.input_path.is_some()
             && !self.output_paths.is_empty()
