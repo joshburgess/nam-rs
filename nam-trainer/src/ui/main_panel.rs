@@ -257,11 +257,12 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             });
 
-            // Uninstall miniforge option
+            // Uninstall miniforge option — only when it exists and we're not mid-install
             let miniforge_dir = home_dir()
                 .map(|h| h.join("miniforge3"))
                 .unwrap_or_default();
-            if miniforge_dir.exists() {
+            let not_installing = app.install_state != crate::app::InstallState::Installing;
+            if miniforge_dir.exists() && not_installing {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

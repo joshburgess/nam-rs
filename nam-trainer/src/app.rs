@@ -551,28 +551,52 @@ print(json.dumps(result))
         }
     }
 
-    /// Remove ~/miniforge3 and reset Python selection to system default.
+    /// Remove ~/miniforge3 in a background thread with progress feedback.
     pub fn uninstall_miniforge(&mut self) {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let miniforge_dir = std::path::PathBuf::from(&home).join("miniforge3");
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_state = InstallState::Installing;
+        self.install_log.clear();
+        self.install_log.push("Removing ~/miniforge3...".into());
 
-        if miniforge_dir.exists() {
-            let _ = std::fs::remove_dir_all(&miniforge_dir);
-        }
+        std::thread::spawn(move || {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let miniforge_dir = std::path::PathBuf::from(&home).join("miniforge3");
 
-        // Reset to system python
+            if miniforge_dir.exists() {
+                let _ = tx.send(InstallMessage::Log(format!(
+                    "Deleting {}...",
+                    miniforge_dir.display()
+                )));
+                match std::fs::remove_dir_all(&miniforge_dir) {
+                    Ok(_) => {
+                        let _ = tx.send(InstallMessage::Log(
+                            "Miniforge removed successfully.".into(),
+                        ));
+                        let _ = tx.send(InstallMessage::Done { success: true });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(InstallMessage::Log(format!(
+                            "Failed to remove: {e}"
+                        )));
+                        let _ = tx.send(InstallMessage::Done { success: false });
+                    }
+                }
+            } else {
+                let _ = tx.send(InstallMessage::Log(
+                    "~/miniforge3 does not exist.".into(),
+                ));
+                let _ = tx.send(InstallMessage::Done { success: true });
+            }
+        });
+
+        // Reset to system python immediately so the UI updates
         self.python_path = "python3".to_string();
         self.settings.python_path = Some("python3".to_string());
         self.settings.save();
-
-        // Refresh discovery and re-check
         self.discovered_pythons = None;
         self.python_status = PythonStatus::Unknown;
         self.check_python();
-
-        // Clear install state
-        self.install_state = InstallState::Idle;
-        self.install_log.clear();
     }
 
     pub fn can_train(&self) -> bool {
