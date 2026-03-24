@@ -70,6 +70,7 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
         threshold_esr: app.config.threshold_esr,
         save_plot: app.config.save_plot,
         fit_mrstft: app.config.fit_mrstft,
+        device: app.selected_device.clone(),
         metadata: protocol::MetadataRequest {
             name: non_empty(&app.metadata.name),
             modeled_by: non_empty(&app.metadata.modeled_by),

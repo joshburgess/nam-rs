@@ -32,6 +32,9 @@ pub struct TrainerApp {
     // Python executable path
     pub python_path: String,
 
+    // Device selection
+    pub selected_device: String, // "cpu", "cuda:0", "mps", etc.
+
     // Python discovery and environment status
     pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
     pub python_status: PythonStatus,
@@ -66,13 +69,19 @@ pub const NAM_MIN_PYTHON: (u32, u32) = (3, 10);
 pub enum PythonStatus {
     Unknown,
     Ok {
-        gpu: Option<String>,
         version: String,
+        devices: Vec<TrainingDevice>,
     },
     VersionTooOld {
         version: String,
     },
     Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingDevice {
+    pub id: String,   // "cpu", "cuda:0", "cuda:1", "mps"
+    pub name: String, // "CPU", "CUDA 0: NVIDIA RTX 4090", "Apple GPU (MPS)"
 }
 
 #[derive(Debug)]
@@ -273,6 +282,7 @@ impl TrainerApp {
                 .python_path
                 .clone()
                 .unwrap_or_else(default_python_name),
+            selected_device: "cpu".to_string(),
             discovered_pythons: None,
             python_status: PythonStatus::Unknown,
             python_check_rx: None,
@@ -294,7 +304,11 @@ impl TrainerApp {
         std::thread::spawn(move || {
             let script = r#"
 import json, sys
-result = {"nam": False, "gpu": None, "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"}
+result = {
+    "nam": False,
+    "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    "devices": [{"id": "cpu", "name": "CPU"}]
+}
 try:
     from nam.train import core
     result["nam"] = True
@@ -303,9 +317,11 @@ except ImportError:
 try:
     import torch
     if torch.cuda.is_available():
-        result["gpu"] = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        result["gpu"] = "mps"
+        for i in range(torch.cuda.device_count()):
+            name = torch.cuda.get_device_name(i)
+            result["devices"].append({"id": f"cuda:{i}", "name": f"CUDA {i}: {name}"})
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        result["devices"].append({"id": "mps", "name": "Apple GPU (MPS)"})
 except ImportError:
     pass
 print(json.dumps(result))
@@ -335,9 +351,27 @@ print(json.dumps(result))
                             PythonStatus::VersionTooOld { version }
                         } else {
                             let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let gpu = val.get("gpu").and_then(|v| v.as_str()).map(String::from);
+
+                            // Parse devices list
+                            let devices: Vec<TrainingDevice> = val
+                                .get("devices")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|d| {
+                                            let id = d.get("id")?.as_str()?.to_string();
+                                            let name = d.get("name")?.as_str()?.to_string();
+                                            Some(TrainingDevice { id, name })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| vec![TrainingDevice {
+                                    id: "cpu".into(),
+                                    name: "CPU".into(),
+                                }]);
+
                             if nam_ok {
-                                PythonStatus::Ok { gpu, version }
+                                PythonStatus::Ok { version, devices }
                             } else {
                                 PythonStatus::Error(
                                     "NAM not installed".into(),
@@ -865,6 +899,17 @@ impl TrainerApp {
     fn poll_python_check(&mut self) {
         if let Some(ref rx) = self.python_check_rx {
             if let Ok(status) = rx.try_recv() {
+                // Auto-select best device when status changes to Ok
+                if let PythonStatus::Ok { ref devices, .. } = status {
+                    let best = devices
+                        .iter()
+                        .find(|d| d.id.starts_with("cuda"))
+                        .or_else(|| devices.iter().find(|d| d.id == "mps"))
+                        .or(devices.first());
+                    if let Some(dev) = best {
+                        self.selected_device = dev.id.clone();
+                    }
+                }
                 self.python_status = status;
                 self.python_check_rx = None;
             }

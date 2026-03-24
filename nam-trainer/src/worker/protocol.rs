@@ -17,6 +17,7 @@ pub struct TrainRequest {
     pub threshold_esr: Option<f64>,
     pub save_plot: bool,
     pub fit_mrstft: bool,
+    pub device: String,
     pub metadata: MetadataRequest,
 }
 

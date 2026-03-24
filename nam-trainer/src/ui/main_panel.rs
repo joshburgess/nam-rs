@@ -53,7 +53,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .clicked()
                 {
                     let _ = open::that(
-                        "https://drive.google.com/drive/folders/1cZTalC-9sSugQn3pn5JGBxuUxJbmHEoZ",
+                        "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view?usp=drive_link",
                     );
                 }
             });
@@ -119,6 +119,19 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 ui.selectable_value(&mut app.config.architecture, arch, arch.label());
             }
         });
+
+        // Device selector — only show when multiple devices available
+        if let crate::app::PythonStatus::Ok { devices, .. } = &app.python_status {
+            if devices.len() > 1 {
+                ui.horizontal(|ui| {
+                    ui.label("Device:");
+                    ui.add_space(4.0);
+                    for dev in devices {
+                        ui.selectable_value(&mut app.selected_device, dev.id.clone(), &dev.name);
+                    }
+                });
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("Epochs: {}", app.config.epochs)).monospace());
@@ -416,13 +429,16 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 ui.spinner();
                 ui.colored_label(DIM, "Checking Python...");
             }
-            crate::app::PythonStatus::Ok { gpu, version } => {
-                let gpu_label = match gpu.as_deref() {
-                    Some("cuda") => "CUDA GPU",
-                    Some("mps") => "Apple GPU",
-                    _ => "CPU",
-                };
-                ui.colored_label(GREEN, format!("Ready \u{2014} Python {version}, {gpu_label}"));
+            crate::app::PythonStatus::Ok { version, devices } => {
+                let best = devices
+                    .iter()
+                    .find(|d| d.id.starts_with("cuda") || d.id == "mps")
+                    .or(devices.first());
+                let device_label = best.map(|d| d.name.as_str()).unwrap_or("CPU");
+                ui.colored_label(
+                    GREEN,
+                    format!("Ready \u{2014} Python {version}, {device_label}"),
+                );
             }
             crate::app::PythonStatus::VersionTooOld { version } => {
                 let clicked = ui
