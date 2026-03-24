@@ -201,7 +201,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             let has_nam = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
 
             if has_miniforge || has_nam {
-                ui.add_space(2.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
