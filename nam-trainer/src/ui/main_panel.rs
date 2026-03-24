@@ -17,7 +17,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             };
 
             if let Some(action) = &active_action {
-                ui.spinner();
+                ui.add(egui::Spinner::new().color(egui::Color32::from_rgb(255, 180, 60)));
                 let label = match action {
                     crate::app::InstallAction::InstallingPython => "Installing Python...",
                     crate::app::InstallAction::InstallingNam => "Installing NAM...",
@@ -329,7 +329,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     };
                     ui.strong(header);
                     if matches!(app.install_state, crate::app::InstallState::Installing(_)) {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().color(egui::Color32::from_rgb(255, 180, 60)));
                     }
                     if matches!(
                         app.install_state,
