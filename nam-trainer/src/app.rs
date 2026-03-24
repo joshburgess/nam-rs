@@ -923,6 +923,14 @@ impl eframe::App for TrainerApp {
         self.poll_python_check();
         self.poll_install();
 
+        // Request continuous repaints while training or installing
+        let needs_repaint = self.training_state == TrainingState::Training
+            || matches!(self.install_state, InstallState::Installing(_))
+            || matches!(self.python_status, PythonStatus::Unknown);
+        if needs_repaint {
+            ctx.request_repaint();
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui::main_panel::show(self, ui);
