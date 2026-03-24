@@ -341,7 +341,6 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         app.message_rx = None;
                         app.training_log.push("Training cancelled.".into());
                     }
-                    ui.add(egui::Spinner::new().color(AMBER));
                     if let Some(last) = app.epoch_history.last() {
                         ui.label(format!(
                             "Epoch {}/{} \u{2014} ESR: {:.6}",
