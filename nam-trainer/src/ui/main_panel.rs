@@ -256,6 +256,28 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     app.check_python();
                 }
             });
+
+            // Uninstall miniforge option
+            let miniforge_dir = home_dir()
+                .map(|h| h.join("miniforge3"))
+                .unwrap_or_default();
+            if miniforge_dir.exists() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("Uninstall Miniforge")
+                            .on_hover_text(format!(
+                                "Removes {}",
+                                miniforge_dir.display()
+                            ))
+                            .clicked()
+                        {
+                            app.uninstall_miniforge();
+                        }
+                    });
+                });
+            }
         });
 
     // ── Install log (shown during/after install) ─────────────────────────

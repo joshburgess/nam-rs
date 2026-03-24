@@ -551,6 +551,30 @@ print(json.dumps(result))
         }
     }
 
+    /// Remove ~/miniforge3 and reset Python selection to system default.
+    pub fn uninstall_miniforge(&mut self) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let miniforge_dir = std::path::PathBuf::from(&home).join("miniforge3");
+
+        if miniforge_dir.exists() {
+            let _ = std::fs::remove_dir_all(&miniforge_dir);
+        }
+
+        // Reset to system python
+        self.python_path = "python3".to_string();
+        self.settings.python_path = Some("python3".to_string());
+        self.settings.save();
+
+        // Refresh discovery and re-check
+        self.discovered_pythons = None;
+        self.python_status = PythonStatus::Unknown;
+        self.check_python();
+
+        // Clear install state
+        self.install_state = InstallState::Idle;
+        self.install_log.clear();
+    }
+
     pub fn can_train(&self) -> bool {
         self.input_path.is_some()
             && !self.output_paths.is_empty()
