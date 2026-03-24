@@ -306,18 +306,9 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 let btn = egui::Button::new(btn_text)
                     .min_size(egui::vec2(ui.available_width(), 34.0));
 
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(can_train, btn).clicked() {
-                        start_training(app);
-                    }
-                    if ui
-                        .small_button("Demo")
-                        .on_hover_text("Simulate training to preview the progress UI")
-                        .clicked()
-                    {
-                        app.start_demo_training();
-                    }
-                });
+                if ui.add_enabled(can_train, btn).clicked() {
+                    start_training(app);
+                }
                 if !can_train {
                     let mut missing = Vec::new();
                     if app.input_path.is_none() {
@@ -378,6 +369,21 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             }
         }
+    }
+
+    // Demo button — always available for testing the progress UI
+    if app.training_state == TrainingState::Idle && app.training_log.is_empty() {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Demo")
+                    .on_hover_text("Simulate training to preview the progress UI")
+                    .clicked()
+                {
+                    app.start_demo_training();
+                }
+            });
+        });
     }
 
     // ── Training Progress ───────────────────────────────────────────────
