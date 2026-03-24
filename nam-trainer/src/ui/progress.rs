@@ -4,7 +4,6 @@ use egui_plot::{Line, Plot, PlotPoints};
 const AMBER: egui::Color32 = egui::Color32::from_rgb(255, 180, 60);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 const CYAN: egui::Color32 = egui::Color32::from_rgb(80, 180, 255);
-const RED: egui::Color32 = egui::Color32::from_rgb(255, 100, 100);
 
 pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
     egui::Frame::group(ui.style())
@@ -14,8 +13,11 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             ui.strong("Training Progress");
             ui.add_space(4.0);
 
+            let has_epochs = !app.epoch_history.is_empty();
+            let has_plot = app.epoch_history.len() >= 2;
+
             // Progress bar
-            if !app.epoch_history.is_empty() {
+            if has_epochs {
                 let current = app.epoch_history.last().map(|e| e.epoch).unwrap_or(0);
                 let total = app.config.epochs;
                 let fraction = current as f32 / total.max(1) as f32;
@@ -36,34 +38,44 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         stat_label(ui, "ESR", last.esr, GREEN);
                     });
                 }
-
-                // Loss curve plot
-                if app.epoch_history.len() >= 2 {
-                    ui.add_space(6.0);
-                    show_loss_plot(app, ui);
-                }
-
-                ui.add_space(4.0);
             }
 
-            // Scrollable log
-            let max_height = if app.epoch_history.len() >= 2 {
-                80.0
+            // Measure remaining space for plot + log
+            let available = ui.available_height();
+
+            if has_plot {
+                // Give ~65% of remaining space to the plot, ~35% to the log
+                let plot_height = (available * 0.65).clamp(120.0, 300.0);
+                let log_height = (available * 0.30).clamp(60.0, 200.0);
+
+                ui.add_space(6.0);
+                show_loss_plot(app, ui, plot_height);
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(log_height)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &app.training_log {
+                            ui.label(egui::RichText::new(line).monospace().size(11.0));
+                        }
+                    });
             } else {
-                150.0
-            };
-            egui::ScrollArea::vertical()
-                .max_height(max_height)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in &app.training_log {
-                        ui.label(egui::RichText::new(line).monospace().size(11.0));
-                    }
-                });
+                // No plot — give all remaining space to the log
+                let log_height = available.max(80.0);
+                egui::ScrollArea::vertical()
+                    .max_height(log_height)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &app.training_log {
+                            ui.label(egui::RichText::new(line).monospace().size(11.0));
+                        }
+                    });
+            }
         });
 }
 
-fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui) {
+fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
     let train_points: PlotPoints = app
         .epoch_history
         .iter()
@@ -94,7 +106,7 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui) {
         .width(2.0);
 
     Plot::new("loss_plot")
-        .height(140.0)
+        .height(height)
         .allow_drag(false)
         .allow_zoom(false)
         .allow_scroll(false)
@@ -113,6 +125,8 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui) {
 fn stat_label(ui: &mut egui::Ui, name: &str, value: f64, color: egui::Color32) {
     ui.colored_label(
         color,
-        egui::RichText::new(format!("{name}: {value:.6}")).monospace().size(12.0),
+        egui::RichText::new(format!("{name}: {value:.6}"))
+            .monospace()
+            .size(12.0),
     );
 }
