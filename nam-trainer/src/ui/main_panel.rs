@@ -321,6 +321,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         missing.push("output directory");
                     }
                     if !missing.is_empty() {
+                        ui.add_space(4.0);
                         ui.colored_label(DIM, format!("Select {} to begin", missing.join(", ")));
                     }
                 }
