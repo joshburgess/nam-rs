@@ -27,31 +27,48 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     );
                 }
                 crate::app::PythonStatus::VersionTooOld { version } => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 100, 100),
-                        format!(
-                            "Python {version} — requires {min_maj}.{min_min}+",
-                        ),
-                    );
+                    let installing = app.install_state == crate::app::InstallState::Installing;
+                    if installing {
+                        ui.spinner();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 180, 60),
+                            "Installing Python...",
+                        );
+                    } else {
+                        let clicked = ui
+                            .button("Install Python")
+                            .on_hover_text(
+                                "Downloads and installs Miniforge (Python 3.12+) to ~/miniforge3",
+                            )
+                            .clicked();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 100, 100),
+                            format!("Python {version} — requires {min_maj}.{min_min}+"),
+                        );
+                        if clicked {
+                            app.install_python();
+                        }
+                    }
                 }
                 crate::app::PythonStatus::Error(msg) => {
                     if msg.contains("not installed") {
-                        match &app.install_state {
+                        let ist = app.install_state.clone();
+                        match ist {
                             crate::app::InstallState::Idle
                             | crate::app::InstallState::Failed => {
-                                if ui
+                                let clicked = ui
                                     .button("Install NAM")
                                     .on_hover_text(
                                         "Runs: pip install neural-amp-modeler",
                                     )
-                                    .clicked()
-                                {
-                                    app.install_nam();
-                                }
+                                    .clicked();
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 180, 60),
                                     "NAM not installed",
                                 );
+                                if clicked {
+                                    app.install_nam();
+                                }
                             }
                             crate::app::InstallState::Installing => {
                                 ui.spinner();

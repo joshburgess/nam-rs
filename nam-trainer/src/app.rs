@@ -70,6 +70,7 @@ pub enum PythonStatus {
 #[derive(Debug)]
 pub enum InstallMessage {
     Log(String),
+    PythonInstalled { python_path: String },
     Done { success: bool },
 }
 
@@ -393,6 +394,122 @@ print(json.dumps(result))
         });
     }
 
+    /// Install Python via Miniforge into ~/miniforge3.
+    pub fn install_python(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_state = InstallState::Installing;
+        self.install_log.clear();
+        self.install_log
+            .push("Installing Python via Miniforge...".into());
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let install_dir = format!("{home}/miniforge3");
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            let installer_url = if cfg!(target_os = "macos") {
+                if cfg!(target_arch = "aarch64") {
+                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
+                } else {
+                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh"
+                }
+            } else if cfg!(target_os = "linux") {
+                if cfg!(target_arch = "aarch64") {
+                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
+                } else {
+                    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
+                }
+            } else {
+                let _ = tx.send(InstallMessage::Log(
+                    "Automatic Python install is only supported on macOS and Linux.".into(),
+                ));
+                let _ = tx.send(InstallMessage::Done { success: false });
+                return;
+            };
+
+            let installer_path = format!("{}/miniforge_installer.sh", std::env::temp_dir().display());
+
+            // Step 1: Download
+            let _ = tx.send(InstallMessage::Log(format!("Downloading Miniforge from {installer_url}...")));
+            let dl = std::process::Command::new("curl")
+                .args(["-fSL", "-o", &installer_path, installer_url])
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut dl_child = match dl {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(InstallMessage::Log(format!("Failed to start curl: {e}")));
+                    let _ = tx.send(InstallMessage::Done { success: false });
+                    return;
+                }
+            };
+
+            if let Some(stderr) = dl_child.stderr.take() {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let _ = tx.send(InstallMessage::Log(line));
+                }
+            }
+
+            let dl_status = dl_child.wait();
+            if !dl_status.map(|s| s.success()).unwrap_or(false) {
+                let _ = tx.send(InstallMessage::Log("Download failed.".into()));
+                let _ = tx.send(InstallMessage::Done { success: false });
+                return;
+            }
+            let _ = tx.send(InstallMessage::Log("Download complete.".into()));
+
+            // Step 2: Run installer in batch mode
+            let _ = tx.send(InstallMessage::Log(format!("Installing to {install_dir}...")));
+            let install = std::process::Command::new("bash")
+                .args([&installer_path, "-b", "-u", "-p", &install_dir])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut inst_child = match install {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(InstallMessage::Log(format!("Failed to run installer: {e}")));
+                    let _ = tx.send(InstallMessage::Done { success: false });
+                    return;
+                }
+            };
+
+            // Stream stdout
+            if let Some(stdout) = inst_child.stdout.take() {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let _ = tx.send(InstallMessage::Log(line));
+                }
+            }
+
+            let inst_status = inst_child.wait();
+            if !inst_status.map(|s| s.success()).unwrap_or(false) {
+                let _ = tx.send(InstallMessage::Log("Miniforge installation failed.".into()));
+                let _ = tx.send(InstallMessage::Done { success: false });
+                return;
+            }
+
+            // Clean up installer
+            let _ = std::fs::remove_file(&installer_path);
+
+            let python_path = format!("{install_dir}/bin/python");
+            let _ = tx.send(InstallMessage::Log(format!(
+                "Python installed at {python_path}"
+            )));
+
+            // Send special done message with the new python path
+            let _ = tx.send(InstallMessage::PythonInstalled {
+                python_path,
+            });
+            let _ = tx.send(InstallMessage::Done { success: true });
+        });
+    }
+
     pub fn poll_install(&mut self) {
         let rx = match self.install_rx.take() {
             Some(rx) => rx,
@@ -404,6 +521,14 @@ print(json.dumps(result))
             match msg {
                 InstallMessage::Log(line) => {
                     self.install_log.push(line);
+                }
+                InstallMessage::PythonInstalled { python_path } => {
+                    // Auto-select the newly installed Python
+                    self.python_path = python_path.clone();
+                    self.settings.python_path = Some(python_path);
+                    self.settings.save();
+                    // Refresh the discovery list
+                    self.discovered_pythons = None;
                 }
                 InstallMessage::Done { success } => {
                     if success {
