@@ -9,12 +9,13 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         ui.heading("NAM Trainer");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Python/GPU status badge
+            let (min_maj, min_min) = crate::app::NAM_MIN_PYTHON;
             match &app.python_status {
                 crate::app::PythonStatus::Unknown => {
                     ui.spinner();
                     ui.colored_label(egui::Color32::GRAY, "Checking Python...");
                 }
-                crate::app::PythonStatus::Ok { gpu } => {
+                crate::app::PythonStatus::Ok { gpu, version } => {
                     let gpu_label = match gpu.as_deref() {
                         Some("cuda") => "CUDA GPU",
                         Some("mps") => "Apple GPU",
@@ -22,7 +23,15 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     };
                     ui.colored_label(
                         egui::Color32::from_rgb(80, 200, 120),
-                        format!("Ready ({gpu_label})"),
+                        format!("Ready — Python {version}, {gpu_label}"),
+                    );
+                }
+                crate::app::PythonStatus::VersionTooOld { version } => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 100, 100),
+                        format!(
+                            "Python {version} — requires {min_maj}.{min_min}+",
+                        ),
                     );
                 }
                 crate::app::PythonStatus::Error(msg) => {

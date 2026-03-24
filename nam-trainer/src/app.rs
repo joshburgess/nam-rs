@@ -51,10 +51,19 @@ pub enum InstallState {
     Failed,
 }
 
+/// Minimum Python version required by neural-amp-modeler.
+pub const NAM_MIN_PYTHON: (u32, u32) = (3, 10);
+
 #[derive(Clone, Debug)]
 pub enum PythonStatus {
     Unknown,
-    Ok { gpu: Option<String> },
+    Ok {
+        gpu: Option<String>,
+        version: String,
+    },
+    VersionTooOld {
+        version: String,
+    },
     Error(String),
 }
 
@@ -276,7 +285,7 @@ impl TrainerApp {
         std::thread::spawn(move || {
             let script = r#"
 import json, sys
-result = {"nam": False, "gpu": None}
+result = {"nam": False, "gpu": None, "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"}
 try:
     from nam.train import core
     result["nam"] = True
@@ -300,14 +309,31 @@ print(json.dumps(result))
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-                        let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let gpu = val.get("gpu").and_then(|v| v.as_str()).map(String::from);
-                        if nam_ok {
-                            PythonStatus::Ok { gpu }
+                        let version = val
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Check Python version meets minimum
+                        let version_ok = parse_version_tuple(&version)
+                            .map(|(maj, min)| {
+                                (maj, min) >= NAM_MIN_PYTHON
+                            })
+                            .unwrap_or(false);
+
+                        if !version_ok {
+                            PythonStatus::VersionTooOld { version }
                         } else {
-                            PythonStatus::Error(
-                                "NAM not installed. Run: pip install neural-amp-modeler".into(),
-                            )
+                            let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let gpu = val.get("gpu").and_then(|v| v.as_str()).map(String::from);
+                            if nam_ok {
+                                PythonStatus::Ok { gpu, version }
+                            } else {
+                                PythonStatus::Error(
+                                    "NAM not installed".into(),
+                                )
+                            }
                         }
                     } else {
                         PythonStatus::Error("Unexpected Python output".into())
@@ -458,6 +484,20 @@ print(json.dumps(result))
         }
     }
 
+}
+
+fn parse_version_tuple(version: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() >= 2 {
+        let major = parts[0].parse::<u32>().ok()?;
+        let minor = parts[1].parse::<u32>().ok()?;
+        Some((major, minor))
+    } else {
+        None
+    }
+}
+
+impl TrainerApp {
     fn poll_python_check(&mut self) {
         if let Some(ref rx) = self.python_check_rx {
             if let Ok(status) = rx.try_recv() {
