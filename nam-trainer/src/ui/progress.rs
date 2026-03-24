@@ -48,9 +48,9 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
             // Scrollable log
             let max_height = if app.epoch_history.len() >= 2 {
-                60.0 // shorter when plot is shown
+                80.0
             } else {
-                ui.available_height().max(80.0)
+                150.0
             };
             egui::ScrollArea::vertical()
                 .max_height(max_height)

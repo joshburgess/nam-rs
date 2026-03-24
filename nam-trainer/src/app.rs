@@ -879,7 +879,9 @@ impl eframe::App for TrainerApp {
         self.poll_install();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui::main_panel::show(self, ui);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui::main_panel::show(self, ui);
+            });
         });
 
         if self.show_advanced {
