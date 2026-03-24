@@ -321,27 +321,8 @@ impl Conv1x1 {
                 );
             }
         } else {
-            // Small matrix: exact dot-product loop (preserves bit-identical results)
-            let w = &self.weight_colmajor;
-            for f in 0..num_frames {
-                let in_col_start = f * input.rows;
-                let out_col_start = f * out_ch;
-                for o in 0..out_ch {
-                    let mut sum = 0.0f32;
-                    for i in 0..in_ch {
-                        sum += w[i * out_ch + o] * input.data[in_col_start + i];
-                    }
-                    self.output_buf.data[out_col_start + o] = sum;
-                }
-            }
-            if let Some(ref b) = self.bias {
-                for f in 0..num_frames {
-                    let col_start = f * out_ch;
-                    for o in 0..out_ch {
-                        self.output_buf.data[col_start + o] += b[o];
-                    }
-                }
-            }
+            // Small matrix: specialized paths for common sizes, with fused bias
+            self.process_block_small_gemm(&input.data, input.rows, num_frames);
         }
     }
 
@@ -380,23 +361,114 @@ impl Conv1x1 {
                 );
             }
         } else {
-            let w = &self.weight_colmajor;
-            for f in 0..num_frames {
-                let in_col_start = f * input_stride;
-                let out_col_start = f * out_ch;
-                for o in 0..out_ch {
-                    let mut sum = 0.0f32;
-                    for i in 0..in_ch {
-                        sum += w[i * out_ch + o] * input_data[in_col_start + i];
+            self.process_block_small_gemm(input_data, input_stride, num_frames);
+        }
+    }
+
+    /// Small-matrix GEMM with fused bias for common channel counts.
+    /// Specializes for 3x3, 1→3, 3→1 to allow the compiler to fully unroll.
+    #[inline]
+    fn process_block_small_gemm(
+        &mut self,
+        input_data: &[f32],
+        input_stride: usize,
+        num_frames: usize,
+    ) {
+        let out_ch = self.out_channels;
+        let in_ch = self.in_channels;
+        let w = &self.weight_colmajor;
+        let bias = &self.bias;
+        let out = &mut self.output_buf.data;
+
+        match (out_ch, in_ch) {
+            (3, 3) => {
+                let w00 = w[0]; let w10 = w[1]; let w20 = w[2];
+                let w01 = w[3]; let w11 = w[4]; let w21 = w[5];
+                let w02 = w[6]; let w12 = w[7]; let w22 = w[8];
+                if let Some(ref b) = bias {
+                    let b0 = b[0]; let b1 = b[1]; let b2 = b[2];
+                    for f in 0..num_frames {
+                        let ic = f * input_stride;
+                        let oc = f * 3;
+                        let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
+                        out[oc]     = w00 * i0 + w01 * i1 + w02 * i2 + b0;
+                        out[oc + 1] = w10 * i0 + w11 * i1 + w12 * i2 + b1;
+                        out[oc + 2] = w20 * i0 + w21 * i1 + w22 * i2 + b2;
                     }
-                    self.output_buf.data[out_col_start + o] = sum;
+                } else {
+                    for f in 0..num_frames {
+                        let ic = f * input_stride;
+                        let oc = f * 3;
+                        let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
+                        out[oc]     = w00 * i0 + w01 * i1 + w02 * i2;
+                        out[oc + 1] = w10 * i0 + w11 * i1 + w12 * i2;
+                        out[oc + 2] = w20 * i0 + w21 * i1 + w22 * i2;
+                    }
                 }
             }
-            if let Some(ref b) = self.bias {
-                for f in 0..num_frames {
-                    let col_start = f * out_ch;
-                    for o in 0..out_ch {
-                        self.output_buf.data[col_start + o] += b[o];
+            (3, 1) => {
+                let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
+                if let Some(ref b) = bias {
+                    let b0 = b[0]; let b1 = b[1]; let b2 = b[2];
+                    for f in 0..num_frames {
+                        let v = input_data[f * input_stride];
+                        let oc = f * 3;
+                        out[oc]     = w0 * v + b0;
+                        out[oc + 1] = w1 * v + b1;
+                        out[oc + 2] = w2 * v + b2;
+                    }
+                } else {
+                    for f in 0..num_frames {
+                        let v = input_data[f * input_stride];
+                        let oc = f * 3;
+                        out[oc]     = w0 * v;
+                        out[oc + 1] = w1 * v;
+                        out[oc + 2] = w2 * v;
+                    }
+                }
+            }
+            (1, 3) => {
+                let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
+                if let Some(ref b) = bias {
+                    let b0 = b[0];
+                    for f in 0..num_frames {
+                        let ic = f * input_stride;
+                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                            + w2 * input_data[ic + 2] + b0;
+                    }
+                } else {
+                    for f in 0..num_frames {
+                        let ic = f * input_stride;
+                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                            + w2 * input_data[ic + 2];
+                    }
+                }
+            }
+            _ => {
+                // General small-matrix path with fused bias
+                if let Some(ref b) = bias {
+                    for f in 0..num_frames {
+                        let in_col_start = f * input_stride;
+                        let out_col_start = f * out_ch;
+                        for o in 0..out_ch {
+                            let mut sum = b[o];
+                            for i in 0..in_ch {
+                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                            }
+                            out[out_col_start + o] = sum;
+                        }
+                    }
+                } else {
+                    for f in 0..num_frames {
+                        let in_col_start = f * input_stride;
+                        let out_col_start = f * out_ch;
+                        for o in 0..out_ch {
+                            let mut sum = 0.0f32;
+                            for i in 0..in_ch {
+                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                            }
+                            out[out_col_start + o] = sum;
+                        }
                     }
                 }
             }
@@ -407,11 +479,22 @@ impl Conv1x1 {
 // ── Conv1D (dilated, with groups support) ───────────────────────────────────
 
 /// Dilated 1D convolution with ring buffer. Supports grouped convolution.
+/// Depthwise vs general convolution weight storage.
+/// Depthwise is used when groups == in_channels == out_channels, storing a
+/// compact per-channel weight vector per tap instead of a full matrix.
+enum Conv1dWeights {
+    /// General (possibly grouped) convolution.
+    /// weights_colmajor[k] is column-major [out_ch * in_ch]
+    /// where W_k(i, j) = weights_colmajor[k][j * out_ch + i]
+    General(Vec<Vec<f32>>),
+    /// Depthwise convolution: depthwise_weights[k] is [channels],
+    /// one weight per channel per kernel tap.
+    Depthwise(Vec<Vec<f32>>),
+}
+
 /// Weight stored per kernel tap in column-major order matching Eigen.
 struct Conv1d {
-    /// Weight per kernel tap. weights_colmajor[k] is column-major [out_ch * in_ch]
-    /// where W_k(i, j) = weights_colmajor[k][j * out_ch + i]
-    weights_colmajor: Vec<Vec<f32>>,
+    weights: Conv1dWeights,
     bias: Vec<f32>,
     kernel_size: usize,
     dilation: usize,
@@ -433,32 +516,51 @@ impl Conv1d {
         groups: usize,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
-        let out_per_group = out_channels / groups;
-        let in_per_group = in_channels / groups;
+        let is_depthwise = groups == in_channels && in_channels == out_channels;
 
-        let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
-            .map(|_| vec![0.0f32; out_channels * in_channels])
-            .collect();
+        let weights = if is_depthwise {
+            // Depthwise: one weight per channel per kernel tap
+            // C++ weight order: for each channel c, for each kernel tap k
+            let mut dw: Vec<Vec<f32>> = (0..kernel_size)
+                .map(|_| vec![0.0f32; in_channels])
+                .collect();
+            for c in 0..in_channels {
+                let taps = iter.take(kernel_size)?;
+                for k in 0..kernel_size {
+                    dw[k][c] = taps[k];
+                }
+            }
+            Conv1dWeights::Depthwise(dw)
+        } else {
+            // General (possibly grouped) convolution
+            let out_per_group = out_channels / groups;
+            let in_per_group = in_channels / groups;
 
-        // C++ weight order: for group, for out_per_group, for in_per_group, for kernel_tap
-        for g in 0..groups {
-            for i in 0..out_per_group {
-                for j in 0..in_per_group {
-                    let taps = iter.take(kernel_size)?;
-                    let row = g * out_per_group + i;
-                    let col = g * in_per_group + j;
-                    for k in 0..kernel_size {
-                        // column-major: index = col * out_channels + row
-                        tap_weights_colmajor[k][col * out_channels + row] = taps[k];
+            let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
+                .map(|_| vec![0.0f32; out_channels * in_channels])
+                .collect();
+
+            // C++ weight order: for group, for out_per_group, for in_per_group, for kernel_tap
+            for g in 0..groups {
+                for i in 0..out_per_group {
+                    for j in 0..in_per_group {
+                        let taps = iter.take(kernel_size)?;
+                        let row = g * out_per_group + i;
+                        let col = g * in_per_group + j;
+                        for k in 0..kernel_size {
+                            // column-major: index = col * out_channels + row
+                            tap_weights_colmajor[k][col * out_channels + row] = taps[k];
+                        }
                     }
                 }
             }
-        }
+            Conv1dWeights::General(tap_weights_colmajor)
+        };
 
         let bias = iter.take(out_channels)?.to_vec();
 
         Ok(Self {
-            weights_colmajor: tap_weights_colmajor,
+            weights,
             bias,
             kernel_size,
             dilation,
@@ -484,7 +586,7 @@ impl Conv1d {
 
     /// Block processing matching C++ Conv1D::Process.
     /// 1. Write input to ring buffer
-    /// 2. For each kernel tap k: read from ring buffer with lookback, accumulate GEMM
+    /// 2. For each kernel tap k: read from ring buffer with lookback, accumulate
     /// 3. Add bias
     fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
         // Write input to ring buffer
@@ -495,44 +597,83 @@ impl Conv1d {
         let ks = self.kernel_size;
         let dil = self.dilation;
 
-        let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
-
         // Initialize output to zero, then accumulate
         let out_len = out_ch * num_frames;
         self.output_buf.data[..out_len].fill(0.0);
 
-        for k in 0..ks {
-            // C++ offset = dilation * (k + 1 - kernel_size), lookback = -offset
-            let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
-            let lookback = (-offset_signed) as usize;
-
-            let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-            let w = &self.weights_colmajor[k];
-
-            if use_sgemm {
-                unsafe {
-                    sgemm_colmajor(
-                        out_ch,
-                        in_ch,
-                        num_frames,
-                        1.0,
-                        w.as_ptr(),
-                        tap_data.as_ptr(),
-                        in_ch as isize,
-                        1.0,
-                        self.output_buf.data.as_mut_ptr(),
-                    );
-                }
-            } else {
-                for f in 0..num_frames {
-                    let in_col_start = f * in_ch;
-                    let out_col_start = f * out_ch;
-                    for o in 0..out_ch {
-                        let mut sum = 0.0f32;
-                        for i in 0..in_ch {
-                            sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+        match &self.weights {
+            Conv1dWeights::Depthwise(dw) => {
+                // Depthwise: element-wise multiply per channel per tap
+                let ch = out_ch; // in_ch == out_ch for depthwise
+                if ch == 3 {
+                    // 3-channel specialization: fully unrolled inner loop
+                    for k in 0..ks {
+                        let offset_signed: isize =
+                            dil as isize * (k as isize + 1 - ks as isize);
+                        let lookback = (-offset_signed) as usize;
+                        let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
+                        let w0 = dw[k][0];
+                        let w1 = dw[k][1];
+                        let w2 = dw[k][2];
+                        for f in 0..num_frames {
+                            let off = f * 3;
+                            self.output_buf.data[off] += w0 * tap_data[off];
+                            self.output_buf.data[off + 1] += w1 * tap_data[off + 1];
+                            self.output_buf.data[off + 2] += w2 * tap_data[off + 2];
                         }
-                        self.output_buf.data[out_col_start + o] += sum;
+                    }
+                } else {
+                    for k in 0..ks {
+                        let offset_signed: isize =
+                            dil as isize * (k as isize + 1 - ks as isize);
+                        let lookback = (-offset_signed) as usize;
+                        let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
+                        let w = &dw[k];
+                        for f in 0..num_frames {
+                            let col_start = f * ch;
+                            for c in 0..ch {
+                                self.output_buf.data[col_start + c] +=
+                                    w[c] * tap_data[col_start + c];
+                            }
+                        }
+                    }
+                }
+            }
+            Conv1dWeights::General(weights_colmajor) => {
+                let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
+                for k in 0..ks {
+                    let offset_signed: isize =
+                        dil as isize * (k as isize + 1 - ks as isize);
+                    let lookback = (-offset_signed) as usize;
+                    let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
+                    let w = &weights_colmajor[k];
+
+                    if use_sgemm {
+                        unsafe {
+                            sgemm_colmajor(
+                                out_ch,
+                                in_ch,
+                                num_frames,
+                                1.0,
+                                w.as_ptr(),
+                                tap_data.as_ptr(),
+                                in_ch as isize,
+                                1.0,
+                                self.output_buf.data.as_mut_ptr(),
+                            );
+                        }
+                    } else {
+                        for f in 0..num_frames {
+                            let in_col_start = f * in_ch;
+                            let out_col_start = f * out_ch;
+                            for o in 0..out_ch {
+                                let mut sum = 0.0f32;
+                                for i in 0..in_ch {
+                                    sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+                                }
+                                self.output_buf.data[out_col_start + o] += sum;
+                            }
+                        }
                     }
                 }
             }
@@ -601,32 +742,7 @@ impl FiLM {
     ) {
         self.cond_to_scale_shift
             .process_block(condition, num_frames);
-        let scale_shift = &self.cond_to_scale_shift.output_buf;
-        let ss_rows = self.cond_to_scale_shift.out_channels;
-        let dim = self.input_dim;
-
-        if self.do_shift {
-            for f in 0..num_frames {
-                let in_off = f * input.rows;
-                let ss_off = f * ss_rows;
-                let out_off = f * dim;
-                for i in 0..dim {
-                    self.output_buf.data[out_off + i] = input.data[in_off + i]
-                        * scale_shift.data[ss_off + i]
-                        + scale_shift.data[ss_off + dim + i];
-                }
-            }
-        } else {
-            for f in 0..num_frames {
-                let in_off = f * input.rows;
-                let ss_off = f * ss_rows;
-                let out_off = f * dim;
-                for i in 0..dim {
-                    self.output_buf.data[out_off + i] =
-                        input.data[in_off + i] * scale_shift.data[ss_off + i];
-                }
-            }
-        }
+        self.apply_film_inner(&input.data, input.rows, num_frames);
     }
 
     /// Block FiLM with input data that has a different stride (e.g. topRows of a larger matrix)
@@ -639,20 +755,60 @@ impl FiLM {
     ) {
         self.cond_to_scale_shift
             .process_block(condition, num_frames);
+        self.apply_film_inner(input_data, input_stride, num_frames);
+    }
+
+    /// Inner FiLM application with 3-channel specialization.
+    #[inline]
+    fn apply_film_inner(
+        &mut self,
+        input_data: &[f32],
+        input_stride: usize,
+        num_frames: usize,
+    ) {
         let scale_shift = &self.cond_to_scale_shift.output_buf;
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
 
         if self.do_shift {
+            if dim == 3 {
+                for f in 0..num_frames {
+                    let in_off = f * input_stride;
+                    let ss_off = f * ss_rows;
+                    let out_off = f * 3;
+                    self.output_buf.data[out_off] = input_data[in_off]
+                        * scale_shift.data[ss_off]
+                        + scale_shift.data[ss_off + 3];
+                    self.output_buf.data[out_off + 1] = input_data[in_off + 1]
+                        * scale_shift.data[ss_off + 1]
+                        + scale_shift.data[ss_off + 4];
+                    self.output_buf.data[out_off + 2] = input_data[in_off + 2]
+                        * scale_shift.data[ss_off + 2]
+                        + scale_shift.data[ss_off + 5];
+                }
+            } else {
+                for f in 0..num_frames {
+                    let in_off = f * input_stride;
+                    let ss_off = f * ss_rows;
+                    let out_off = f * dim;
+                    for i in 0..dim {
+                        self.output_buf.data[out_off + i] = input_data[in_off + i]
+                            * scale_shift.data[ss_off + i]
+                            + scale_shift.data[ss_off + dim + i];
+                    }
+                }
+            }
+        } else if dim == 3 {
             for f in 0..num_frames {
                 let in_off = f * input_stride;
                 let ss_off = f * ss_rows;
-                let out_off = f * dim;
-                for i in 0..dim {
-                    self.output_buf.data[out_off + i] = input_data[in_off + i]
-                        * scale_shift.data[ss_off + i]
-                        + scale_shift.data[ss_off + dim + i];
-                }
+                let out_off = f * 3;
+                self.output_buf.data[out_off] =
+                    input_data[in_off] * scale_shift.data[ss_off];
+                self.output_buf.data[out_off + 1] =
+                    input_data[in_off + 1] * scale_shift.data[ss_off + 1];
+                self.output_buf.data[out_off + 2] =
+                    input_data[in_off + 2] * scale_shift.data[ss_off + 2];
             }
         } else {
             for f in 0..num_frames {
@@ -1186,8 +1342,21 @@ impl WaveNetLayer {
         let ch = self.channels;
         if let Some(ref l1x1) = self.layer1x1 {
             let total = ch * num_frames;
-            for i in 0..total {
-                self.output_next_layer.data[i] = input.data[i] + l1x1.output_buf.data[i];
+            let inp = &input.data;
+            let l1 = &l1x1.output_buf.data;
+            let out = &mut self.output_next_layer.data;
+            // 4-wide unrolled element-wise addition
+            let mut i = 0;
+            while i + 3 < total {
+                out[i] = inp[i] + l1[i];
+                out[i + 1] = inp[i + 1] + l1[i + 1];
+                out[i + 2] = inp[i + 2] + l1[i + 2];
+                out[i + 3] = inp[i + 3] + l1[i + 3];
+                i += 4;
+            }
+            while i < total {
+                out[i] = inp[i] + l1[i];
+                i += 1;
             }
         } else {
             let total = ch * num_frames;
@@ -1329,16 +1498,35 @@ impl WaveNetLayerArray {
                 layer.process_block(unsafe { &*prev_output }, condition, num_frames);
             }
 
-            // Accumulate head output from this layer
+            // Accumulate head output from this layer (4-wide unrolled)
             let head_out_size = self.head_output_size;
             let layer = &self.layers[i];
             let head_data = layer.get_output_head_data();
             let head_rows = layer.get_output_head_rows();
-            for f in 0..num_frames {
-                let src_off = f * head_rows;
-                let dst_off = f * head_out_size;
-                for c in 0..head_out_size {
-                    self.head_inputs.data[dst_off + c] += head_data[src_off + c];
+            if head_rows == head_out_size {
+                // Contiguous: single pass with unrolling
+                let total = head_out_size * num_frames;
+                let dst = &mut self.head_inputs.data;
+                let mut j = 0;
+                while j + 3 < total {
+                    dst[j] += head_data[j];
+                    dst[j + 1] += head_data[j + 1];
+                    dst[j + 2] += head_data[j + 2];
+                    dst[j + 3] += head_data[j + 3];
+                    j += 4;
+                }
+                while j < total {
+                    dst[j] += head_data[j];
+                    j += 1;
+                }
+            } else {
+                // Different strides: per-frame copy
+                for f in 0..num_frames {
+                    let src_off = f * head_rows;
+                    let dst_off = f * head_out_size;
+                    for c in 0..head_out_size {
+                        self.head_inputs.data[dst_off + c] += head_data[src_off + c];
+                    }
                 }
             }
         }
@@ -1402,7 +1590,7 @@ impl WaveNet {
             .and_then(|v| v.as_u64())
             .unwrap_or(1) as usize;
 
-        for la_json in layers_json {
+        for (la_idx, la_json) in layers_json.iter().enumerate() {
             let input_size = la_json["input_size"]
                 .as_u64()
                 .ok_or_else(|| NamError::MissingField("layer_array.input_size".into()))?
@@ -1423,10 +1611,6 @@ impl WaveNet {
                 .get("bottleneck")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(channels as u64) as usize;
-            let kernel_size = la_json["kernel_size"]
-                .as_u64()
-                .ok_or_else(|| NamError::MissingField("layer_array.kernel_size".into()))?
-                as usize;
             let dilations_arr = la_json["dilations"]
                 .as_array()
                 .ok_or_else(|| NamError::MissingField("layer_array.dilations".into()))?;
@@ -1444,6 +1628,86 @@ impl WaveNet {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let num_layers = dilations.len();
+
+            // Parse kernel sizes: support legacy single `kernel_size` (int) or
+            // new per-layer `kernel_sizes` (array). Mutual exclusivity enforced.
+            let kernel_sizes: Vec<usize> = {
+                let has_kernel_size = la_json.get("kernel_size").is_some();
+                let has_kernel_sizes = la_json.get("kernel_sizes").is_some();
+
+                if has_kernel_size && has_kernel_sizes {
+                    return Err(NamError::InvalidConfig(format!(
+                        "Layer array {}: only one of kernel_size (int) or kernel_sizes (array) may be provided",
+                        la_idx
+                    )));
+                } else if has_kernel_sizes {
+                    let arr = la_json["kernel_sizes"].as_array().ok_or_else(|| {
+                        NamError::InvalidConfig(format!(
+                            "Layer array {}: kernel_sizes must be an array",
+                            la_idx
+                        ))
+                    })?;
+                    let ks: Vec<usize> = arr
+                        .iter()
+                        .map(|v| {
+                            v.as_u64()
+                                .ok_or_else(|| {
+                                    NamError::InvalidConfig(
+                                        "kernel_sizes contains non-integer value".into(),
+                                    )
+                                })
+                                .map(|n| n as usize)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if ks.len() != num_layers {
+                        return Err(NamError::InvalidConfig(format!(
+                            "Layer array {}: kernel_sizes length ({}) must match dilations length ({})",
+                            la_idx,
+                            ks.len(),
+                            num_layers
+                        )));
+                    }
+                    ks
+                } else if has_kernel_size {
+                    let ks_val = &la_json["kernel_size"];
+                    if let Some(arr) = ks_val.as_array() {
+                        // Also accept kernel_size as an array (trainer compat)
+                        let ks: Vec<usize> = arr
+                            .iter()
+                            .map(|v| {
+                                v.as_u64()
+                                    .ok_or_else(|| {
+                                        NamError::InvalidConfig(
+                                            "kernel_size array contains non-integer value".into(),
+                                        )
+                                    })
+                                    .map(|n| n as usize)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if ks.len() != num_layers {
+                            return Err(NamError::InvalidConfig(format!(
+                                "Layer array {}: kernel_size array length ({}) must match dilations length ({})",
+                                la_idx,
+                                ks.len(),
+                                num_layers
+                            )));
+                        }
+                        ks
+                    } else {
+                        let ks = ks_val.as_u64().ok_or_else(|| {
+                            NamError::InvalidConfig(format!(
+                                "Layer array {}: kernel_size must be an integer or array",
+                                la_idx
+                            ))
+                        })? as usize;
+                        vec![ks; num_layers]
+                    }
+                } else {
+                    return Err(NamError::MissingField(
+                        "layer_array: either kernel_size or kernel_sizes must be provided".into(),
+                    ));
+                }
+            };
 
             // Parse activation configs (per-layer or single)
             let activation_configs: Vec<Activation> = {
@@ -1564,7 +1828,7 @@ impl WaveNet {
                     channels,
                     bottleneck,
                     cond_size,
-                    kernel_size,
+                    kernel_sizes[layer_idx],
                     dil,
                     &activation_configs[layer_idx],
                     layer_gating,
@@ -2362,5 +2626,265 @@ mod tests {
         let mut output = vec![0.0 as Sample; 64];
         model.process(&input, &mut output);
         assert!(output.iter().all(|&x| (x as f64).is_finite()));
+    }
+
+    // ── Per-layer kernel_sizes tests ────────────────────────────────────────
+
+    /// Helper: build a minimal WaveNet JSON config and matching weight vec.
+    /// Returns (config_json, weights) for simple 1-channel, no-gating configs.
+    fn make_kernel_size_config(kernel_field: &str, num_layers: usize) -> (String, Vec<f32>) {
+        // Weight budget for 1-ch, 1-bottleneck, no-gating, layer1x1-active, no-head1x1:
+        //   rechannel: 1, per layer with kernel K: K+4, head_rechannel: 1, head_scale: 1
+        // Parse kernel sizes from the field string to compute exact weight count.
+        let kernel_sizes: Vec<usize> = if kernel_field.contains('[') {
+            // Array form: extract numbers from brackets
+            let start = kernel_field.find('[').unwrap();
+            let end = kernel_field.find(']').unwrap();
+            kernel_field[start + 1..end]
+                .split(',')
+                .map(|s| s.trim().parse::<usize>().unwrap())
+                .collect()
+        } else {
+            // Scalar form: extract the number
+            let num: usize = kernel_field
+                .split(':')
+                .last()
+                .unwrap()
+                .trim()
+                .trim_matches('"')
+                .parse()
+                .unwrap();
+            vec![num; num_layers]
+        };
+        let num_weights = 1 + kernel_sizes.iter().map(|k| k + 4).sum::<usize>() + 1 + 1;
+        let weights = vec![1.0f32; num_weights];
+        let dilations: Vec<String> = (0..num_layers).map(|i| format!("{}", 1 << i)).collect();
+        let config_str = format!(
+            r#"{{
+                "layers": [{{
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "head_size": 1,
+                    "channels": 1,
+                    {},
+                    "dilations": [{}],
+                    "activation": "ReLU",
+                    "gated": false,
+                    "head_bias": false
+                }}],
+                "head_scale": 1.0
+            }}"#,
+            kernel_field,
+            dilations.join(", ")
+        );
+        (config_str, weights)
+    }
+
+    #[test]
+    fn test_kernel_size_int_compat() {
+        // Legacy single kernel_size integer should be expanded to all layers
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_size": 3"#, 3);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        assert!(result.is_ok(), "Legacy kernel_size int should parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_kernel_sizes_per_layer_array() {
+        // New per-layer kernel_sizes array
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_sizes": [2, 3, 5]"#, 3);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        assert!(result.is_ok(), "Per-layer kernel_sizes should parse: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_kernel_size_mutual_exclusivity() {
+        // Providing both kernel_size and kernel_sizes should error
+        let (config_str, weights) = make_kernel_size_config(
+            r#""kernel_size": 3, "kernel_sizes": [2, 3, 5]"#,
+            3,
+        );
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        let err = result.err().expect("Both kernel_size and kernel_sizes should be rejected");
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("only one of"),
+            "Error should mention mutual exclusivity: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_kernel_sizes_length_mismatch() {
+        // kernel_sizes length != dilations length should error
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_sizes": [2, 3]"#, 3);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        let err = result.err().expect("Mismatched kernel_sizes length should be rejected");
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("must match"),
+            "Error should mention length mismatch: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_no_kernel_size_field_errors() {
+        // Neither kernel_size nor kernel_sizes should error
+        let config_str = r#"{
+            "layers": [{
+                "input_size": 1,
+                "condition_size": 1,
+                "head_size": 1,
+                "channels": 1,
+                "dilations": [1, 2],
+                "activation": "ReLU",
+                "gated": false,
+                "head_bias": false
+            }],
+            "head_scale": 1.0
+        }"#;
+        let config: serde_json::Value = serde_json::from_str(config_str).unwrap();
+        let weights = vec![1.0f32; 500];
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        assert!(result.is_err(), "Missing kernel_size should be rejected");
+    }
+
+    #[test]
+    fn test_kernel_sizes_per_layer_different_receptive_fields() {
+        // With kernel_sizes [2, 3] and dilations [1, 2]:
+        //   layer 0: RF = 1 * (2-1) = 1
+        //   layer 1: RF = 2 * (3-1) = 4
+        //   total RF = 5, prewarm = 1 (base) + 5 = 6
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_sizes": [2, 3]"#, 2);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let model = WaveNet::from_config(&config, &weights, metadata).unwrap();
+        assert_eq!(model.prewarm_samples(), 6);
+    }
+
+    #[test]
+    fn test_kernel_size_as_array() {
+        // kernel_size (singular key) with array value should also be accepted
+        // for compatibility with trainer exports
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_size": [2, 3]"#, 2);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let result = WaveNet::from_config(&config, &weights, metadata);
+        assert!(result.is_ok(), "kernel_size as array should parse: {:?}", result.err());
+        let model = result.unwrap();
+        // dilations [1, 2], kernel_sizes [2, 3]: RF = 1*(2-1) + 2*(3-1) = 5, prewarm = 1 + 5 = 6
+        assert_eq!(model.prewarm_samples(), 6);
+    }
+
+    #[test]
+    fn test_kernel_size_int_receptive_field() {
+        // With kernel_size=3 and dilations [1, 2]:
+        //   layer 0: RF = 1 * (3-1) = 2
+        //   layer 1: RF = 2 * (3-1) = 4
+        //   total RF = 6, prewarm = 1 + 6 = 7
+        let (config_str, weights) = make_kernel_size_config(r#""kernel_size": 3"#, 2);
+        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        let metadata = DspMetadata::default();
+        let model = WaveNet::from_config(&config, &weights, metadata).unwrap();
+        assert_eq!(model.prewarm_samples(), 7);
+    }
+
+    // ── Depthwise convolution tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_conv1d_depthwise_detected() {
+        // groups == in_channels == out_channels triggers depthwise path
+        let weights_data = vec![1.0f32; 100];
+        let mut iter = crate::util::WeightIter::new(&weights_data);
+        let conv = Conv1d::from_weights(4, 4, 3, 1, 4, &mut iter).unwrap();
+        assert!(matches!(conv.weights, Conv1dWeights::Depthwise(_)));
+    }
+
+    #[test]
+    fn test_conv1d_general_when_not_depthwise() {
+        // groups != in_channels should use general path
+        let weights_data = vec![1.0f32; 100];
+        let mut iter = crate::util::WeightIter::new(&weights_data);
+        let conv = Conv1d::from_weights(4, 4, 3, 1, 2, &mut iter).unwrap();
+        assert!(matches!(conv.weights, Conv1dWeights::General(_)));
+    }
+
+    #[test]
+    fn test_conv1d_depthwise_identity() {
+        // 2-channel depthwise with kernel_size=1, weights=[1,1]
+        // Should act as identity (plus bias)
+        let weights_data = vec![1.0, 1.0, 0.0, 0.0]; // 2 weights + 2 bias
+        let mut iter = crate::util::WeightIter::new(&weights_data);
+        let mut conv = Conv1d::from_weights(2, 2, 1, 1, 2, &mut iter).unwrap();
+        conv.set_max_buffer_size(4);
+
+        let mut input = ColMajorMatrix::new(2, 4);
+        // Frame 0: [3.0, 5.0], Frame 1: [7.0, 11.0]
+        input.data[0] = 3.0;
+        input.data[1] = 5.0;
+        input.data[2] = 7.0;
+        input.data[3] = 11.0;
+
+        conv.process_block(&input, 2);
+        // With weight=1 and bias=0: output should equal input
+        assert!((conv.output_buf.data[0] - 3.0).abs() < 1e-6);
+        assert!((conv.output_buf.data[1] - 5.0).abs() < 1e-6);
+        assert!((conv.output_buf.data[2] - 7.0).abs() < 1e-6);
+        assert!((conv.output_buf.data[3] - 11.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_conv1d_depthwise_scaling() {
+        // 2-channel depthwise with kernel_size=1, weights=[2, 3], bias=[10, 20]
+        let weights_data = vec![2.0, 3.0, 10.0, 20.0];
+        let mut iter = crate::util::WeightIter::new(&weights_data);
+        let mut conv = Conv1d::from_weights(2, 2, 1, 1, 2, &mut iter).unwrap();
+        conv.set_max_buffer_size(4);
+
+        let mut input = ColMajorMatrix::new(2, 4);
+        input.data[0] = 1.0; // ch0, frame0
+        input.data[1] = 1.0; // ch1, frame0
+
+        conv.process_block(&input, 1);
+        // ch0: 2*1 + 10 = 12, ch1: 3*1 + 20 = 23
+        assert!((conv.output_buf.data[0] - 12.0).abs() < 1e-6);
+        assert!((conv.output_buf.data[1] - 23.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_conv1d_depthwise_multi_tap() {
+        // 2-channel depthwise with kernel_size=2, dilation=1
+        // weights: ch0=[1, 2], ch1=[3, 4], bias=[0, 0]
+        // C++ weight order for depthwise: for each channel c, for each tap k
+        let weights_data = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
+        let mut iter = crate::util::WeightIter::new(&weights_data);
+        let mut conv = Conv1d::from_weights(2, 2, 2, 1, 2, &mut iter).unwrap();
+        conv.set_max_buffer_size(4);
+
+        // Process two calls to build up ring buffer history
+        let mut input1 = ColMajorMatrix::new(2, 4);
+        input1.data[0] = 1.0; // ch0
+        input1.data[1] = 0.0; // ch1
+        conv.process_block(&input1, 1);
+
+        let mut input2 = ColMajorMatrix::new(2, 4);
+        input2.data[0] = 0.0; // ch0
+        input2.data[1] = 1.0; // ch1
+        conv.process_block(&input2, 1);
+        // Tap ordering: k=0 has lookback=1 (prev), k=1 has lookback=0 (current)
+        // Frame 1 output:
+        //   ch0: w[0]*prev[ch0] + w[1]*now[ch0] = 1*1 + 2*0 = 1
+        //   ch1: w[0]*prev[ch1] + w[1]*now[ch1] = 3*0 + 4*1 = 4
+        assert!((conv.output_buf.data[0] - 1.0).abs() < 1e-6, "ch0: {}", conv.output_buf.data[0]);
+        assert!((conv.output_buf.data[1] - 4.0).abs() < 1e-6, "ch1: {}", conv.output_buf.data[1]);
     }
 }
