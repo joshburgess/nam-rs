@@ -7,12 +7,16 @@ nam.train.core, and writes JSON progress events to stdout.
 Protocol:
   stdin:  single JSON line with TrainRequest
   stdout: one JSON line per event (epoch_end, training_complete, error, etc.)
+
+Progress is captured by monkey-patching PyTorch Lightning's Trainer to
+inject a custom callback, since core.train() doesn't expose a callback parameter.
 """
 
 import json
 import os
 import sys
 import traceback
+
 
 def emit(event: dict):
     """Write a JSON event to stdout and flush immediately."""
@@ -41,6 +45,7 @@ def main():
               "Install with: pip install neural-amp-modeler"})
         sys.exit(1)
 
+    # Custom callback for JSON progress reporting
     class JsonProgressCallback(pl.Callback):
         """Reports training progress as JSON lines to stdout."""
 
@@ -53,6 +58,23 @@ def main():
                 "val_loss": float(metrics.get("val_loss", 0.0)),
                 "esr": float(metrics.get("ESR", metrics.get("val_loss", 0.0))),
             })
+
+    # Monkey-patch the Trainer to inject our callback
+    _original_trainer_init = pl.Trainer.__init__
+
+    def _patched_trainer_init(self, *args, **kwargs):
+        _original_trainer_init(self, *args, **kwargs)
+        self.callbacks.append(JsonProgressCallback())
+
+    pl.Trainer.__init__ = _patched_trainer_init
+
+    # Set device via environment variable if specified
+    device = request.get("device", "")
+    if device.startswith("cuda:"):
+        gpu_idx = device.split(":")[1]
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_idx
+    elif device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Build user metadata
     meta = request.get("metadata", {})
@@ -106,13 +128,11 @@ def main():
                 fit_mrstft=request.get("fit_mrstft", True),
                 threshold_esr=request.get("threshold_esr"),
                 user_metadata=user_metadata,
-                local_callbacks=[JsonProgressCallback()],
             )
 
             # Find the exported model path
             model_path = os.path.join(destination, basename, f"{basename}.nam")
             if not os.path.exists(model_path):
-                # Try alternate location
                 for root, dirs, files in os.walk(os.path.join(destination, basename)):
                     for f in files:
                         if f.endswith(".nam"):
@@ -122,7 +142,7 @@ def main():
             emit({
                 "type": "training_complete",
                 "file": output_path,
-                "validation_esr": 0.0,  # TODO: extract from trainer
+                "validation_esr": 0.0,
                 "model_path": model_path,
             })
 
