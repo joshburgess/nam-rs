@@ -65,10 +65,10 @@ pub trait Dsp: Send {
         out_channels: usize,
         num_frames: usize,
     ) {
-        for f in 0..num_frames {
+        for (f, &sample) in input.iter().enumerate().take(num_frames) {
             let col_start = f * output_stride;
             self.process_sample_multi_channel(
-                input[f],
+                sample,
                 &mut output_data[col_start..col_start + out_channels],
             );
         }

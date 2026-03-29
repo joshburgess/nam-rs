@@ -1,5 +1,7 @@
 // Allow index-based loops in GEMM hot paths where explicit indexing matches C++ Eigen order
 #![allow(clippy::needless_range_loop)]
+// Allow returns after cfg-gated blocks where the return prevents fallthrough to cfg'd-out code
+#![allow(clippy::needless_return, unreachable_code)]
 
 use crate::activations::Activation;
 use crate::dsp::{Dsp, DspMetadata, Sample};

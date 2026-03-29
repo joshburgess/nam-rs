@@ -1,6 +1,6 @@
-/// FFI bindings to coarse-grained C kernels compiled with -ffast-math.
-/// Each function processes an entire operation to amortize FFI call overhead.
-
+// FFI bindings to coarse-grained C kernels compiled with -ffast-math.
+// Each function processes an entire operation to amortize FFI call overhead.
+#[allow(dead_code)]
 extern "C" {
     /// Full Conv1d depthwise: all taps + bias in one call.
     /// weights layout: weights[k * ch + c] for tap k, channel c.
