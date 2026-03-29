@@ -9,6 +9,10 @@ description = "Rust DSP inference engine for Neural Amp Modeler"
 default = []
 float_io = []  # Use f32 instead of f64 for process() I/O (matches C++ DSP_SAMPLE_FLOAT)
 faer = ["dep:faer"]  # Use faer GEMM instead of matrixmultiply
+fast-kernels = []  # C inner loops compiled with -ffast-math
+
+[build-dependencies]
+cc = { version = "1", optional = false }
 
 [dependencies]
 ndarray = "0.16"

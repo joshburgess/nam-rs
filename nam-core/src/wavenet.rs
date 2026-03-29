@@ -1,5 +1,3 @@
-// Allow index-based loops in GEMM hot paths where explicit indexing matches C++ Eigen order
-#![allow(clippy::needless_range_loop)]
 
 use crate::activations::Activation;
 use crate::dsp::{Dsp, DspMetadata, Sample};
@@ -232,16 +230,10 @@ impl RingBuffer2D {
         }
         let ch = self.channels;
         let copy_start = self.write_pos - self.max_lookback;
-        // Copy max_lookback columns from copy_start to position 0
-        for c in 0..self.max_lookback {
-            let src_off = (copy_start + c) * ch;
-            let dst_off = c * ch;
-            // Can't use copy_from_slice because regions may overlap, but since
-            // copy_start >= max_lookback (by C++ invariant), they don't overlap.
-            for i in 0..ch {
-                self.storage[dst_off + i] = self.storage[src_off + i];
-            }
-        }
+        let len = self.max_lookback * ch;
+        let src_start = copy_start * ch;
+        // copy_start >= max_lookback (by C++ invariant), so regions don't overlap.
+        self.storage.copy_within(src_start..src_start + len, 0);
         self.write_pos = self.max_lookback;
     }
 
@@ -408,6 +400,31 @@ impl Conv1x1 {
         let bias = &self.bias;
         let out = &mut self.output_buf.data;
 
+        // Fast-kernels: route all sizes through C for -ffast-math vectorization
+        #[cfg(feature = "fast-kernels")]
+        {
+            let bias_ptr = match bias {
+                Some(ref b) => b.as_ptr(),
+                None => core::ptr::null(),
+            };
+            unsafe {
+                crate::fast_kernels::fast_conv1x1_small(
+                    out.as_mut_ptr(),
+                    w.as_ptr(),
+                    input_data.as_ptr(),
+                    bias_ptr,
+                    out_ch,
+                    in_ch,
+                    input_stride,
+                    num_frames,
+                );
+            }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         match (out_ch, in_ch) {
             (3, 3) => {
                 let w00 = w[0]; let w10 = w[1]; let w20 = w[2];
@@ -459,43 +476,45 @@ impl Conv1x1 {
                 let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
                 if let Some(ref b) = bias {
                     let b0 = b[0];
-                    for f in 0..num_frames {
+                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
                             + w2 * input_data[ic + 2] + b0;
                     }
                 } else {
-                    for f in 0..num_frames {
+                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
                             + w2 * input_data[ic + 2];
                     }
                 }
             }
             _ => {
-                // General small-matrix path with fused bias
-                if let Some(ref b) = bias {
-                    for f in 0..num_frames {
-                        let in_col_start = f * input_stride;
-                        let out_col_start = f * out_ch;
-                        for o in 0..out_ch {
-                            let mut sum = b[o];
-                            for i in 0..in_ch {
-                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                {
+                    // General small-matrix path with fused bias
+                    if let Some(ref b) = bias {
+                        for f in 0..num_frames {
+                            let in_col_start = f * input_stride;
+                            let out_col_start = f * out_ch;
+                            for o in 0..out_ch {
+                                let mut sum = b[o];
+                                for i in 0..in_ch {
+                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                }
+                                out[out_col_start + o] = sum;
                             }
-                            out[out_col_start + o] = sum;
                         }
-                    }
-                } else {
-                    for f in 0..num_frames {
-                        let in_col_start = f * input_stride;
-                        let out_col_start = f * out_ch;
-                        for o in 0..out_ch {
-                            let mut sum = 0.0f32;
-                            for i in 0..in_ch {
-                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                    } else {
+                        for f in 0..num_frames {
+                            let in_col_start = f * input_stride;
+                            let out_col_start = f * out_ch;
+                            for o in 0..out_ch {
+                                let mut sum = 0.0f32;
+                                for i in 0..in_ch {
+                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                }
+                                out[out_col_start + o] = sum;
                             }
-                            out[out_col_start + o] = sum;
                         }
                     }
                 }
@@ -533,6 +552,9 @@ struct Conv1d {
     // Block processing state
     input_buffer: RingBuffer2D,
     output_buf: ColMajorMatrix,
+    /// Flattened weights for C FFI: all taps concatenated.
+    #[cfg(feature = "fast-kernels")]
+    flat_weights: Vec<f32>,
 }
 
 impl Conv1d {
@@ -552,6 +574,8 @@ impl Conv1d {
             let mut dw: Vec<Vec<f32>> = (0..kernel_size)
                 .map(|_| vec![0.0f32; in_channels])
                 .collect();
+            // Indexes dw[k][c] and taps[k] simultaneously — can't use iterators
+            #[allow(clippy::needless_range_loop)]
             for c in 0..in_channels {
                 let taps = iter.take(kernel_size)?;
                 for k in 0..kernel_size {
@@ -587,6 +611,27 @@ impl Conv1d {
 
         let bias = iter.take(out_channels)?.to_vec();
 
+        // Build flat weights for C FFI
+        #[cfg(feature = "fast-kernels")]
+        let flat_weights = match &weights {
+            Conv1dWeights::Depthwise(dw) => {
+                // flat_weights[k * ch + c]
+                let mut flat = Vec::with_capacity(kernel_size * out_channels);
+                for tap in dw {
+                    flat.extend_from_slice(tap);
+                }
+                flat
+            }
+            Conv1dWeights::General(taps) => {
+                // flat_weights[k * (out_ch * in_ch) + ...] — just concatenate
+                let mut flat = Vec::with_capacity(kernel_size * out_channels * in_channels);
+                for tap in taps {
+                    flat.extend_from_slice(tap);
+                }
+                flat
+            }
+        };
+
         Ok(Self {
             weights,
             bias,
@@ -597,6 +642,8 @@ impl Conv1d {
             groups,
             input_buffer: RingBuffer2D::new(),
             output_buf: ColMajorMatrix::new(out_channels, 1),
+            #[cfg(feature = "fast-kernels")]
+            flat_weights,
         })
     }
 
@@ -625,9 +672,75 @@ impl Conv1d {
         let ks = self.kernel_size;
         let dil = self.dilation;
 
-        // Initialize output to zero, then accumulate
-        let out_len = out_ch * num_frames;
-        self.output_buf.data[..out_len].fill(0.0);
+        // Fast-kernels path: single C FFI call for the entire Conv1d
+        #[cfg(feature = "fast-kernels")]
+        {
+            // Build tap pointer array
+            let tap_ptrs: Vec<*const f32> = (0..ks)
+                .map(|k| {
+                    let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
+                    let lookback = (-offset_signed) as usize;
+                    self.input_buffer.read_ptr(num_frames, lookback).as_ptr()
+                })
+                .collect();
+
+            let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
+            match &self.weights {
+                Conv1dWeights::Depthwise(_) => unsafe {
+                    crate::fast_kernels::fast_conv1d_depthwise(
+                        self.output_buf.data.as_mut_ptr(),
+                        tap_ptrs.as_ptr(),
+                        self.flat_weights.as_ptr(),
+                        self.bias.as_ptr(),
+                        out_ch,
+                        ks,
+                        num_frames,
+                    );
+                },
+                Conv1dWeights::General(_) if !use_sgemm => unsafe {
+                    crate::fast_kernels::fast_conv1d_small_gemv(
+                        self.output_buf.data.as_mut_ptr(),
+                        tap_ptrs.as_ptr(),
+                        self.flat_weights.as_ptr(),
+                        self.bias.as_ptr(),
+                        out_ch,
+                        in_ch,
+                        ks,
+                        num_frames,
+                    );
+                },
+                Conv1dWeights::General(weights_colmajor) => {
+                    // Large matrix: initialize with bias, then accumulate via sgemm
+                    for f in 0..num_frames {
+                        let off = f * out_ch;
+                        self.output_buf.data[off..off + out_ch]
+                            .copy_from_slice(&self.bias);
+                    }
+                    for k in 0..ks {
+                        let w = &weights_colmajor[k];
+                        unsafe {
+                            sgemm_colmajor(
+                                out_ch, in_ch, num_frames,
+                                1.0, w.as_ptr(), tap_ptrs[k], in_ch as isize,
+                                1.0, self.output_buf.data.as_mut_ptr(),
+                            );
+                        }
+                    }
+                }
+            }
+            self.input_buffer.advance(num_frames);
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
+            return;
+        }
+
+        // Initialize output with bias (fused: eliminates separate bias-add pass)
+        // (unreachable when fast-kernels feature is enabled — the block above returns early)
+        #[allow(unreachable_code)]
+        for f in 0..num_frames {
+            let off = f * out_ch;
+            self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
+        }
 
         match &self.weights {
             Conv1dWeights::Depthwise(dw) => {
@@ -635,14 +748,14 @@ impl Conv1d {
                 let ch = out_ch; // in_ch == out_ch for depthwise
                 if ch == 3 {
                     // 3-channel specialization: fully unrolled inner loop
-                    for k in 0..ks {
+                    for (k, tap_w) in dw.iter().enumerate() {
                         let offset_signed: isize =
                             dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                        let w0 = dw[k][0];
-                        let w1 = dw[k][1];
-                        let w2 = dw[k][2];
+                        let w0 = tap_w[0];
+                        let w1 = tap_w[1];
+                        let w2 = tap_w[2];
                         for f in 0..num_frames {
                             let off = f * 3;
                             self.output_buf.data[off] += w0 * tap_data[off];
@@ -651,17 +764,16 @@ impl Conv1d {
                         }
                     }
                 } else {
-                    for k in 0..ks {
+                    for (k, tap_w) in dw.iter().enumerate() {
                         let offset_signed: isize =
                             dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                        let w = &dw[k];
                         for f in 0..num_frames {
                             let col_start = f * ch;
                             for c in 0..ch {
                                 self.output_buf.data[col_start + c] +=
-                                    w[c] * tap_data[col_start + c];
+                                    tap_w[c] * tap_data[col_start + c];
                             }
                         }
                     }
@@ -669,12 +781,11 @@ impl Conv1d {
             }
             Conv1dWeights::General(weights_colmajor) => {
                 let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
-                for k in 0..ks {
+                for (k, w) in weights_colmajor.iter().enumerate() {
                     let offset_signed: isize =
                         dil as isize * (k as isize + 1 - ks as isize);
                     let lookback = (-offset_signed) as usize;
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                    let w = &weights_colmajor[k];
 
                     if use_sgemm {
                         unsafe {
@@ -704,14 +815,6 @@ impl Conv1d {
                         }
                     }
                 }
-            }
-        }
-
-        // Add bias (colwise)
-        for f in 0..num_frames {
-            let col_start = f * out_ch;
-            for o in 0..out_ch {
-                self.output_buf.data[col_start + o] += self.bias[o];
             }
         }
 
@@ -798,6 +901,31 @@ impl FiLM {
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
 
+        #[cfg(feature = "fast-kernels")]
+        {
+            unsafe {
+                if self.do_shift {
+                    crate::fast_kernels::fast_film_scale_shift(
+                        self.output_buf.data.as_mut_ptr(),
+                        input_data.as_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, input_stride, dim, ss_rows, num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::fast_film_scale(
+                        self.output_buf.data.as_mut_ptr(),
+                        input_data.as_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, input_stride, dim, ss_rows, num_frames,
+                    );
+                }
+            }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         if self.do_shift {
             if dim == 3 {
                 for f in 0..num_frames {
@@ -865,6 +993,29 @@ impl FiLM {
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
 
+        #[cfg(feature = "fast-kernels")]
+        {
+            unsafe {
+                if self.do_shift {
+                    crate::fast_kernels::fast_film_inplace_scale_shift(
+                        target_data.as_mut_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, target_stride, ss_rows, num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::fast_film_inplace_scale(
+                        target_data.as_mut_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, target_stride, ss_rows, num_frames,
+                    );
+                }
+            }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         if self.do_shift {
             for f in 0..num_frames {
                 let t_off = f * target_stride;
@@ -1218,8 +1369,45 @@ impl WaveNetLayer {
 
         // z = conv_output + mixin_output
         let z_len = z_rows * num_frames;
-        for i in 0..z_len {
-            self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+
+        // Fast path: fuse add + tanh activation into one C call
+        #[cfg(feature = "fast-kernels")]
+        let did_fused_add_activate = if self.activation_pre_film.is_none()
+            && self.gating_mode == GatingMode::None
+            && matches!(self.activation, Activation::Tanh)
+        {
+            let use_fast = crate::util::is_fast_tanh_enabled();
+            unsafe {
+                crate::fast_kernels::fast_add_activate(
+                    self.z_buf.data.as_mut_ptr(),
+                    self.conv.output_buf.data.as_ptr(),
+                    self.input_mixin.output_buf.data.as_ptr(),
+                    z_len,
+                    use_fast as i32,
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        #[cfg(not(feature = "fast-kernels"))]
+        let did_fused_add_activate = false;
+
+        if !did_fused_add_activate {
+            #[cfg(feature = "fast-kernels")]
+            unsafe {
+                crate::fast_kernels::fast_vec_add(
+                    self.z_buf.data.as_mut_ptr(),
+                    self.conv.output_buf.data.as_ptr(),
+                    self.input_mixin.output_buf.data.as_ptr(),
+                    z_len,
+                );
+            }
+            #[cfg(not(feature = "fast-kernels"))]
+            for i in 0..z_len {
+                self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+            }
         }
 
         // Optional activation_pre_film
@@ -1230,12 +1418,14 @@ impl WaveNetLayer {
         // Step 3: Activation + gating/blending
         match self.gating_mode {
             GatingMode::None => {
-                // Apply activation in-place to z
-                self.activation.apply_colmajor_inplace(
-                    &mut self.z_buf.data,
-                    bottleneck,
-                    num_frames,
-                );
+                if !did_fused_add_activate {
+                    // Apply activation in-place to z
+                    self.activation.apply_colmajor_inplace(
+                        &mut self.z_buf.data,
+                        bottleneck,
+                        num_frames,
+                    );
+                }
 
                 // Optional activation_post_film
                 if let Some(ref mut film) = self.activation_post_film {
@@ -1248,9 +1438,37 @@ impl WaveNetLayer {
                 }
             }
             GatingMode::Gated => {
-                // Gating: top bottleneck = primary activation, bottom bottleneck = secondary
-                // output[i] = primary(z[i]) * secondary(z[i + bottleneck])
-                // Process column by column to match C++ per-sample gating
+                // Gating: output[c] = primary(z[c]) * secondary(z[bottleneck+c])
+                #[cfg(feature = "fast-kernels")]
+                {
+                    let p_id = self.activation.c_type_id();
+                    let s_id = self.secondary_activation.c_type_id();
+                    if let (Some(p), Some(s)) = (p_id, s_id) {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        unsafe {
+                            crate::fast_kernels::fast_gated_activation(
+                                self.z_buf.data.as_mut_ptr(),
+                                z_rows, bottleneck, num_frames,
+                                p, s, use_fast as i32,
+                            );
+                        }
+                    } else {
+                        // Fallback for PReLU/LeakyRelu with per-channel params
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        for f in 0..num_frames {
+                            let z_off = f * z_rows;
+                            for c in 0..bottleneck {
+                                let primary = self.activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + c], c, use_fast);
+                                let gate = self.secondary_activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
+                                self.z_buf.data[z_off + c] = primary * gate;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
@@ -1261,9 +1479,9 @@ impl WaveNetLayer {
                         let gate = self
                             .secondary_activation
                             .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
-                        // Store result in top rows of z
                         self.z_buf.data[z_off + c] = primary * gate;
                     }
+                }
                 }
 
                 // activation_post_film on topRows(bottleneck)
@@ -1286,7 +1504,36 @@ impl WaveNetLayer {
                 }
             }
             GatingMode::Blended => {
-                // Blending: alpha * activated + (1-alpha) * pre_activation
+                // Blending: z[c] = alpha * activated(z[c]) + (1-alpha) * z[c]
+                #[cfg(feature = "fast-kernels")]
+                {
+                    let p_id = self.activation.c_type_id();
+                    let s_id = self.secondary_activation.c_type_id();
+                    if let (Some(p), Some(s)) = (p_id, s_id) {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        unsafe {
+                            crate::fast_kernels::fast_blended_activation(
+                                self.z_buf.data.as_mut_ptr(),
+                                z_rows, bottleneck, num_frames,
+                                p, s, use_fast as i32,
+                            );
+                        }
+                    } else {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        for f in 0..num_frames {
+                            let z_off = f * z_rows;
+                            for c in 0..bottleneck {
+                                let pre_act = self.z_buf.data[z_off + c];
+                                let activated = self.activation.apply_scalar_channel_fast(pre_act, c, use_fast);
+                                let alpha = self.secondary_activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
+                                self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
@@ -1299,6 +1546,7 @@ impl WaveNetLayer {
                         self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
                     }
                 }
+                } // end cfg(not(fast-kernels))
 
                 // activation_post_film
                 if let Some(ref mut film) = self.activation_post_film {
@@ -1372,21 +1620,32 @@ impl WaveNetLayer {
         let ch = self.channels;
         if let Some(ref l1x1) = self.layer1x1 {
             let total = ch * num_frames;
-            let inp = &input.data;
-            let l1 = &l1x1.output_buf.data;
-            let out = &mut self.output_next_layer.data;
-            // 4-wide unrolled element-wise addition
-            let mut i = 0;
-            while i + 3 < total {
-                out[i] = inp[i] + l1[i];
-                out[i + 1] = inp[i + 1] + l1[i + 1];
-                out[i + 2] = inp[i + 2] + l1[i + 2];
-                out[i + 3] = inp[i + 3] + l1[i + 3];
-                i += 4;
+            #[cfg(feature = "fast-kernels")]
+            unsafe {
+                crate::fast_kernels::fast_vec_add(
+                    self.output_next_layer.data.as_mut_ptr(),
+                    input.data.as_ptr(),
+                    l1x1.output_buf.data.as_ptr(),
+                    total,
+                );
             }
-            while i < total {
-                out[i] = inp[i] + l1[i];
-                i += 1;
+            #[cfg(not(feature = "fast-kernels"))]
+            {
+                let inp = &input.data;
+                let l1 = &l1x1.output_buf.data;
+                let out = &mut self.output_next_layer.data;
+                let mut i = 0;
+                while i + 3 < total {
+                    out[i] = inp[i] + l1[i];
+                    out[i + 1] = inp[i + 1] + l1[i + 1];
+                    out[i + 2] = inp[i + 2] + l1[i + 2];
+                    out[i + 3] = inp[i + 3] + l1[i + 3];
+                    i += 4;
+                }
+                while i < total {
+                    out[i] = inp[i] + l1[i];
+                    i += 1;
+                }
             }
         } else {
             let total = ch * num_frames;
@@ -1534,8 +1793,18 @@ impl WaveNetLayerArray {
             let head_data = layer.get_output_head_data();
             let head_rows = layer.get_output_head_rows();
             if head_rows == head_out_size {
-                // Contiguous: single pass with unrolling
+                // Contiguous: single pass
                 let total = head_out_size * num_frames;
+                #[cfg(feature = "fast-kernels")]
+                unsafe {
+                    crate::fast_kernels::fast_vec_add_inplace(
+                        self.head_inputs.data.as_mut_ptr(),
+                        head_data.as_ptr(),
+                        total,
+                    );
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let dst = &mut self.head_inputs.data;
                 let mut j = 0;
                 while j + 3 < total {
@@ -1549,6 +1818,7 @@ impl WaveNetLayerArray {
                     dst[j] += head_data[j];
                     j += 1;
                 }
+                } // end cfg(not(fast-kernels))
             } else {
                 // Different strides: per-frame copy
                 for f in 0..num_frames {
@@ -1958,39 +2228,43 @@ impl WaveNet {
         self.ensure_buffer_size(num_frames);
 
         // Step 1: Fill condition_input (in_channels x num_frames)
-        // For standard NAM, in_channels = 1, so each column has one element
+        // For standard NAM, in_channels = 1, so each column has one element.
+        // Buffer is pre-zeroed by resize(), so only write the first channel.
         let in_ch = self.in_channels;
-        for f in 0..num_frames {
-            let col_start = f * in_ch;
-            self.condition_input.data[col_start] = input[f] as f32;
-            // Zero remaining channels if any (unlikely for NAM)
-            for c in 1..in_ch {
-                self.condition_input.data[col_start + c] = 0.0;
-            }
+        for (f, &sample) in input.iter().enumerate().take(num_frames) {
+            self.condition_input.data[f * in_ch] = sample as f32;
         }
 
         // Step 2: Process condition
         if let Some(ref mut cdsp) = self.condition_dsp {
-            // Process condition_dsp per-sample for multi-channel output
+            // Process condition_dsp as a block (not per-sample) for efficiency
             let cond_out_ch = cdsp.num_output_channels();
-            for f in 0..num_frames {
-                let in_sample = input[f];
-                let col_start = f * self.condition_output.rows;
-                cdsp.process_sample_multi_channel(
-                    in_sample,
-                    &mut self.condition_output.data[col_start..col_start + cond_out_ch],
-                );
-            }
+            let cond_rows = self.condition_output.rows;
+
+            cdsp.process_block_multi_channel(
+                input,
+                &mut self.condition_output.data,
+                cond_rows,
+                cond_out_ch,
+                num_frames,
+            );
         } else {
             // No condition DSP: condition_output = condition_input
             let cond_rows = self.condition_output.rows;
             let in_rows = self.condition_input.rows;
             let copy_rows = cond_rows.min(in_rows);
-            for f in 0..num_frames {
-                let cond_off = f * cond_rows;
-                let in_off = f * in_rows;
-                self.condition_output.data[cond_off..cond_off + copy_rows]
-                    .copy_from_slice(&self.condition_input.data[in_off..in_off + copy_rows]);
+            if cond_rows == in_rows {
+                // Same stride: single bulk copy
+                let len = copy_rows * num_frames;
+                self.condition_output.data[..len]
+                    .copy_from_slice(&self.condition_input.data[..len]);
+            } else {
+                for f in 0..num_frames {
+                    let cond_off = f * cond_rows;
+                    let in_off = f * in_rows;
+                    self.condition_output.data[cond_off..cond_off + copy_rows]
+                        .copy_from_slice(&self.condition_input.data[in_off..in_off + copy_rows]);
+                }
             }
         }
 
@@ -2031,14 +2305,14 @@ impl WaveNet {
         // For single-channel output (typical NAM): data is contiguous
         if out_ch == 1 {
             let scale = self.head_scale;
-            for s in 0..num_frames {
-                output[s] = (scale * final_head.data[s]) as Sample;
+            for (o, &h) in output.iter_mut().zip(final_head.data.iter()).take(num_frames) {
+                *o = (scale * h) as Sample;
             }
         } else {
-            // Multi-channel: take first channel (or scale all)
+            // Multi-channel: take first channel
             let scale = self.head_scale;
-            for s in 0..num_frames {
-                output[s] = (scale * final_head.data[s * out_ch]) as Sample;
+            for (s, o) in output.iter_mut().enumerate().take(num_frames) {
+                *o = (scale * final_head.data[s * out_ch]) as Sample;
             }
         }
     }
@@ -2133,6 +2407,39 @@ impl Dsp for WaveNet {
         }
     }
 
+    fn process_block_multi_channel(
+        &mut self,
+        input: &[Sample],
+        output_data: &mut [f32],
+        output_stride: usize,
+        out_channels: usize,
+        num_frames: usize,
+    ) {
+        // Process the full block through the WaveNet
+        // We need a dummy output buffer for process_block's mono output
+        let mut dummy_output = vec![Sample::default(); num_frames];
+        self.process_block(input, &mut dummy_output);
+
+        // Extract multi-channel head output from the last layer array
+        let last = self.layer_arrays.len() - 1;
+        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
+        let head_ch = self.layer_arrays[last].head_rechannel.out_channels;
+        let scale = self.head_scale;
+        let copy_ch = out_channels.min(head_ch);
+
+        for f in 0..num_frames {
+            let out_off = f * output_stride;
+            let head_off = f * head_ch;
+            for c in 0..copy_ch {
+                output_data[out_off + c] = scale * final_head.data[head_off + c];
+            }
+        }
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.set_max_buffer_size_internal(max_buffer_size);
+    }
+
     fn prewarm_samples(&self) -> usize {
         self.prewarm_samples_count
     }
@@ -2161,8 +2468,18 @@ impl Activation {
                 }
             }
             _ => {
-                let use_fast = crate::util::is_fast_tanh_enabled();
                 let len = rows * num_cols;
+                #[cfg(feature = "fast-kernels")]
+                if let Some(act_id) = self.c_type_id() {
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    unsafe {
+                        crate::fast_kernels::fast_activation_inplace(
+                            data.as_mut_ptr(), len, act_id, use_fast as i32,
+                        );
+                    }
+                    return;
+                }
+                let use_fast = crate::util::is_fast_tanh_enabled();
                 for x in data[..len].iter_mut() {
                     *x = self.apply_scalar_fast(*x, use_fast);
                 }

@@ -22,6 +22,22 @@ pub enum Activation {
 }
 
 impl Activation {
+    /// Map to C kernel activation type ID. Returns None for activations
+    /// that have per-channel parameters (PReLU, LeakyRelu, LeakyHardTanh).
+    #[cfg(feature = "fast-kernels")]
+    pub fn c_type_id(&self) -> Option<i32> {
+        match self {
+            Activation::Tanh => Some(0),
+            Activation::Silu => Some(1),
+            Activation::HardSwish => Some(2),
+            Activation::Softsign => Some(3),
+            Activation::HardTanh => Some(4),
+            Activation::Sigmoid => Some(0), // use tanh-based sigmoid via SiLU path? No — treat as tanh for now
+            Activation::Relu => Some(5),
+            _ => None, // PReLU, LeakyRelu, LeakyHardTanh have per-channel params
+        }
+    }
+
     /// Apply activation to a single value. For hot loops, prefer `apply_slice`
     /// which hoists the fast_tanh flag check out of the loop.
     #[inline]

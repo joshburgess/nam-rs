@@ -53,4 +53,26 @@ pub trait Dsp: Send {
             out[0] = output[0] as f32;
         }
     }
+
+    /// Process a block of samples and write multi-channel output in column-major format.
+    /// output_data[f * output_stride + c] = channel c of frame f.
+    /// Default falls back to per-sample processing.
+    fn process_block_multi_channel(
+        &mut self,
+        input: &[Sample],
+        output_data: &mut [f32],
+        output_stride: usize,
+        out_channels: usize,
+        num_frames: usize,
+    ) {
+        for (f, &sample) in input.iter().enumerate().take(num_frames) {
+            let col_start = f * output_stride;
+            self.process_sample_multi_channel(
+                sample,
+                &mut output_data[col_start..col_start + out_channels],
+            );
+        }
+    }
+
+    fn set_max_buffer_size(&mut self, _max_buffer_size: usize) {}
 }
