@@ -1,8 +1,3 @@
-// Allow index-based loops where explicit indexing matches C++ Eigen order or
-// multiple arrays are indexed simultaneously (dw[k][c], weights[k], etc.)
-#![allow(clippy::needless_range_loop)]
-// Allow returns after cfg-gated blocks where the return prevents fallthrough to cfg'd-out code
-#![allow(clippy::needless_return, unreachable_code)]
 
 use crate::activations::Activation;
 use crate::dsp::{Dsp, DspMetadata, Sample};
@@ -424,6 +419,8 @@ impl Conv1x1 {
                     num_frames,
                 );
             }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
             return;
         }
 
@@ -479,15 +476,15 @@ impl Conv1x1 {
                 let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
                 if let Some(ref b) = bias {
                     let b0 = b[0];
-                    for f in 0..num_frames {
+                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
                             + w2 * input_data[ic + 2] + b0;
                     }
                 } else {
-                    for f in 0..num_frames {
+                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        out[f] = w0 * input_data[ic] + w1 * input_data[ic + 1]
+                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
                             + w2 * input_data[ic + 2];
                     }
                 }
@@ -577,6 +574,8 @@ impl Conv1d {
             let mut dw: Vec<Vec<f32>> = (0..kernel_size)
                 .map(|_| vec![0.0f32; in_channels])
                 .collect();
+            // Indexes dw[k][c] and taps[k] simultaneously — can't use iterators
+            #[allow(clippy::needless_range_loop)]
             for c in 0..in_channels {
                 let taps = iter.take(kernel_size)?;
                 for k in 0..kernel_size {
@@ -730,10 +729,14 @@ impl Conv1d {
                 }
             }
             self.input_buffer.advance(num_frames);
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
             return;
         }
 
         // Initialize output with bias (fused: eliminates separate bias-add pass)
+        // (unreachable when fast-kernels feature is enabled — the block above returns early)
+        #[allow(unreachable_code)]
         for f in 0..num_frames {
             let off = f * out_ch;
             self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
@@ -745,14 +748,14 @@ impl Conv1d {
                 let ch = out_ch; // in_ch == out_ch for depthwise
                 if ch == 3 {
                     // 3-channel specialization: fully unrolled inner loop
-                    for k in 0..ks {
+                    for (k, tap_w) in dw.iter().enumerate() {
                         let offset_signed: isize =
                             dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                        let w0 = dw[k][0];
-                        let w1 = dw[k][1];
-                        let w2 = dw[k][2];
+                        let w0 = tap_w[0];
+                        let w1 = tap_w[1];
+                        let w2 = tap_w[2];
                         for f in 0..num_frames {
                             let off = f * 3;
                             self.output_buf.data[off] += w0 * tap_data[off];
@@ -761,17 +764,16 @@ impl Conv1d {
                         }
                     }
                 } else {
-                    for k in 0..ks {
+                    for (k, tap_w) in dw.iter().enumerate() {
                         let offset_signed: isize =
                             dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                        let w = &dw[k];
                         for f in 0..num_frames {
                             let col_start = f * ch;
                             for c in 0..ch {
                                 self.output_buf.data[col_start + c] +=
-                                    w[c] * tap_data[col_start + c];
+                                    tap_w[c] * tap_data[col_start + c];
                             }
                         }
                     }
@@ -779,12 +781,11 @@ impl Conv1d {
             }
             Conv1dWeights::General(weights_colmajor) => {
                 let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
-                for k in 0..ks {
+                for (k, w) in weights_colmajor.iter().enumerate() {
                     let offset_signed: isize =
                         dil as isize * (k as isize + 1 - ks as isize);
                     let lookback = (-offset_signed) as usize;
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
-                    let w = &weights_colmajor[k];
 
                     if use_sgemm {
                         unsafe {
@@ -919,6 +920,8 @@ impl FiLM {
                     );
                 }
             }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
             return;
         }
 
@@ -1007,6 +1010,8 @@ impl FiLM {
                     );
                 }
             }
+            // Return early so the non-fast-kernels fallback below is skipped
+            #[allow(clippy::needless_return, unreachable_code)]
             return;
         }
 
