@@ -5,6 +5,9 @@
 # Test fixture audio files (generated, not checked in)
 nam-core/test_fixtures/audio/
 
+# Training output artifacts (checkpoints, logs, plots)
+nam-trainer/test_data/test_output/
+
 # IDE
 .idea/
 .vscode/

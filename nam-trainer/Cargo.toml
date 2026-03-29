@@ -1,0 +1,20 @@
+[package]
+name = "nam-trainer"
+version = "0.1.0"
+edition = "2021"
+description = "GUI trainer for Neural Amp Modeler models"
+
+[[bin]]
+name = "nam-trainer"
+path = "src/main.rs"
+
+[dependencies]
+nam-core = { path = "../nam-core" }
+eframe = "0.31"
+egui = "0.31"
+egui_plot = "0.31"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+open = "5"
