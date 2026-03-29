@@ -61,16 +61,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-  build-plugins:
-    name: Build Plugins (${{ matrix.os }})
+  build-artifacts:
+    name: Build Artifacts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: macos-latest
-            artifact_name: nam-plugin-macos
+            artifact_suffix: macos
           - os: windows-latest
-            artifact_name: nam-plugin-windows
+            artifact_suffix: windows
+          - os: ubuntu-latest
+            artifact_suffix: linux
     steps:
       - uses: actions/checkout@v4
 
@@ -83,13 +85,30 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-plugin-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-artifacts-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Bundle plugin
         run: cargo xtask bundle nam-plugin --release
 
+      - name: Build trainer
+        run: cargo build --release -p nam-trainer
+
       - name: Upload plugin artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: nam-plugin-${{ matrix.artifact_suffix }}
           path: target/bundled/
+
+      - name: Upload trainer artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nam-trainer-${{ matrix.artifact_suffix }}
+          path: target/release/nam-trainer
+
+      - name: Upload trainer artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nam-trainer-${{ matrix.artifact_suffix }}
+          path: target/release/nam-trainer.exe
