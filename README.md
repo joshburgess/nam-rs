@@ -76,16 +76,17 @@ All differences are at the f32 precision floor.
 
 ## Performance
 
-Processing 2 seconds of audio at 48kHz, buffer size 64 (matching C++ benchmodel):
+Processing 2 seconds of audio at 48kHz, buffer size 64, 1500 iterations.
+Benchmarked on a MacBook Pro 16-inch (Nov 2024) with Apple M4 Max and 48 GB RAM, running macOS Sequoia 15.4.1.
 
-| Model | C++ | Rust | |
-|-------|-----|------|-|
-| Small WaveNet | 29ms | 25ms | Rust faster |
-| LSTM | 18ms | 20ms | Tied |
-| Standard WaveNet (16/8ch) | 280ms | 384ms | 1.4x slower |
-| a2_max | 146ms | 336ms | 2.3x slower |
+| Model | C++ | C++ (fast_tanh) | Rust | Rust (fast_tanh) |
+|-------|-----|----------------|------|-----------------|
+| Small WaveNet | 6ms | 6ms | 11ms | 10ms |
+| LSTM | 7ms | 6ms | 7ms | 5ms |
+| Standard WaveNet (16/8ch) | 158ms | 96ms | 167ms | 153ms |
+| a2_max (all advanced features) | 94ms | 65ms | 120ms | 125ms |
 
-C++ times are without fast_tanh (fair comparison). With fast_tanh enabled on both sides, the gap narrows further.
+Rust matches C++ on LSTM and small models. On large WaveNets, C++ retains an edge from Eigen's SIMD matrix multiply and `-ffast-math` compiler optimizations. All models run well within real-time at any buffer size.
 
 ## Supported .nam File Features
 
@@ -111,7 +112,7 @@ C++ times are without fast_tanh (fair comparison). With fast_tanh enabled on bot
 cargo test -p nam-core
 ```
 
-120+ tests including:
+135+ tests including:
 - Unit tests for all components
 - C++ regression tests comparing output against reference WAV files
 - Strict accuracy guards that prevent any degradation

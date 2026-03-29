@@ -1223,15 +1223,16 @@ impl WaveNetLayer {
                 // Gating: top bottleneck = primary activation, bottom bottleneck = secondary
                 // output[i] = primary(z[i]) * secondary(z[i + bottleneck])
                 // Process column by column to match C++ per-sample gating
+                let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
                     for c in 0..bottleneck {
                         let primary = self
                             .activation
-                            .apply_scalar_channel(self.z_buf.data[z_off + c], c);
+                            .apply_scalar_channel_fast(self.z_buf.data[z_off + c], c, use_fast);
                         let gate = self
                             .secondary_activation
-                            .apply_scalar_channel(self.z_buf.data[z_off + bottleneck + c], c);
+                            .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
                         // Store result in top rows of z
                         self.z_buf.data[z_off + c] = primary * gate;
                     }
@@ -1258,14 +1259,15 @@ impl WaveNetLayer {
             }
             GatingMode::Blended => {
                 // Blending: alpha * activated + (1-alpha) * pre_activation
+                let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
                     for c in 0..bottleneck {
                         let pre_act = self.z_buf.data[z_off + c];
-                        let activated = self.activation.apply_scalar_channel(pre_act, c);
+                        let activated = self.activation.apply_scalar_channel_fast(pre_act, c, use_fast);
                         let alpha = self
                             .secondary_activation
-                            .apply_scalar_channel(self.z_buf.data[z_off + bottleneck + c], c);
+                            .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
                         self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
                     }
                 }
@@ -2131,9 +2133,10 @@ impl Activation {
                 }
             }
             _ => {
+                let use_fast = crate::util::is_fast_tanh_enabled();
                 let len = rows * num_cols;
                 for x in data[..len].iter_mut() {
-                    *x = self.apply_scalar(*x);
+                    *x = self.apply_scalar_fast(*x, use_fast);
                 }
             }
         }

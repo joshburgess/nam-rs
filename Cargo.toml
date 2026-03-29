@@ -1,3 +1,10 @@
 [workspace]
 members = ["nam-core", "nam-cli", "nam-plugin", "nam-trainer", "xtask"]
 resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

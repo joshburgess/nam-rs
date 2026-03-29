@@ -1,5 +1,5 @@
 use crate::error::NamError;
-use crate::util::{sigmoid_auto, tanh_auto};
+use crate::util::{fast_sigmoid, fast_tanh, is_fast_tanh_enabled};
 
 #[derive(Debug, Clone)]
 pub enum Activation {
@@ -22,12 +22,31 @@ pub enum Activation {
 }
 
 impl Activation {
+    /// Apply activation to a single value. For hot loops, prefer `apply_slice`
+    /// which hoists the fast_tanh flag check out of the loop.
     #[inline]
     pub fn apply_scalar(&self, x: f32) -> f32 {
+        self.apply_scalar_fast(x, is_fast_tanh_enabled())
+    }
+
+    #[inline]
+    pub fn apply_scalar_fast(&self, x: f32, use_fast: bool) -> f32 {
         match self {
             Activation::Relu => x.max(0.0),
-            Activation::Tanh => tanh_auto(x),
-            Activation::Sigmoid => sigmoid_auto(x),
+            Activation::Tanh => {
+                if use_fast {
+                    fast_tanh(x)
+                } else {
+                    x.tanh()
+                }
+            }
+            Activation::Sigmoid => {
+                if use_fast {
+                    fast_sigmoid(x)
+                } else {
+                    1.0 / (1.0 + (-x).exp())
+                }
+            }
             Activation::HardTanh => x.clamp(-1.0, 1.0),
             Activation::LeakyRelu(alpha) => {
                 if x >= 0.0 {
@@ -36,7 +55,14 @@ impl Activation {
                     alpha * x
                 }
             }
-            Activation::Silu => x * sigmoid_auto(x),
+            Activation::Silu => {
+                let sig = if use_fast {
+                    fast_sigmoid(x)
+                } else {
+                    1.0 / (1.0 + (-x).exp())
+                };
+                x * sig
+            }
             Activation::Softsign => x / (1.0 + x.abs()),
             Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) * (1.0 / 6.0),
             Activation::LeakyHardTanh {
@@ -54,7 +80,6 @@ impl Activation {
                 }
             }
             Activation::PReLU(slopes) => {
-                // Scalar apply uses first slope (for non-channel-aware callers)
                 let alpha = slopes.first().copied().unwrap_or(0.01);
                 if x >= 0.0 {
                     x
@@ -69,6 +94,11 @@ impl Activation {
     /// for PReLU, which has per-channel slopes.
     #[inline]
     pub fn apply_scalar_channel(&self, x: f32, channel: usize) -> f32 {
+        self.apply_scalar_channel_fast(x, channel, is_fast_tanh_enabled())
+    }
+
+    #[inline]
+    pub fn apply_scalar_channel_fast(&self, x: f32, channel: usize, use_fast: bool) -> f32 {
         match self {
             Activation::PReLU(slopes) => {
                 let alpha = slopes.get(channel).copied().unwrap_or(0.01);
@@ -78,14 +108,15 @@ impl Activation {
                     alpha * x
                 }
             }
-            _ => self.apply_scalar(x),
+            _ => self.apply_scalar_fast(x, use_fast),
         }
     }
 
     #[inline]
     pub fn apply_slice(&self, data: &mut [f32]) {
+        let use_fast = is_fast_tanh_enabled();
         for x in data.iter_mut() {
-            *x = self.apply_scalar(*x);
+            *x = self.apply_scalar_fast(*x, use_fast);
         }
     }
 

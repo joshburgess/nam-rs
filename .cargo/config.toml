@@ -2,4 +2,4 @@
 xtask = "run --package xtask --release --"
 
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "llvm-args=--fp-contract=fast"]
