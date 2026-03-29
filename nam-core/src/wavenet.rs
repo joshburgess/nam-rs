@@ -533,6 +533,9 @@ struct Conv1d {
     // Block processing state
     input_buffer: RingBuffer2D,
     output_buf: ColMajorMatrix,
+    /// Flattened weights for C FFI: all taps concatenated.
+    #[cfg(feature = "fast-kernels")]
+    flat_weights: Vec<f32>,
 }
 
 impl Conv1d {
@@ -587,6 +590,27 @@ impl Conv1d {
 
         let bias = iter.take(out_channels)?.to_vec();
 
+        // Build flat weights for C FFI
+        #[cfg(feature = "fast-kernels")]
+        let flat_weights = match &weights {
+            Conv1dWeights::Depthwise(dw) => {
+                // flat_weights[k * ch + c]
+                let mut flat = Vec::with_capacity(kernel_size * out_channels);
+                for tap in dw {
+                    flat.extend_from_slice(tap);
+                }
+                flat
+            }
+            Conv1dWeights::General(taps) => {
+                // flat_weights[k * (out_ch * in_ch) + ...] — just concatenate
+                let mut flat = Vec::with_capacity(kernel_size * out_channels * in_channels);
+                for tap in taps {
+                    flat.extend_from_slice(tap);
+                }
+                flat
+            }
+        };
+
         Ok(Self {
             weights,
             bias,
@@ -597,6 +621,8 @@ impl Conv1d {
             groups,
             input_buffer: RingBuffer2D::new(),
             output_buf: ColMajorMatrix::new(out_channels, 1),
+            #[cfg(feature = "fast-kernels")]
+            flat_weights,
         })
     }
 
@@ -624,6 +650,70 @@ impl Conv1d {
         let in_ch = self.in_channels;
         let ks = self.kernel_size;
         let dil = self.dilation;
+
+        // Fast-kernels path: single C FFI call for the entire Conv1d
+        #[cfg(feature = "fast-kernels")]
+        {
+            // Build tap pointer array
+            let tap_ptrs: Vec<*const f32> = (0..ks)
+                .map(|k| {
+                    let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
+                    let lookback = (-offset_signed) as usize;
+                    self.input_buffer.read_ptr(num_frames, lookback).as_ptr()
+                })
+                .collect();
+
+            let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
+            match &self.weights {
+                Conv1dWeights::Depthwise(_) => unsafe {
+                    crate::fast_kernels::fast_conv1d_depthwise(
+                        self.output_buf.data.as_mut_ptr(),
+                        tap_ptrs.as_ptr(),
+                        self.flat_weights.as_ptr(),
+                        self.bias.as_ptr(),
+                        out_ch,
+                        ks,
+                        num_frames,
+                    );
+                },
+                Conv1dWeights::General(_) if !use_sgemm => unsafe {
+                    crate::fast_kernels::fast_conv1d_small_gemv(
+                        self.output_buf.data.as_mut_ptr(),
+                        tap_ptrs.as_ptr(),
+                        self.flat_weights.as_ptr(),
+                        self.bias.as_ptr(),
+                        out_ch,
+                        in_ch,
+                        ks,
+                        num_frames,
+                    );
+                },
+                Conv1dWeights::General(weights_colmajor) => {
+                    // Large matrix: still use sgemm (it has its own SIMD)
+                    let out_len = out_ch * num_frames;
+                    self.output_buf.data[..out_len].fill(0.0);
+                    for k in 0..ks {
+                        let w = &weights_colmajor[k];
+                        unsafe {
+                            sgemm_colmajor(
+                                out_ch, in_ch, num_frames,
+                                1.0, w.as_ptr(), tap_ptrs[k], in_ch as isize,
+                                1.0, self.output_buf.data.as_mut_ptr(),
+                            );
+                        }
+                    }
+                    // Add bias
+                    for f in 0..num_frames {
+                        let off = f * out_ch;
+                        for o in 0..out_ch {
+                            self.output_buf.data[off + o] += self.bias[o];
+                        }
+                    }
+                }
+            }
+            self.input_buffer.advance(num_frames);
+            return;
+        }
 
         // Initialize output to zero, then accumulate
         let out_len = out_ch * num_frames;
@@ -1218,8 +1308,35 @@ impl WaveNetLayer {
 
         // z = conv_output + mixin_output
         let z_len = z_rows * num_frames;
-        for i in 0..z_len {
-            self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+
+        // Fast path: fuse add + tanh activation into one C call
+        #[cfg(feature = "fast-kernels")]
+        let did_fused_add_activate = if self.activation_pre_film.is_none()
+            && self.gating_mode == GatingMode::None
+            && matches!(self.activation, Activation::Tanh)
+        {
+            let use_fast = crate::util::is_fast_tanh_enabled();
+            unsafe {
+                crate::fast_kernels::fast_add_activate(
+                    self.z_buf.data.as_mut_ptr(),
+                    self.conv.output_buf.data.as_ptr(),
+                    self.input_mixin.output_buf.data.as_ptr(),
+                    z_len,
+                    use_fast as i32,
+                );
+            }
+            true
+        } else {
+            false
+        };
+
+        #[cfg(not(feature = "fast-kernels"))]
+        let did_fused_add_activate = false;
+
+        if !did_fused_add_activate {
+            for i in 0..z_len {
+                self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+            }
         }
 
         // Optional activation_pre_film
@@ -1230,12 +1347,14 @@ impl WaveNetLayer {
         // Step 3: Activation + gating/blending
         match self.gating_mode {
             GatingMode::None => {
-                // Apply activation in-place to z
-                self.activation.apply_colmajor_inplace(
-                    &mut self.z_buf.data,
-                    bottleneck,
-                    num_frames,
-                );
+                if !did_fused_add_activate {
+                    // Apply activation in-place to z
+                    self.activation.apply_colmajor_inplace(
+                        &mut self.z_buf.data,
+                        bottleneck,
+                        num_frames,
+                    );
+                }
 
                 // Optional activation_post_film
                 if let Some(ref mut film) = self.activation_post_film {

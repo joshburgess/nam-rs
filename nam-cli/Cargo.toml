@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 faer = ["nam-core/faer"]
+fast-kernels = ["nam-core/fast-kernels"]
 
 [dependencies]
 nam-core = { path = "../nam-core" }

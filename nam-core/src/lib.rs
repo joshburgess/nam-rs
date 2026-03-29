@@ -1,4 +1,6 @@
 pub mod activations;
+#[cfg(feature = "fast-kernels")]
+pub(crate) mod fast_kernels;
 pub mod convnet;
 pub mod dsp;
 pub mod error;
