@@ -402,6 +402,29 @@ impl Conv1x1 {
         let bias = &self.bias;
         let out = &mut self.output_buf.data;
 
+        // Fast-kernels: route all sizes through C for -ffast-math vectorization
+        #[cfg(feature = "fast-kernels")]
+        {
+            let bias_ptr = match bias {
+                Some(ref b) => b.as_ptr(),
+                None => core::ptr::null(),
+            };
+            unsafe {
+                crate::fast_kernels::fast_conv1x1_small(
+                    out.as_mut_ptr(),
+                    w.as_ptr(),
+                    input_data.as_ptr(),
+                    bias_ptr,
+                    out_ch,
+                    in_ch,
+                    input_stride,
+                    num_frames,
+                );
+            }
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         match (out_ch, in_ch) {
             (3, 3) => {
                 let w00 = w[0]; let w10 = w[1]; let w20 = w[2];
@@ -467,24 +490,6 @@ impl Conv1x1 {
                 }
             }
             _ => {
-                #[cfg(feature = "fast-kernels")]
-                unsafe {
-                    let bias_ptr = match bias {
-                        Some(ref b) => b.as_ptr(),
-                        None => core::ptr::null(),
-                    };
-                    crate::fast_kernels::fast_conv1x1_small(
-                        out.as_mut_ptr(),
-                        w.as_ptr(),
-                        input_data.as_ptr(),
-                        bias_ptr,
-                        out_ch,
-                        in_ch,
-                        input_stride,
-                        num_frames,
-                    );
-                }
-                #[cfg(not(feature = "fast-kernels"))]
                 {
                     // General small-matrix path with fused bias
                     if let Some(ref b) = bias {
