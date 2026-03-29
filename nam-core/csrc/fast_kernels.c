@@ -291,6 +291,89 @@ void fast_film_inplace_scale(
     }
 }
 
+/* ── Gated activation: z[c] = primary(z[c]) * secondary(z[bottleneck+c])
+ * activation_type: 0=Tanh, 1=SiLU, 2=Hardswish, 3=Softsign, 4=HardTanh
+ * Applies to topRows(bottleneck) of z, which has z_rows stride.
+ */
+static inline float apply_activation(float x, int type, int use_fast_tanh) {
+    switch (type) {
+        case 0: /* Tanh */
+            if (use_fast_tanh) {
+                float ax = fabsf(x);
+                float x2 = x * x;
+                return (x * (2.45550750702956f + 2.45550750702956f * ax
+                        + (0.893229853513558f + 0.821226666969744f * ax) * x2))
+                     / (2.44506634652299f + (2.44506634652299f + x2)
+                        * fabsf(x + 0.814642734961073f * x * ax));
+            }
+            return tanhf(x);
+        case 1: { /* SiLU = x * sigmoid(x) */
+            float sig = 1.0f / (1.0f + expf(-x));
+            return x * sig;
+        }
+        case 2: { /* Hardswish = x * clamp(x+3, 0, 6) / 6 */
+            float t = x + 3.0f;
+            float clamped = t < 0.0f ? 0.0f : (t > 6.0f ? 6.0f : t);
+            return x * clamped * (1.0f / 6.0f);
+        }
+        case 3: /* Softsign = x / (1 + |x|) */
+            return x / (1.0f + fabsf(x));
+        case 4: /* HardTanh = clamp(x, -1, 1) */
+            return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
+        case 5: /* ReLU */
+            return x > 0.0f ? x : 0.0f;
+        default:
+            return x;
+    }
+}
+
+void fast_gated_activation(
+    float *restrict z,
+    size_t z_rows,
+    size_t bottleneck,
+    size_t num_frames,
+    int primary_type,
+    int secondary_type,
+    int use_fast_tanh
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t z_off = f * z_rows;
+        for (size_t c = 0; c < bottleneck; c++) {
+            float primary = apply_activation(z[z_off + c], primary_type, use_fast_tanh);
+            float gate = apply_activation(z[z_off + bottleneck + c], secondary_type, use_fast_tanh);
+            z[z_off + c] = primary * gate;
+        }
+    }
+}
+
+void fast_blended_activation(
+    float *restrict z,
+    size_t z_rows,
+    size_t bottleneck,
+    size_t num_frames,
+    int primary_type,
+    int secondary_type,
+    int use_fast_tanh
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t z_off = f * z_rows;
+        for (size_t c = 0; c < bottleneck; c++) {
+            float pre_act = z[z_off + c];
+            float activated = apply_activation(pre_act, primary_type, use_fast_tanh);
+            float alpha = apply_activation(z[z_off + bottleneck + c], secondary_type, use_fast_tanh);
+            z[z_off + c] = alpha * activated + (1.0f - alpha) * pre_act;
+        }
+    }
+}
+
+/* ── Activation in-place (any type) ─────────────────────────────────────
+ */
+void fast_activation_inplace(float *data, size_t len, int type, int use_fast_tanh) {
+    for (size_t i = 0; i < len; i++) {
+        data[i] = apply_activation(data[i], type, use_fast_tanh);
+    }
+}
+
 void fast_tanh_poly_inplace(float *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         float x = data[i];

@@ -102,6 +102,21 @@ extern "C" {
     /// Add bias to each column: output[f*ch + o] += bias[o]
     pub fn fast_add_bias(output: *mut f32, bias: *const f32, ch: usize, num_frames: usize);
 
+    /// Gated activation: z[c] = primary(z[c]) * secondary(z[bottleneck+c])
+    pub fn fast_gated_activation(
+        z: *mut f32, z_rows: usize, bottleneck: usize, num_frames: usize,
+        primary_type: i32, secondary_type: i32, use_fast_tanh: i32,
+    );
+
+    /// Blended activation: z[c] = alpha * activated + (1-alpha) * pre_act
+    pub fn fast_blended_activation(
+        z: *mut f32, z_rows: usize, bottleneck: usize, num_frames: usize,
+        primary_type: i32, secondary_type: i32, use_fast_tanh: i32,
+    );
+
+    /// Generic activation in-place.
+    pub fn fast_activation_inplace(data: *mut f32, len: usize, act_type: i32, use_fast_tanh: i32);
+
     /// Tanh in-place (standard math, compiled with -ffast-math).
     pub fn fast_tanh_inplace(data: *mut f32, len: usize);
 

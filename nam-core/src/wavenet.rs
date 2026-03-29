@@ -1425,9 +1425,37 @@ impl WaveNetLayer {
                 }
             }
             GatingMode::Gated => {
-                // Gating: top bottleneck = primary activation, bottom bottleneck = secondary
-                // output[i] = primary(z[i]) * secondary(z[i + bottleneck])
-                // Process column by column to match C++ per-sample gating
+                // Gating: output[c] = primary(z[c]) * secondary(z[bottleneck+c])
+                #[cfg(feature = "fast-kernels")]
+                {
+                    let p_id = self.activation.c_type_id();
+                    let s_id = self.secondary_activation.c_type_id();
+                    if let (Some(p), Some(s)) = (p_id, s_id) {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        unsafe {
+                            crate::fast_kernels::fast_gated_activation(
+                                self.z_buf.data.as_mut_ptr(),
+                                z_rows, bottleneck, num_frames,
+                                p, s, use_fast as i32,
+                            );
+                        }
+                    } else {
+                        // Fallback for PReLU/LeakyRelu with per-channel params
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        for f in 0..num_frames {
+                            let z_off = f * z_rows;
+                            for c in 0..bottleneck {
+                                let primary = self.activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + c], c, use_fast);
+                                let gate = self.secondary_activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
+                                self.z_buf.data[z_off + c] = primary * gate;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
@@ -1438,9 +1466,9 @@ impl WaveNetLayer {
                         let gate = self
                             .secondary_activation
                             .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
-                        // Store result in top rows of z
                         self.z_buf.data[z_off + c] = primary * gate;
                     }
+                }
                 }
 
                 // activation_post_film on topRows(bottleneck)
@@ -1463,7 +1491,36 @@ impl WaveNetLayer {
                 }
             }
             GatingMode::Blended => {
-                // Blending: alpha * activated + (1-alpha) * pre_activation
+                // Blending: z[c] = alpha * activated(z[c]) + (1-alpha) * z[c]
+                #[cfg(feature = "fast-kernels")]
+                {
+                    let p_id = self.activation.c_type_id();
+                    let s_id = self.secondary_activation.c_type_id();
+                    if let (Some(p), Some(s)) = (p_id, s_id) {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        unsafe {
+                            crate::fast_kernels::fast_blended_activation(
+                                self.z_buf.data.as_mut_ptr(),
+                                z_rows, bottleneck, num_frames,
+                                p, s, use_fast as i32,
+                            );
+                        }
+                    } else {
+                        let use_fast = crate::util::is_fast_tanh_enabled();
+                        for f in 0..num_frames {
+                            let z_off = f * z_rows;
+                            for c in 0..bottleneck {
+                                let pre_act = self.z_buf.data[z_off + c];
+                                let activated = self.activation.apply_scalar_channel_fast(pre_act, c, use_fast);
+                                let alpha = self.secondary_activation
+                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
+                                self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let use_fast = crate::util::is_fast_tanh_enabled();
                 for f in 0..num_frames {
                     let z_off = f * z_rows;
@@ -1476,6 +1533,7 @@ impl WaveNetLayer {
                         self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
                     }
                 }
+                } // end cfg(not(fast-kernels))
 
                 // activation_post_film
                 if let Some(ref mut film) = self.activation_post_film {
@@ -2397,8 +2455,18 @@ impl Activation {
                 }
             }
             _ => {
-                let use_fast = crate::util::is_fast_tanh_enabled();
                 let len = rows * num_cols;
+                #[cfg(feature = "fast-kernels")]
+                if let Some(act_id) = self.c_type_id() {
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    unsafe {
+                        crate::fast_kernels::fast_activation_inplace(
+                            data.as_mut_ptr(), len, act_id, use_fast as i32,
+                        );
+                    }
+                    return;
+                }
+                let use_fast = crate::util::is_fast_tanh_enabled();
                 for x in data[..len].iter_mut() {
                     *x = self.apply_scalar_fast(*x, use_fast);
                 }
