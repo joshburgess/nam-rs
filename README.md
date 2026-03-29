@@ -20,6 +20,7 @@ nam-rs/
 ├── nam-core/       # DSP inference library
 ├── nam-cli/        # Command-line render and benchmark tools
 ├── nam-plugin/     # VST3/CLAP audio plugin (nih-plug + egui)
+├── nam-trainer/    # GUI for training NAM models
 └── xtask/          # Plugin bundling tool
 ```
 
