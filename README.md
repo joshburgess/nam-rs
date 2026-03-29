@@ -181,13 +181,18 @@ Nearly every float operation in the hot path now goes through C code compiled wi
 
 2. **Monolithic compilation vs. compositional architecture.** Our code has separate structs for Conv1d, Conv1x1, and FiLM, with method calls between them. Each method call is a function boundary the optimizer can't see across, especially across the Rust/C FFI boundary. Eigen compiles the entire layer pipeline as one function body where the optimizer sees everything and can keep intermediate values in registers across operations.
 
-3. **FFI call overhead compounds.** Each C kernel call has a small fixed cost: save caller-saved registers, branch to the function, restore on return. For the a2_max model with its nested condition_dsp WaveNet and 8 FiLM modules per dilation, there are roughly 200+ C kernel calls per 64-sample buffer. At ~5-10ns each, that's 1-2 microseconds per buffer, compounding to several milliseconds over the full benchmark.
+3. **FFI call overhead is minor but measurable.** Each C kernel call has a small fixed cost (~5-10ns). For the a2_max model with its nested condition_dsp WaveNet, there are roughly 200+ C kernel calls per 64-sample buffer. However, [empirical testing](https://github.com/joshburgess/nam-rs/tree/feature/monolithic-c-layer) showed that eliminating these calls by fusing the post-convolution pipeline into a single C function produced no measurable improvement — the overhead is only ~0.4% of total runtime.
 
 ### What it would take to close the gap completely
 
-The only way to eliminate the remaining overhead would be to compile the entire layer processing pipeline as a single C function — one call per layer per buffer instead of dozens of small kernel calls. But this would mean reimplementing the Rust layer processing logic (Conv1d + Conv1x1 mixin + FiLM + activation + gating + residual connection + head output) as monolithic C code, which defeats the purpose of having a Rust codebase.
+We tested the monolithic C approach on the [`feature/monolithic-c-layer`](https://github.com/joshburgess/nam-rs/tree/feature/monolithic-c-layer) branch, fusing the entire post-convolution pipeline (add + activate + layer1x1 + residual + head) into a single C function to eliminate intermediate buffers and FFI overhead. Two variants were tried:
 
-Alternatively, a future Rust `#[fast_math]` function attribute (discussed in RFCs but not on the language roadmap) would allow the Rust compiler to apply the same float optimizations that `-ffast-math` enables in C, without needing FFI at all. This would close the gap entirely while keeping everything in pure Rust.
+1. **Monolithic function** with all FiLM/gating/head parameters: **8–11% regression**. The large parameter list and conditional branches caused register pressure, defeating the compiler's ability to optimize each individual loop.
+2. **Focused per-gating-mode functions** (ungated/gated/blended) with no FiLM, minimal parameters, keeping z in stack registers: **0% change** (within noise). The theoretical FFI overhead savings is only ~0.4% of total runtime (~300ns out of ~70µs for the standard model), far too small to measure.
+
+The experiment confirms that the remaining gap is not from FFI overhead or intermediate buffers at the Rust/C boundary — it's from Eigen's expression template fusion happening *inside* the convolution operations (across kernel taps) and GCC/Clang's ability to optimize across function boundaries within a single monolithic compilation unit. These are architectural properties of the C++ approach that can't be replicated by reorganizing the FFI boundary.
+
+A future Rust `#[fast_math]` function attribute (discussed in RFCs but not on the language roadmap) would allow the Rust compiler to apply the same float optimizations that `-ffast-math` enables in C, without needing FFI at all. This would close the gap entirely while keeping everything in pure Rust.
 
 ## Supported .nam File Features
 
