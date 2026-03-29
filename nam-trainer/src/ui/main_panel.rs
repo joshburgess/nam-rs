@@ -424,19 +424,13 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
         }
     }
 
-    // Demo button — always available for testing the progress UI
-    if app.training_state == TrainingState::Idle && app.training_log.is_empty() {
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("Demo")
-                    .on_hover_text("Simulate training to preview the progress UI")
-                    .clicked()
-                {
-                    app.start_demo_training();
-                }
-            });
-        });
+    // Hidden demo mode: Ctrl+Shift+D triggers a simulated training run
+    if app.training_state == TrainingState::Idle
+        && ui.input(|i| {
+            i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D)
+        })
+    {
+        app.start_demo_training();
     }
 }
 
