@@ -2799,6 +2799,7 @@ name = "nam-core"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "cc",
  "criterion",
  "faer",
  "hound",
