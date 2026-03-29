@@ -2090,16 +2090,17 @@ impl WaveNet {
 
         // Step 2: Process condition
         if let Some(ref mut cdsp) = self.condition_dsp {
-            // Process condition_dsp per-sample for multi-channel output
+            // Process condition_dsp as a block (not per-sample) for efficiency
             let cond_out_ch = cdsp.num_output_channels();
-            for f in 0..num_frames {
-                let in_sample = input[f];
-                let col_start = f * self.condition_output.rows;
-                cdsp.process_sample_multi_channel(
-                    in_sample,
-                    &mut self.condition_output.data[col_start..col_start + cond_out_ch],
-                );
-            }
+            let cond_rows = self.condition_output.rows;
+
+            cdsp.process_block_multi_channel(
+                input,
+                &mut self.condition_output.data,
+                cond_rows,
+                cond_out_ch,
+                num_frames,
+            );
         } else {
             // No condition DSP: condition_output = condition_input
             let cond_rows = self.condition_output.rows;
@@ -2250,6 +2251,39 @@ impl Dsp for WaveNet {
                 *o = scale * final_head.data[i];
             }
         }
+    }
+
+    fn process_block_multi_channel(
+        &mut self,
+        input: &[Sample],
+        output_data: &mut [f32],
+        output_stride: usize,
+        out_channels: usize,
+        num_frames: usize,
+    ) {
+        // Process the full block through the WaveNet
+        // We need a dummy output buffer for process_block's mono output
+        let mut dummy_output = vec![Sample::default(); num_frames];
+        self.process_block(input, &mut dummy_output);
+
+        // Extract multi-channel head output from the last layer array
+        let last = self.layer_arrays.len() - 1;
+        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
+        let head_ch = self.layer_arrays[last].head_rechannel.out_channels;
+        let scale = self.head_scale;
+        let copy_ch = out_channels.min(head_ch);
+
+        for f in 0..num_frames {
+            let out_off = f * output_stride;
+            let head_off = f * head_ch;
+            for c in 0..copy_ch {
+                output_data[out_off + c] = scale * final_head.data[head_off + c];
+            }
+        }
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.set_max_buffer_size_internal(max_buffer_size);
     }
 
     fn prewarm_samples(&self) -> usize {
