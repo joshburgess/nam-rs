@@ -26,22 +26,50 @@ unsafe fn sgemm_colmajor(
     beta: f32,
     c: *mut f32,
 ) {
-    matrixmultiply::sgemm(
-        m,
-        k,
-        n,
-        alpha,
-        a,
-        1,
-        m as isize, // A: col-major
-        b,
-        1,
-        b_col_stride, // B: col-major with given stride
-        beta,
-        c,
-        1,
-        m as isize, // C: col-major
-    );
+    #[cfg(feature = "faer")]
+    {
+        // Construct faer matrix views from raw col-major pointers.
+        // A is (m x k) col-major with stride m, B is (k x n) with given stride, C is (m x n).
+        let a_slice = core::slice::from_raw_parts(a, m * k);
+        let b_slice = core::slice::from_raw_parts(b, (b_col_stride as usize) * n);
+        let c_slice = core::slice::from_raw_parts_mut(c, m * n);
+
+        let a_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(a_slice, m, k);
+        let b_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(b_slice, b_col_stride as usize, n);
+        // B may have stride > k (when input buffer has extra rows). Use only top k rows.
+        let b_mat = b_mat.subrows(0, k);
+        let c_mat = faer::mat::from_column_major_slice_mut::<f32, usize, usize>(c_slice, m, n);
+
+        // C = beta*C + alpha*A*B
+        faer::linalg::matmul::matmul(
+            c_mat,
+            a_mat,
+            b_mat,
+            Some(beta), // scale existing C
+            alpha,      // scale A*B
+            faer::Parallelism::None,
+        );
+    }
+
+    #[cfg(not(feature = "faer"))]
+    {
+        matrixmultiply::sgemm(
+            m,
+            k,
+            n,
+            alpha,
+            a,
+            1,
+            m as isize, // A: col-major
+            b,
+            1,
+            b_col_stride, // B: col-major with given stride
+            beta,
+            c,
+            1,
+            m as isize, // C: col-major
+        );
+    }
 }
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
