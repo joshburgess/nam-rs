@@ -232,16 +232,10 @@ impl RingBuffer2D {
         }
         let ch = self.channels;
         let copy_start = self.write_pos - self.max_lookback;
-        // Copy max_lookback columns from copy_start to position 0
-        for c in 0..self.max_lookback {
-            let src_off = (copy_start + c) * ch;
-            let dst_off = c * ch;
-            // Can't use copy_from_slice because regions may overlap, but since
-            // copy_start >= max_lookback (by C++ invariant), they don't overlap.
-            for i in 0..ch {
-                self.storage[dst_off + i] = self.storage[src_off + i];
-            }
-        }
+        let len = self.max_lookback * ch;
+        let src_start = copy_start * ch;
+        // copy_start >= max_lookback (by C++ invariant), so regions don't overlap.
+        self.storage.copy_within(src_start..src_start + len, 0);
         self.write_pos = self.max_lookback;
     }
 
@@ -709,9 +703,12 @@ impl Conv1d {
                     );
                 },
                 Conv1dWeights::General(weights_colmajor) => {
-                    // Large matrix: still use sgemm (it has its own SIMD)
-                    let out_len = out_ch * num_frames;
-                    self.output_buf.data[..out_len].fill(0.0);
+                    // Large matrix: initialize with bias, then accumulate via sgemm
+                    for f in 0..num_frames {
+                        let off = f * out_ch;
+                        self.output_buf.data[off..off + out_ch]
+                            .copy_from_slice(&self.bias);
+                    }
                     for k in 0..ks {
                         let w = &weights_colmajor[k];
                         unsafe {
@@ -722,22 +719,17 @@ impl Conv1d {
                             );
                         }
                     }
-                    // Add bias
-                    for f in 0..num_frames {
-                        let off = f * out_ch;
-                        for o in 0..out_ch {
-                            self.output_buf.data[off + o] += self.bias[o];
-                        }
-                    }
                 }
             }
             self.input_buffer.advance(num_frames);
             return;
         }
 
-        // Initialize output to zero, then accumulate
-        let out_len = out_ch * num_frames;
-        self.output_buf.data[..out_len].fill(0.0);
+        // Initialize output with bias (fused: eliminates separate bias-add pass)
+        for f in 0..num_frames {
+            let off = f * out_ch;
+            self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
+        }
 
         match &self.weights {
             Conv1dWeights::Depthwise(dw) => {
@@ -814,14 +806,6 @@ impl Conv1d {
                         }
                     }
                 }
-            }
-        }
-
-        // Add bias (colwise)
-        for f in 0..num_frames {
-            let col_start = f * out_ch;
-            for o in 0..out_ch {
-                self.output_buf.data[col_start + o] += self.bias[o];
             }
         }
 
@@ -2141,15 +2125,11 @@ impl WaveNet {
         self.ensure_buffer_size(num_frames);
 
         // Step 1: Fill condition_input (in_channels x num_frames)
-        // For standard NAM, in_channels = 1, so each column has one element
+        // For standard NAM, in_channels = 1, so each column has one element.
+        // Buffer is pre-zeroed by resize(), so only write the first channel.
         let in_ch = self.in_channels;
         for f in 0..num_frames {
-            let col_start = f * in_ch;
-            self.condition_input.data[col_start] = input[f] as f32;
-            // Zero remaining channels if any (unlikely for NAM)
-            for c in 1..in_ch {
-                self.condition_input.data[col_start + c] = 0.0;
-            }
+            self.condition_input.data[f * in_ch] = input[f] as f32;
         }
 
         // Step 2: Process condition
@@ -2170,11 +2150,18 @@ impl WaveNet {
             let cond_rows = self.condition_output.rows;
             let in_rows = self.condition_input.rows;
             let copy_rows = cond_rows.min(in_rows);
-            for f in 0..num_frames {
-                let cond_off = f * cond_rows;
-                let in_off = f * in_rows;
-                self.condition_output.data[cond_off..cond_off + copy_rows]
-                    .copy_from_slice(&self.condition_input.data[in_off..in_off + copy_rows]);
+            if cond_rows == in_rows {
+                // Same stride: single bulk copy
+                let len = copy_rows * num_frames;
+                self.condition_output.data[..len]
+                    .copy_from_slice(&self.condition_input.data[..len]);
+            } else {
+                for f in 0..num_frames {
+                    let cond_off = f * cond_rows;
+                    let in_off = f * in_rows;
+                    self.condition_output.data[cond_off..cond_off + copy_rows]
+                        .copy_from_slice(&self.condition_input.data[in_off..in_off + copy_rows]);
+                }
             }
         }
 
