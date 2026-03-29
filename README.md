@@ -11,6 +11,7 @@ Loads `.nam` model files produced by the NAM Python trainer and processes audio 
 - **C++ accuracy parity**: bit-identical output on small models, within f32 precision floor on larger models (verified against C++ reference)
 - **Fast tanh toggle**: switch between accurate `std::tanh` and C++-compatible polynomial approximation for performance
 - **Audio plugin**: VST3/CLAP plugin with egui GUI, file browser, and gain controls
+- **Training GUI**: native desktop app for training NAM models, with one-click Python/environment setup
 - **CLI tools**: offline rendering and benchmarking
 
 ## Project Structure
@@ -59,6 +60,23 @@ cargo run --release -p nam-cli -- render model.nam input.wav output.wav
 cargo run --release -p nam-cli -- bench model.nam 64 1500
 cargo run --release -p nam-cli -- bench model.nam 64 1500 --fast  # with fast tanh
 ```
+
+## NAM Trainer
+
+The `nam-trainer` crate is a native desktop GUI for training Neural Amp Models. The upstream NAM project provides training via a [Google Colab notebook](https://github.com/sdatkinson/neural-amp-modeler) or a command-line Python script, but both require manual Python environment setup and offer no visual feedback during training. The trainer GUI solves this by providing a self-contained desktop experience.
+
+```bash
+cargo run --release -p nam-trainer
+```
+
+**Features:**
+- **One-click environment setup** — auto-discovers Python installations, installs Miniforge and `neural-amp-modeler` with a single button click, detects NVIDIA/Apple GPU hardware
+- **Training workflow** — select input/output audio files, configure model architecture (Standard/Lite/Feather/Nano), epochs, batch size, and advanced parameters, then train with a live loss curve plot and streaming log
+- **Device selection** — automatically detects available training devices (CPU, CUDA GPUs, Apple MPS) and selects the best one
+- **Model metadata** — set model name, gear type, tone type, and other metadata fields embedded in the `.nam` file
+- **Cross-platform** — builds and runs on macOS, Linux, and Windows with platform-specific Python discovery and Miniforge installation
+
+The trainer drives the upstream [neural-amp-modeler](https://github.com/sdatkinson/neural-amp-modeler) Python package via a JSON-based worker protocol over stdin/stdout. The Rust GUI handles all environment management and progress visualization while the Python process does the actual PyTorch training.
 
 ## Accuracy
 
