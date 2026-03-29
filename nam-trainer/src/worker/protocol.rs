@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// Request sent from Rust GUI to Python worker via stdin (single JSON line).
@@ -50,13 +48,18 @@ pub enum WorkerEvent {
 
     #[serde(rename = "training_complete")]
     TrainingComplete {
+        #[allow(dead_code)] // present in JSON, matched with `..`
         file: String,
         validation_esr: f64,
         model_path: String,
     },
 
     #[serde(rename = "training_failed")]
-    TrainingFailed { file: String, error: String },
+    TrainingFailed {
+        #[allow(dead_code)] // present in JSON, matched with `..`
+        file: String,
+        error: String,
+    },
 
     #[serde(rename = "all_complete")]
     AllComplete,

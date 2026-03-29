@@ -13,17 +13,36 @@ const SECTION_GAP: f32 = 6.0;
 pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.add_space(2.0);
 
-    // ── Header ──────────────────────────────────────────────────────────
+    show_header(app, ui);
+    ui.add_space(SECTION_GAP);
+    show_audio_files(app, ui);
+    ui.add_space(SECTION_GAP);
+    show_configuration(app, ui);
+    ui.add_space(SECTION_GAP);
+    show_python_environment(app, ui);
+    show_install_log(app, ui);
+    show_train_controls(app, ui);
+
+    if !app.training_log.is_empty() {
+        ui.add_space(4.0);
+        super::progress::show(app, ui);
+    }
+}
+
+// ── Header ─────────────────────────────────────────────────────────────
+
+fn show_header(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("NAM Trainer").size(20.0).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             show_status_badge(app, ui);
         });
     });
+}
 
-    ui.add_space(SECTION_GAP);
+// ── Audio Files ────────────────────────────────────────────────────────
 
-    // ── Audio Files ─────────────────────────────────────────────────────
+fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
     section(ui, "Audio Files", |ui| {
         // Input audio
         ui.horizontal(|ui| {
@@ -107,10 +126,11 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
         });
     });
+}
 
-    ui.add_space(SECTION_GAP);
+// ── Configuration ──────────────────────────────────────────────────────
 
-    // ── Configuration ───────────────────────────────────────────────────
+fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
     section(ui, "Configuration", |ui| {
         ui.horizontal(|ui| {
             ui.label("Model:");
@@ -161,10 +181,11 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             });
         });
     });
+}
 
-    ui.add_space(SECTION_GAP);
+// ── Python Environment ─────────────────────────────────────────────────
 
-    // ── Python Environment ──────────────────────────────────────────────
+fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
     section(ui, "Python Environment", |ui| {
         // Auto-discover on first frame
         if app.discovered_pythons.is_none() {
@@ -184,31 +205,31 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         egui::ComboBox::from_id_salt("python_combo")
             .selected_text(current_label)
             .width(full_width)
-                .show_ui(ui, |ui| {
-                    for entry in &discovered {
-                        let label = format!("{} ({})", entry.label, entry.path);
-                        if ui
-                            .selectable_value(
-                                &mut app.python_path,
-                                entry.path.clone(),
-                                label,
-                            )
-                            .changed()
-                        {
-                            changed = true;
-                        }
-                    }
-                    ui.separator();
+            .show_ui(ui, |ui| {
+                for entry in &discovered {
+                    let label = format!("{} ({})", entry.label, entry.path);
                     if ui
-                        .selectable_label(false, "Browse for Python executable...")
-                        .clicked()
+                        .selectable_value(
+                            &mut app.python_path,
+                            entry.path.clone(),
+                            label,
+                        )
+                        .changed()
                     {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            app.python_path = path.display().to_string();
-                            changed = true;
-                        }
+                        changed = true;
                     }
-                });
+                }
+                ui.separator();
+                if ui
+                    .selectable_label(false, "Browse for Python executable...")
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        app.python_path = path.display().to_string();
+                        changed = true;
+                    }
+                }
+            });
 
         if changed {
             app.settings.python_path = Some(app.python_path.clone());
@@ -233,28 +254,26 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if has_miniforge {
-                                if ui
+                            if has_miniforge
+                                && ui
                                     .small_button("Uninstall Miniforge")
                                     .on_hover_text(format!(
                                         "Removes {}",
                                         miniforge_dir.display()
                                     ))
                                     .clicked()
-                                {
-                                    app.uninstall_miniforge();
-                                }
+                            {
+                                app.uninstall_miniforge();
                             }
-                            if has_nam {
-                                if ui
+                            if has_nam
+                                && ui
                                     .small_button("Uninstall NAM")
                                     .on_hover_text(
                                         "Runs: pip uninstall neural-amp-modeler",
                                     )
                                     .clicked()
-                                {
-                                    app.uninstall_nam();
-                                }
+                            {
+                                app.uninstall_nam();
                             }
                         },
                     );
@@ -262,60 +281,68 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
         }
     });
+}
 
-    // ── Install/Uninstall log ───────────────────────────────────────────
-    if !app.install_log.is_empty() {
-        ui.add_space(SECTION_GAP);
-        egui::Frame::group(ui.style())
-            .inner_margin(SECTION_MARGIN)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let header = match &app.install_state {
-                        crate::app::InstallState::Installing(action) => match action {
-                            crate::app::InstallAction::InstallingPython => "Installing Python",
-                            crate::app::InstallAction::InstallingNam => "Installing NAM",
-                            crate::app::InstallAction::UninstallingNam => "Uninstalling NAM",
-                            crate::app::InstallAction::UninstallingMiniforge => {
-                                "Removing Miniforge"
-                            }
-                        },
-                        _ => "Setup",
-                    };
-                    ui.strong(header);
-                    if matches!(
-                        app.install_state,
-                        crate::app::InstallState::Installing(_)
-                    ) {
-                        ui.add(egui::Spinner::new().color(AMBER));
-                    }
-                    if matches!(
-                        app.install_state,
-                        crate::app::InstallState::Done | crate::app::InstallState::Failed
-                    ) {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("Dismiss").clicked() {
-                                    app.install_log.clear();
-                                    app.install_state = crate::app::InstallState::Idle;
-                                }
-                            },
-                        );
-                    }
-                });
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical()
-                    .max_height(120.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &app.install_log {
-                            ui.label(egui::RichText::new(line).monospace().size(11.0));
-                        }
-                    });
-            });
+// ── Install/Uninstall log ──────────────────────────────────────────────
+
+fn show_install_log(app: &mut TrainerApp, ui: &mut egui::Ui) {
+    if app.install_log.is_empty() {
+        return;
     }
 
-    // ── Train ───────────────────────────────────────────────────────────
+    ui.add_space(SECTION_GAP);
+    egui::Frame::group(ui.style())
+        .inner_margin(SECTION_MARGIN)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let header = match &app.install_state {
+                    crate::app::InstallState::Installing(action) => match action {
+                        crate::app::InstallAction::InstallingPython => "Installing Python",
+                        crate::app::InstallAction::InstallingNam => "Installing NAM",
+                        crate::app::InstallAction::UninstallingNam => "Uninstalling NAM",
+                        crate::app::InstallAction::UninstallingMiniforge => {
+                            "Removing Miniforge"
+                        }
+                    },
+                    _ => "Setup",
+                };
+                ui.strong(header);
+                if matches!(
+                    app.install_state,
+                    crate::app::InstallState::Installing(_)
+                ) {
+                    ui.add(egui::Spinner::new().color(AMBER));
+                }
+                if matches!(
+                    app.install_state,
+                    crate::app::InstallState::Done | crate::app::InstallState::Failed
+                ) {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("Dismiss").clicked() {
+                                app.install_log.clear();
+                                app.install_state = crate::app::InstallState::Idle;
+                            }
+                        },
+                    );
+                }
+            });
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical()
+                .max_height(120.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &app.install_log {
+                        ui.label(egui::RichText::new(line).monospace().size(11.0));
+                    }
+                });
+        });
+}
+
+// ── Train controls ─────────────────────────────────────────────────────
+
+fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
     let env_ready = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
     let no_active_install =
         !matches!(app.install_state, crate::app::InstallState::Installing(_))
@@ -410,12 +437,6 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             });
         });
-    }
-
-    // ── Training Progress ───────────────────────────────────────────────
-    if !app.training_log.is_empty() {
-        ui.add_space(4.0);
-        super::progress::show(app, ui);
     }
 }
 
