@@ -1,4 +1,5 @@
-// Allow index-based loops in GEMM hot paths where explicit indexing matches C++ Eigen order
+// Allow index-based loops where explicit indexing matches C++ Eigen order or
+// multiple arrays are indexed simultaneously (dw[k][c], weights[k], etc.)
 #![allow(clippy::needless_range_loop)]
 // Allow returns after cfg-gated blocks where the return prevents fallthrough to cfg'd-out code
 #![allow(clippy::needless_return, unreachable_code)]
@@ -2225,8 +2226,8 @@ impl WaveNet {
         // For standard NAM, in_channels = 1, so each column has one element.
         // Buffer is pre-zeroed by resize(), so only write the first channel.
         let in_ch = self.in_channels;
-        for f in 0..num_frames {
-            self.condition_input.data[f * in_ch] = input[f] as f32;
+        for (f, &sample) in input.iter().enumerate().take(num_frames) {
+            self.condition_input.data[f * in_ch] = sample as f32;
         }
 
         // Step 2: Process condition
@@ -2299,14 +2300,14 @@ impl WaveNet {
         // For single-channel output (typical NAM): data is contiguous
         if out_ch == 1 {
             let scale = self.head_scale;
-            for s in 0..num_frames {
-                output[s] = (scale * final_head.data[s]) as Sample;
+            for (o, &h) in output.iter_mut().zip(final_head.data.iter()).take(num_frames) {
+                *o = (scale * h) as Sample;
             }
         } else {
-            // Multi-channel: take first channel (or scale all)
+            // Multi-channel: take first channel
             let scale = self.head_scale;
-            for s in 0..num_frames {
-                output[s] = (scale * final_head.data[s * out_ch]) as Sample;
+            for (s, o) in output.iter_mut().enumerate().take(num_frames) {
+                *o = (scale * final_head.data[s * out_ch]) as Sample;
             }
         }
     }
