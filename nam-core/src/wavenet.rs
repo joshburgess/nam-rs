@@ -473,29 +473,49 @@ impl Conv1x1 {
                 }
             }
             _ => {
-                // General small-matrix path with fused bias
-                if let Some(ref b) = bias {
-                    for f in 0..num_frames {
-                        let in_col_start = f * input_stride;
-                        let out_col_start = f * out_ch;
-                        for o in 0..out_ch {
-                            let mut sum = b[o];
-                            for i in 0..in_ch {
-                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                #[cfg(feature = "fast-kernels")]
+                unsafe {
+                    let bias_ptr = match bias {
+                        Some(ref b) => b.as_ptr(),
+                        None => core::ptr::null(),
+                    };
+                    crate::fast_kernels::fast_conv1x1_small(
+                        out.as_mut_ptr(),
+                        w.as_ptr(),
+                        input_data.as_ptr(),
+                        bias_ptr,
+                        out_ch,
+                        in_ch,
+                        input_stride,
+                        num_frames,
+                    );
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
+                    // General small-matrix path with fused bias
+                    if let Some(ref b) = bias {
+                        for f in 0..num_frames {
+                            let in_col_start = f * input_stride;
+                            let out_col_start = f * out_ch;
+                            for o in 0..out_ch {
+                                let mut sum = b[o];
+                                for i in 0..in_ch {
+                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                }
+                                out[out_col_start + o] = sum;
                             }
-                            out[out_col_start + o] = sum;
                         }
-                    }
-                } else {
-                    for f in 0..num_frames {
-                        let in_col_start = f * input_stride;
-                        let out_col_start = f * out_ch;
-                        for o in 0..out_ch {
-                            let mut sum = 0.0f32;
-                            for i in 0..in_ch {
-                                sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                    } else {
+                        for f in 0..num_frames {
+                            let in_col_start = f * input_stride;
+                            let out_col_start = f * out_ch;
+                            for o in 0..out_ch {
+                                let mut sum = 0.0f32;
+                                for i in 0..in_ch {
+                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                }
+                                out[out_col_start + o] = sum;
                             }
-                            out[out_col_start + o] = sum;
                         }
                     }
                 }
@@ -888,6 +908,29 @@ impl FiLM {
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
 
+        #[cfg(feature = "fast-kernels")]
+        {
+            unsafe {
+                if self.do_shift {
+                    crate::fast_kernels::fast_film_scale_shift(
+                        self.output_buf.data.as_mut_ptr(),
+                        input_data.as_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, input_stride, dim, ss_rows, num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::fast_film_scale(
+                        self.output_buf.data.as_mut_ptr(),
+                        input_data.as_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, input_stride, dim, ss_rows, num_frames,
+                    );
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         if self.do_shift {
             if dim == 3 {
                 for f in 0..num_frames {
@@ -955,6 +998,27 @@ impl FiLM {
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
 
+        #[cfg(feature = "fast-kernels")]
+        {
+            unsafe {
+                if self.do_shift {
+                    crate::fast_kernels::fast_film_inplace_scale_shift(
+                        target_data.as_mut_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, target_stride, ss_rows, num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::fast_film_inplace_scale(
+                        target_data.as_mut_ptr(),
+                        scale_shift.data.as_ptr(),
+                        dim, target_stride, ss_rows, num_frames,
+                    );
+                }
+            }
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         if self.do_shift {
             for f in 0..num_frames {
                 let t_off = f * target_stride;

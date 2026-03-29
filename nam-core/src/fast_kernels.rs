@@ -37,6 +37,62 @@ extern "C" {
         use_fast_tanh: i32,
     );
 
+    /// Conv1x1 small GEMM with optional bias.
+    pub fn fast_conv1x1_small(
+        output: *mut f32,
+        weights: *const f32,
+        input: *const f32,
+        bias: *const f32, // null if no bias
+        out_ch: usize,
+        in_ch: usize,
+        input_stride: usize,
+        num_frames: usize,
+    );
+
+    /// FiLM scale+shift (out-of-place).
+    pub fn fast_film_scale_shift(
+        output: *mut f32,
+        input: *const f32,
+        scale_shift: *const f32,
+        dim: usize,
+        input_stride: usize,
+        output_stride: usize,
+        ss_rows: usize,
+        num_frames: usize,
+    );
+
+    /// FiLM scale only (out-of-place).
+    pub fn fast_film_scale(
+        output: *mut f32,
+        input: *const f32,
+        scale: *const f32,
+        dim: usize,
+        input_stride: usize,
+        output_stride: usize,
+        ss_rows: usize,
+        num_frames: usize,
+    );
+
+    /// FiLM in-place scale+shift.
+    pub fn fast_film_inplace_scale_shift(
+        data: *mut f32,
+        scale_shift: *const f32,
+        dim: usize,
+        data_stride: usize,
+        ss_rows: usize,
+        num_frames: usize,
+    );
+
+    /// FiLM in-place scale only.
+    pub fn fast_film_inplace_scale(
+        data: *mut f32,
+        scale: *const f32,
+        dim: usize,
+        data_stride: usize,
+        ss_rows: usize,
+        num_frames: usize,
+    );
+
     /// Tanh in-place (standard math, compiled with -ffast-math).
     pub fn fast_tanh_inplace(data: *mut f32, len: usize);
 
