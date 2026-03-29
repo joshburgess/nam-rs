@@ -93,6 +93,15 @@ extern "C" {
         num_frames: usize,
     );
 
+    /// Element-wise vector add: c[i] = a[i] + b[i]
+    pub fn fast_vec_add(c: *mut f32, a: *const f32, b: *const f32, len: usize);
+
+    /// Element-wise vector add in-place: a[i] += b[i]
+    pub fn fast_vec_add_inplace(a: *mut f32, b: *const f32, len: usize);
+
+    /// Add bias to each column: output[f*ch + o] += bias[o]
+    pub fn fast_add_bias(output: *mut f32, bias: *const f32, ch: usize, num_frames: usize);
+
     /// Tanh in-place (standard math, compiled with -ffast-math).
     pub fn fast_tanh_inplace(data: *mut f32, len: usize);
 

@@ -98,6 +98,47 @@ void fast_conv1d_small_gemv(
     }
 }
 
+/* ── Vector add: c[i] = a[i] + b[i] ────────────────────────────────────
+ */
+void fast_vec_add(
+    float *restrict c,
+    const float *restrict a,
+    const float *restrict b,
+    size_t len
+) {
+    for (size_t i = 0; i < len; i++) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+/* ── Vector add in-place: a[i] += b[i] ──────────────────────────────────
+ */
+void fast_vec_add_inplace(
+    float *restrict a,
+    const float *restrict b,
+    size_t len
+) {
+    for (size_t i = 0; i < len; i++) {
+        a[i] += b[i];
+    }
+}
+
+/* ── Add bias to each column: output[f*ch + o] += bias[o] ──────────────
+ */
+void fast_add_bias(
+    float *restrict output,
+    const float *restrict bias,
+    size_t ch,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t off = f * ch;
+        for (size_t c = 0; c < ch; c++) {
+            output[off + c] += bias[c];
+        }
+    }
+}
+
 /* ── Fused z = conv + mixin, then activation ────────────────────────────
  * z_out[i] = activation(conv_out[i] + mixin_out[i])
  * Eliminates separate add pass and activation pass.

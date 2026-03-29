@@ -1382,6 +1382,16 @@ impl WaveNetLayer {
         let did_fused_add_activate = false;
 
         if !did_fused_add_activate {
+            #[cfg(feature = "fast-kernels")]
+            unsafe {
+                crate::fast_kernels::fast_vec_add(
+                    self.z_buf.data.as_mut_ptr(),
+                    self.conv.output_buf.data.as_ptr(),
+                    self.input_mixin.output_buf.data.as_ptr(),
+                    z_len,
+                );
+            }
+            #[cfg(not(feature = "fast-kernels"))]
             for i in 0..z_len {
                 self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
             }
@@ -1539,21 +1549,32 @@ impl WaveNetLayer {
         let ch = self.channels;
         if let Some(ref l1x1) = self.layer1x1 {
             let total = ch * num_frames;
-            let inp = &input.data;
-            let l1 = &l1x1.output_buf.data;
-            let out = &mut self.output_next_layer.data;
-            // 4-wide unrolled element-wise addition
-            let mut i = 0;
-            while i + 3 < total {
-                out[i] = inp[i] + l1[i];
-                out[i + 1] = inp[i + 1] + l1[i + 1];
-                out[i + 2] = inp[i + 2] + l1[i + 2];
-                out[i + 3] = inp[i + 3] + l1[i + 3];
-                i += 4;
+            #[cfg(feature = "fast-kernels")]
+            unsafe {
+                crate::fast_kernels::fast_vec_add(
+                    self.output_next_layer.data.as_mut_ptr(),
+                    input.data.as_ptr(),
+                    l1x1.output_buf.data.as_ptr(),
+                    total,
+                );
             }
-            while i < total {
-                out[i] = inp[i] + l1[i];
-                i += 1;
+            #[cfg(not(feature = "fast-kernels"))]
+            {
+                let inp = &input.data;
+                let l1 = &l1x1.output_buf.data;
+                let out = &mut self.output_next_layer.data;
+                let mut i = 0;
+                while i + 3 < total {
+                    out[i] = inp[i] + l1[i];
+                    out[i + 1] = inp[i + 1] + l1[i + 1];
+                    out[i + 2] = inp[i + 2] + l1[i + 2];
+                    out[i + 3] = inp[i + 3] + l1[i + 3];
+                    i += 4;
+                }
+                while i < total {
+                    out[i] = inp[i] + l1[i];
+                    i += 1;
+                }
             }
         } else {
             let total = ch * num_frames;
@@ -1701,8 +1722,18 @@ impl WaveNetLayerArray {
             let head_data = layer.get_output_head_data();
             let head_rows = layer.get_output_head_rows();
             if head_rows == head_out_size {
-                // Contiguous: single pass with unrolling
+                // Contiguous: single pass
                 let total = head_out_size * num_frames;
+                #[cfg(feature = "fast-kernels")]
+                unsafe {
+                    crate::fast_kernels::fast_vec_add_inplace(
+                        self.head_inputs.data.as_mut_ptr(),
+                        head_data.as_ptr(),
+                        total,
+                    );
+                }
+                #[cfg(not(feature = "fast-kernels"))]
+                {
                 let dst = &mut self.head_inputs.data;
                 let mut j = 0;
                 while j + 3 < total {
@@ -1716,6 +1747,7 @@ impl WaveNetLayerArray {
                     dst[j] += head_data[j];
                     j += 1;
                 }
+                } // end cfg(not(fast-kernels))
             } else {
                 // Different strides: per-frame copy
                 for f in 0..num_frames {
