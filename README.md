@@ -79,14 +79,16 @@ All differences are at the f32 precision floor.
 Processing 2 seconds of audio at 48kHz, buffer size 64, 1500 iterations.
 Benchmarked on a MacBook Pro 16-inch (Nov 2024) with Apple M4 Max and 48 GB RAM, running macOS Sequoia 15.4.1.
 
+All benchmarks below were measured with interleaved C++/Rust runs (alternating single runs, not batches) to equalize thermal conditions on the CPU.
+
 ### Default build (pure Rust, stable toolchain, no C compiler needed)
 
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
-| Small WaveNet | 6ms | 6ms | ~tied |
-| LSTM | 6ms | 5ms | Rust faster |
-| Standard WaveNet (16/8ch, 20 layers) | 61ms | 167ms | 2.7x slower |
-| a2_max (all advanced features) | 56ms | 132ms | 2.4x slower |
+| Small WaveNet | 5ms | 7ms | 1.4x |
+| LSTM | 6ms | 6ms | ~tied |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 167ms | 2.7x slower |
+| a2_max (all advanced features) | 58ms | 132ms | 2.3x slower |
 
 ### With `fast-kernels` feature (requires C compiler)
 
@@ -96,16 +98,31 @@ cargo build --release --features fast-kernels
 
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
-| Small WaveNet | 6ms | 6ms | ~tied |
-| LSTM | 6ms | 5ms | Rust faster |
-| Standard WaveNet (16/8ch, 20 layers) | 61ms | 71ms | 1.16x |
-| a2_max (all advanced features) | 56ms | 63ms | 1.13x |
+| Small WaveNet | 5ms | 7ms | 1.4x |
+| LSTM | 6ms | 6ms | ~tied |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 74ms | 1.17x |
+| a2_max (all advanced features) | 58ms | 67ms | 1.16x |
+
+### With `fast-kernels` + `faer` features (best performance)
+
+```bash
+cargo build --release --features fast-kernels,faer
+```
+
+| Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
+|-------|----------------|-----------------|--------|
+| Small WaveNet | 5ms | 7ms | 1.4x |
+| LSTM | 6ms | 6ms | ~tied |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 66ms | **1.05x** |
+| a2_max (all advanced features) | 58ms | 66ms | 1.14x |
+
+The `faer` feature replaces the default `matrixmultiply` GEMM with [faer](https://github.com/sarah-ek/faer-rs)'s GEMM kernel, which is better tuned for the small matrix sizes (8x16) used in WaveNet's SGEMM path. It closes the Standard WaveNet gap from 17% to 5%. It has minimal effect on a2_max since that model's matrices are too small for the SGEMM path.
 
 All models run well within real-time at any buffer size.
 
 ### Optimization journey
 
-The pure Rust implementation started at 2.4-2.7x slower than C++ on large models. Through a series of optimizations, the `fast-kernels` feature closes the gap to ~15%:
+The pure Rust implementation started at 2.3-2.7x slower than C++ on large models. Through algorithmic fixes and C fast-math kernels, the gap was closed to 5-16%:
 
 **Algorithmic fixes (pure Rust, no feature flags needed):**
 
@@ -127,11 +144,20 @@ The remaining gap after algorithmic fixes was caused by Rust's strict IEEE 754 f
 - **Element-wise operations** — vector add, vector add-in-place, bias addition, all compiled with fast-math for better vectorization
 - **Full SGEMM** — column-major matrix multiply for the large-matrix path
 
-The C code is trivial — the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is ~250 lines. The "secret sauce" is the compiler flag, not the language.
+The C code is trivial — the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is under 300 lines. The performance comes from the compiler flag, not the language.
 
-### Where the remaining ~15% gap comes from
+**What we tried that didn't help:**
 
-Nearly every float operation in the hot path now goes through C code compiled with `-ffast-math`, so compiler flags are no longer the difference. The remaining gap is architectural:
+- **LLVM `-enable-unsafe-fp-math` flag** — Rust's frontend generates more conservative IR than C's frontend, so the backend flag alone doesn't replicate `-ffast-math`. No measurable improvement.
+- **Apple Accelerate / BLAS** — dispatch overhead for BLAS routines exceeded the compute time for NAM's small matrices (8x16, 4x1). Pure Rust `matrixmultiply` was faster.
+- **Nightly `core::intrinsics::fadd_fast`/`fmul_fast`** — per-operation fast-math intrinsics didn't help because LLVM doesn't propagate them to enable loop-level vectorization the way a global `-ffast-math` flag does.
+- **Hand-written NEON SIMD kernels** — per-element SIMD kernels called per kernel tap had higher overhead than letting the compiler auto-vectorize the scalar loops. A hand-tuned 8x16 GEMM kernel matched `matrixmultiply` but didn't beat it.
+- **Fused Conv1d loop (frame-outer)** — restructuring the Conv1d from tap-outer to frame-outer (to keep accumulators in registers across all taps) hurt cache performance because it accessed multiple tap data arrays per frame instead of streaming through one at a time.
+- **Fused layer pipeline (mixin + add + activation in one pass)** — prevented the compiler from auto-vectorizing each simple pass independently, resulting in slower code than separate passes.
+
+### Where the remaining 5-16% gap comes from
+
+Nearly every float operation in the hot path now goes through C code compiled with `-ffast-math`, so compiler flags are no longer the primary difference. The remaining gap is architectural:
 
 1. **Eigen expression templates eliminate intermediate buffers.** In C++, Eigen can write `z = conv_output + mixin_output` and the compiler sees it as one fused operation — no intermediate buffer is ever materialized. In our code, even with C kernels, we write the Conv1d output to one buffer, write the mixin output to another, then call a C function to combine them into a third. That's three separate buffers and two memory passes where Eigen does one. This applies to every step in the pipeline.
 
