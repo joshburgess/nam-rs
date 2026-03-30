@@ -103,10 +103,10 @@ All benchmarks below were measured with interleaved C++/Rust runs (alternating s
 
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
-| Small WaveNet | 5ms | 7ms | 1.4x |
-| LSTM | 6ms | 6ms | ~tied |
-| Standard WaveNet (16/8ch, 20 layers) | 63ms | 167ms | 2.7x slower |
-| a2_max (all advanced features) | 58ms | 132ms | 2.3x slower |
+| Small WaveNet | 5ms | 12ms | 2.4x slower |
+| LSTM | 5ms | 6ms | 1.2x |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 145ms | 2.3x slower |
+| a2_max (all advanced features) | 58ms | 105ms | 1.8x slower |
 
 ### With `fast-kernels` feature (requires C compiler)
 
@@ -117,9 +117,9 @@ cargo build --release --features fast-kernels
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
 | Small WaveNet | 5ms | 7ms | 1.4x |
-| LSTM | 6ms | 6ms | ~tied |
-| Standard WaveNet (16/8ch, 20 layers) | 63ms | 74ms | 1.17x |
-| a2_max (all advanced features) | 58ms | 67ms | 1.16x |
+| LSTM | 5ms | 5ms | ~tied |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 73ms | 1.16x |
+| a2_max (all advanced features) | 58ms | 69ms | 1.19x |
 
 ### With `fast-kernels` + `faer` features (best performance)
 
@@ -130,17 +130,17 @@ cargo build --release --features fast-kernels,faer
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
 | Small WaveNet | 5ms | 7ms | 1.4x |
-| LSTM | 6ms | 6ms | ~tied |
-| Standard WaveNet (16/8ch, 20 layers) | 63ms | 66ms | **1.05x** |
-| a2_max (all advanced features) | 58ms | 66ms | 1.14x |
+| LSTM | 5ms | 6ms | 1.2x |
+| Standard WaveNet (16/8ch, 20 layers) | 63ms | 68ms | **1.08x** |
+| a2_max (all advanced features) | 58ms | 70ms | 1.21x |
 
-The `faer` feature replaces the default `matrixmultiply` GEMM with [faer](https://github.com/sarah-ek/faer-rs)'s GEMM kernel, which is better tuned for the small matrix sizes (8x16) used in WaveNet's SGEMM path. It closes the Standard WaveNet gap from 17% to 5%. It has minimal effect on a2_max since that model's matrices are too small for the SGEMM path.
+The `faer` feature replaces the default `matrixmultiply` GEMM with [faer](https://github.com/sarah-ek/faer-rs)'s GEMM kernel, which is better tuned for the small matrix sizes (8x16) used in WaveNet's SGEMM path. It closes the Standard WaveNet gap from 16% to 8%. It has minimal effect on a2_max since that model's matrices are too small for the SGEMM path.
 
 All models run well within real-time at any buffer size.
 
 ### Optimization journey
 
-The pure Rust implementation started at 2.3-2.7x slower than C++ on large models. Through algorithmic fixes and C fast-math kernels, the gap was closed to 5-16%:
+The pure Rust implementation started at 1.8-2.4x slower than C++ on large models. Through algorithmic fixes and C fast-math kernels, the gap was closed to 8-21%:
 
 **Algorithmic fixes (pure Rust, no feature flags needed):**
 
