@@ -90,7 +90,7 @@ Compared against C++ NeuralAmpModelerCore reference output (2 seconds of audio a
 | wavenet_a1_standard (16/8ch, 20 layers) | 6.42e-07 |
 | wavenet_a2_max (all advanced features) | 7.15e-06 |
 
-All differences are at the f32 precision floor and completely inaudible. The largest divergence (wavenet_a2_max at 7.15e-6) represents approximately -103 dB below the signal — well below the 24-bit noise floor (-144 dB) and far below the threshold of human hearing. These differences arise from floating-point accumulation order between Rust and Eigen's SIMD GEMM microkernels in the C++ implementation.
+All differences are at the f32 precision floor and completely inaudible. The largest divergence (wavenet_a2_max at 7.15e-6) represents approximately -103 dB below the signal — far below the threshold of human hearing for distortion artifacts. These differences arise from floating-point accumulation order between Rust and Eigen's SIMD GEMM microkernels in the C++ implementation.
 
 ## Performance
 
