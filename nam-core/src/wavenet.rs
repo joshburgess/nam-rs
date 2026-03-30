@@ -436,18 +436,18 @@ impl Conv1x1 {
                         let ic = f * input_stride;
                         let oc = f * 3;
                         let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
-                        out[oc]     = w00 * i0 + w01 * i1 + w02 * i2 + b0;
-                        out[oc + 1] = w10 * i0 + w11 * i1 + w12 * i2 + b1;
-                        out[oc + 2] = w20 * i0 + w21 * i1 + w22 * i2 + b2;
+                        out[oc]     = w00.mul_add(i0, w01.mul_add(i1, w02.mul_add(i2, b0)));
+                        out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12.mul_add(i2, b1)));
+                        out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22.mul_add(i2, b2)));
                     }
                 } else {
                     for f in 0..num_frames {
                         let ic = f * input_stride;
                         let oc = f * 3;
                         let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
-                        out[oc]     = w00 * i0 + w01 * i1 + w02 * i2;
-                        out[oc + 1] = w10 * i0 + w11 * i1 + w12 * i2;
-                        out[oc + 2] = w20 * i0 + w21 * i1 + w22 * i2;
+                        out[oc]     = w00.mul_add(i0, w01.mul_add(i1, w02 * i2));
+                        out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12 * i2));
+                        out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22 * i2));
                     }
                 }
             }
@@ -458,9 +458,9 @@ impl Conv1x1 {
                     for f in 0..num_frames {
                         let v = input_data[f * input_stride];
                         let oc = f * 3;
-                        out[oc]     = w0 * v + b0;
-                        out[oc + 1] = w1 * v + b1;
-                        out[oc + 2] = w2 * v + b2;
+                        out[oc]     = w0.mul_add(v, b0);
+                        out[oc + 1] = w1.mul_add(v, b1);
+                        out[oc + 2] = w2.mul_add(v, b2);
                     }
                 } else {
                     for f in 0..num_frames {
@@ -478,20 +478,21 @@ impl Conv1x1 {
                     let b0 = b[0];
                     for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
-                            + w2 * input_data[ic + 2] + b0;
+                        *o = w0.mul_add(input_data[ic], w1.mul_add(input_data[ic + 1],
+                            w2.mul_add(input_data[ic + 2], b0)));
                     }
                 } else {
                     for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        *o = w0 * input_data[ic] + w1 * input_data[ic + 1]
-                            + w2 * input_data[ic + 2];
+                        *o = w0.mul_add(input_data[ic], w1.mul_add(input_data[ic + 1],
+                            w2 * input_data[ic + 2]));
                     }
                 }
             }
             _ => {
                 {
                     // General small-matrix path with fused bias
+                    // Uses mul_add (FMA) to match Eigen's SIMD FMA behavior
                     if let Some(ref b) = bias {
                         for f in 0..num_frames {
                             let in_col_start = f * input_stride;
@@ -499,7 +500,7 @@ impl Conv1x1 {
                             for o in 0..out_ch {
                                 let mut sum = b[o];
                                 for i in 0..in_ch {
-                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                    sum = w[i * out_ch + o].mul_add(input_data[in_col_start + i], sum);
                                 }
                                 out[out_col_start + o] = sum;
                             }
@@ -511,7 +512,7 @@ impl Conv1x1 {
                             for o in 0..out_ch {
                                 let mut sum = 0.0f32;
                                 for i in 0..in_ch {
-                                    sum += w[i * out_ch + o] * input_data[in_col_start + i];
+                                    sum = w[i * out_ch + o].mul_add(input_data[in_col_start + i], sum);
                                 }
                                 out[out_col_start + o] = sum;
                             }
@@ -758,9 +759,9 @@ impl Conv1d {
                         let w2 = tap_w[2];
                         for f in 0..num_frames {
                             let off = f * 3;
-                            self.output_buf.data[off] += w0 * tap_data[off];
-                            self.output_buf.data[off + 1] += w1 * tap_data[off + 1];
-                            self.output_buf.data[off + 2] += w2 * tap_data[off + 2];
+                            self.output_buf.data[off] = w0.mul_add(tap_data[off], self.output_buf.data[off]);
+                            self.output_buf.data[off + 1] = w1.mul_add(tap_data[off + 1], self.output_buf.data[off + 1]);
+                            self.output_buf.data[off + 2] = w2.mul_add(tap_data[off + 2], self.output_buf.data[off + 2]);
                         }
                     }
                 } else {
@@ -772,8 +773,8 @@ impl Conv1d {
                         for f in 0..num_frames {
                             let col_start = f * ch;
                             for c in 0..ch {
-                                self.output_buf.data[col_start + c] +=
-                                    tap_w[c] * tap_data[col_start + c];
+                                self.output_buf.data[col_start + c] =
+                                    tap_w[c].mul_add(tap_data[col_start + c], self.output_buf.data[col_start + c]);
                             }
                         }
                     }
@@ -808,7 +809,7 @@ impl Conv1d {
                             for o in 0..out_ch {
                                 let mut sum = 0.0f32;
                                 for i in 0..in_ch {
-                                    sum += w[i * out_ch + o] * tap_data[in_col_start + i];
+                                    sum = w[i * out_ch + o].mul_add(tap_data[in_col_start + i], sum);
                                 }
                                 self.output_buf.data[out_col_start + o] += sum;
                             }
@@ -933,14 +934,11 @@ impl FiLM {
                     let ss_off = f * ss_rows;
                     let out_off = f * 3;
                     self.output_buf.data[out_off] = input_data[in_off]
-                        * scale_shift.data[ss_off]
-                        + scale_shift.data[ss_off + 3];
+                        .mul_add(scale_shift.data[ss_off], scale_shift.data[ss_off + 3]);
                     self.output_buf.data[out_off + 1] = input_data[in_off + 1]
-                        * scale_shift.data[ss_off + 1]
-                        + scale_shift.data[ss_off + 4];
+                        .mul_add(scale_shift.data[ss_off + 1], scale_shift.data[ss_off + 4]);
                     self.output_buf.data[out_off + 2] = input_data[in_off + 2]
-                        * scale_shift.data[ss_off + 2]
-                        + scale_shift.data[ss_off + 5];
+                        .mul_add(scale_shift.data[ss_off + 2], scale_shift.data[ss_off + 5]);
                 }
             } else {
                 for f in 0..num_frames {
@@ -949,8 +947,7 @@ impl FiLM {
                     let out_off = f * dim;
                     for i in 0..dim {
                         self.output_buf.data[out_off + i] = input_data[in_off + i]
-                            * scale_shift.data[ss_off + i]
-                            + scale_shift.data[ss_off + dim + i];
+                            .mul_add(scale_shift.data[ss_off + i], scale_shift.data[ss_off + dim + i]);
                     }
                 }
             }
@@ -1021,8 +1018,8 @@ impl FiLM {
                 let t_off = f * target_stride;
                 let ss_off = f * ss_rows;
                 for i in 0..dim {
-                    target_data[t_off + i] = target_data[t_off + i] * scale_shift.data[ss_off + i]
-                        + scale_shift.data[ss_off + dim + i];
+                    target_data[t_off + i] = target_data[t_off + i]
+                        .mul_add(scale_shift.data[ss_off + i], scale_shift.data[ss_off + dim + i]);
                 }
             }
         } else {

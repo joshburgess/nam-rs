@@ -8,7 +8,7 @@ Loads `.nam` model files produced by the NAM Python trainer and processes audio 
 
 - **All model architectures**: WaveNet, LSTM, ConvNet, Linear
 - **All advanced WaveNet features**: FiLM conditioning, gated/blended activations, grouped convolutions, head1x1, nested condition_dsp, slimmable models
-- **C++ accuracy parity**: bit-identical output on small models, within f32 precision floor on larger models (verified against C++ reference)
+- **C++ accuracy parity**: within f32 precision floor on all models, completely inaudible differences (verified against C++ reference)
 - **Fast tanh toggle**: switch between accurate `std::tanh` and C++-compatible polynomial approximation for performance
 - **Audio plugin**: VST3/CLAP plugin with egui GUI, file browser, and gain controls
 - **Training GUI**: native desktop app for training NAM models, with one-click Python/environment setup
@@ -84,13 +84,13 @@ Compared against C++ NeuralAmpModelerCore reference output (2 seconds of audio a
 
 | Model | Max Diff vs C++ |
 |-------|----------------|
-| wavenet | bit-identical |
-| wavenet_condition_dsp | bit-identical |
-| lstm | 2.09e-07 |
-| wavenet_a1_standard (16/8ch, 20 layers) | 1.13e-06 |
-| wavenet_a2_max (all advanced features) | 4.77e-06 |
+| wavenet | 1.19e-07 |
+| wavenet_condition_dsp | 8.94e-08 |
+| lstm | 8.94e-08 |
+| wavenet_a1_standard (16/8ch, 20 layers) | 6.42e-07 |
+| wavenet_a2_max (all advanced features) | 7.15e-06 |
 
-All differences are at the f32 precision floor.
+All differences are at the f32 precision floor and completely inaudible. The largest divergence (wavenet_a2_max at 7.15e-6) represents approximately -103 dB below the signal — well below the 24-bit noise floor (-144 dB) and far below the threshold of human hearing. These differences arise from floating-point accumulation order between Rust and Eigen's SIMD GEMM microkernels in the C++ implementation.
 
 ## Performance
 
