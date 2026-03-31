@@ -256,6 +256,76 @@
       text-align: center;
       min-height: 1.2em;
     }
+
+    /* Effects */
+    .fx-row {
+      border-top: 1px solid #0f3460;
+      padding-top: 0.8rem;
+      margin-top: 0.8rem;
+    }
+
+    .fx-row:first-child {
+      border-top: none;
+      padding-top: 0;
+      margin-top: 0;
+    }
+
+    .fx-header {
+      margin-bottom: 0.5rem;
+    }
+
+    .fx-toggle {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+      font-size: 0.9rem;
+      color: #ccc;
+    }
+
+    .fx-toggle input[type="checkbox"] {
+      accent-color: #e94560;
+      width: 1rem;
+      height: 1rem;
+    }
+
+    .fx-controls {
+      display: none;
+      padding-left: 0.2rem;
+    }
+
+    .fx-controls.visible {
+      display: block;
+    }
+
+    .fx-param {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 0.4rem;
+      font-size: 0.8rem;
+    }
+
+    .fx-param label {
+      width: 55px;
+      color: #888;
+      flex-shrink: 0;
+    }
+
+    .fx-param input[type="range"] {
+      flex: 1;
+      accent-color: #e94560;
+      height: 4px;
+    }
+
+    .fx-value {
+      width: 55px;
+      text-align: right;
+      color: #aaa;
+      font-size: 0.75rem;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+    }
   </style>
 </head>
 <body>
@@ -298,6 +368,74 @@
         <input type="file" id="ir-input" accept=".wav">
       </label>
       <div class="ir-status" id="ir-status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Effects</h2>
+
+      <div class="fx-row">
+        <div class="fx-header">
+          <label class="fx-toggle"><input type="checkbox" id="eq-enabled"> EQ</label>
+        </div>
+        <div class="fx-controls" id="eq-controls">
+          <div class="fx-param">
+            <label>Low</label>
+            <input type="range" id="eq-low" min="-12" max="12" value="0" step="0.5">
+            <span class="fx-value" id="eq-low-val">0 dB</span>
+          </div>
+          <div class="fx-param">
+            <label>Mid</label>
+            <input type="range" id="eq-mid" min="-12" max="12" value="0" step="0.5">
+            <span class="fx-value" id="eq-mid-val">0 dB</span>
+          </div>
+          <div class="fx-param">
+            <label>High</label>
+            <input type="range" id="eq-high" min="-12" max="12" value="0" step="0.5">
+            <span class="fx-value" id="eq-high-val">0 dB</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="fx-row">
+        <div class="fx-header">
+          <label class="fx-toggle"><input type="checkbox" id="delay-enabled"> Delay</label>
+        </div>
+        <div class="fx-controls" id="delay-controls">
+          <div class="fx-param">
+            <label>Time</label>
+            <input type="range" id="delay-time" min="0.05" max="1.0" value="0.35" step="0.01">
+            <span class="fx-value" id="delay-time-val">350 ms</span>
+          </div>
+          <div class="fx-param">
+            <label>Feedback</label>
+            <input type="range" id="delay-feedback" min="0" max="0.9" value="0.4" step="0.01">
+            <span class="fx-value" id="delay-feedback-val">40%</span>
+          </div>
+          <div class="fx-param">
+            <label>Mix</label>
+            <input type="range" id="delay-mix" min="0" max="1.0" value="0.3" step="0.01">
+            <span class="fx-value" id="delay-mix-val">30%</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="fx-row">
+        <div class="fx-header">
+          <label class="fx-toggle"><input type="checkbox" id="reverb-enabled"> Reverb</label>
+        </div>
+        <div class="fx-controls" id="reverb-controls">
+          <div class="fx-param">
+            <label>Decay</label>
+            <input type="range" id="reverb-decay" min="0.5" max="5.0" value="2.0" step="0.1">
+            <span class="fx-value" id="reverb-decay-val">2.0 s</span>
+          </div>
+          <div class="fx-param">
+            <label>Mix</label>
+            <input type="range" id="reverb-mix" min="0" max="1.0" value="0.25" step="0.01">
+            <span class="fx-value" id="reverb-mix-val">25%</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="card">

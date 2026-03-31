@@ -10,6 +10,19 @@ let sourceNode = null;
 let micStream = null;
 let mainThreadModel = null;
 let convolverNode = null;
+let eqLow = null;
+let eqMid = null;
+let eqHigh = null;
+let delayNode = null;
+let delayFeedback = null;
+let delayDry = null;
+let delayWet = null;
+let reverbConvolver = null;
+let reverbDry = null;
+let reverbWet = null;
+let eqEnabled = false;
+let delayEnabled = false;
+let reverbEnabled = false;
 let useWorklet = false;
 let wasmInitialized = false;
 let activeProfileId = null;
@@ -69,18 +82,133 @@ function getProcessorNode() {
   return useWorklet ? workletNode : scriptNode;
 }
 
-// Reconnect the output chain: processor → [convolver] → destination
+function ensureEffectNodes() {
+  if (eqLow) return; // already created
+
+  const ctx = audioContext;
+
+  // 3-band EQ
+  eqLow = ctx.createBiquadFilter();
+  eqLow.type = 'lowshelf';
+  eqLow.frequency.value = 320;
+  eqLow.gain.value = 0;
+
+  eqMid = ctx.createBiquadFilter();
+  eqMid.type = 'peaking';
+  eqMid.frequency.value = 1000;
+  eqMid.Q.value = 0.7;
+  eqMid.gain.value = 0;
+
+  eqHigh = ctx.createBiquadFilter();
+  eqHigh.type = 'highshelf';
+  eqHigh.frequency.value = 3200;
+  eqHigh.gain.value = 0;
+
+  // Delay (feedback delay with wet/dry mix)
+  delayNode = ctx.createDelay(2.0);
+  delayNode.delayTime.value = 0.35;
+  delayFeedback = ctx.createGain();
+  delayFeedback.gain.value = 0.4;
+  delayDry = ctx.createGain();
+  delayDry.gain.value = 1.0;
+  delayWet = ctx.createGain();
+  delayWet.gain.value = 0.3;
+
+  // Delay feedback loop: delay → feedback → delay
+  delayNode.connect(delayFeedback);
+  delayFeedback.connect(delayNode);
+  delayNode.connect(delayWet);
+
+  // Reverb (synthetic IR via offline rendering)
+  reverbConvolver = ctx.createConvolver();
+  reverbConvolver.normalize = true;
+  reverbDry = ctx.createGain();
+  reverbDry.gain.value = 1.0;
+  reverbWet = ctx.createGain();
+  reverbWet.gain.value = 0.25;
+
+  generateReverbIR(2.0);
+}
+
+function generateReverbIR(decay) {
+  const ctx = audioContext;
+  const rate = ctx.sampleRate;
+  const length = Math.floor(rate * decay);
+  const buffer = ctx.createBuffer(2, length, rate);
+
+  for (let ch = 0; ch < 2; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let i = 0; i < length; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2);
+    }
+  }
+
+  reverbConvolver.buffer = buffer;
+}
+
+// Reconnect the full output chain:
+// processor → [cab IR] → [EQ] → [delay dry/wet] → [reverb dry/wet] → destination
 function reconnectOutput() {
   const processor = getProcessorNode();
   if (!processor || !audioContext) return;
 
+  ensureEffectNodes();
+
+  // Disconnect everything first
   processor.disconnect();
+  if (convolverNode) convolverNode.disconnect();
+  eqLow.disconnect();
+  eqMid.disconnect();
+  eqHigh.disconnect();
+  delayDry.disconnect();
+  delayWet.disconnect();
+  reverbDry.disconnect();
+  reverbWet.disconnect();
+  reverbConvolver.disconnect();
+
+  // Build chain
+  let current = processor;
+
+  // Cab IR (optional)
   if (convolverNode) {
-    convolverNode.disconnect();
-    processor.connect(convolverNode);
-    convolverNode.connect(audioContext.destination);
+    current.connect(convolverNode);
+    current = convolverNode;
+  }
+
+  // EQ (bypass = connect through, enabled = chain filters)
+  if (eqEnabled) {
+    current.connect(eqLow);
+    eqLow.connect(eqMid);
+    eqMid.connect(eqHigh);
+    current = eqHigh;
+  }
+
+  // Delay (bypass = dry only, enabled = dry + wet parallel)
+  if (delayEnabled) {
+    current.connect(delayDry);
+    current.connect(delayNode); // feeds the delay line → delayWet
+
+    // Merge dry + wet into reverb or destination
+    if (reverbEnabled) {
+      delayDry.connect(reverbDry);
+      delayDry.connect(reverbConvolver);
+      delayWet.connect(reverbDry);
+      delayWet.connect(reverbConvolver);
+      reverbConvolver.connect(reverbWet);
+      reverbDry.connect(audioContext.destination);
+      reverbWet.connect(audioContext.destination);
+    } else {
+      delayDry.connect(audioContext.destination);
+      delayWet.connect(audioContext.destination);
+    }
+  } else if (reverbEnabled) {
+    current.connect(reverbDry);
+    current.connect(reverbConvolver);
+    reverbConvolver.connect(reverbWet);
+    reverbDry.connect(audioContext.destination);
+    reverbWet.connect(audioContext.destination);
   } else {
-    processor.connect(audioContext.destination);
+    current.connect(audioContext.destination);
   }
 }
 
@@ -346,6 +474,82 @@ micButton.addEventListener('click', async () => {
   } catch (err) {
     setStatus(`Mic access denied: ${err.message}`, true);
   }
+});
+
+// ── Effects controls ──
+
+function setupFxToggle(checkboxId, controlsId, onToggle) {
+  const checkbox = document.getElementById(checkboxId);
+  const controls = document.getElementById(controlsId);
+  checkbox.addEventListener('change', () => {
+    const enabled = checkbox.checked;
+    controls.classList.toggle('visible', enabled);
+    onToggle(enabled);
+  });
+}
+
+function setupSlider(sliderId, valueId, format, onChange) {
+  const slider = document.getElementById(sliderId);
+  const display = document.getElementById(valueId);
+  const update = () => {
+    const v = parseFloat(slider.value);
+    display.textContent = format(v);
+    onChange(v);
+  };
+  slider.addEventListener('input', update);
+  update(); // set initial display
+}
+
+// EQ
+setupFxToggle('eq-enabled', 'eq-controls', (on) => {
+  eqEnabled = on;
+  reconnectOutput();
+});
+
+setupSlider('eq-low', 'eq-low-val', (v) => `${v > 0 ? '+' : ''}${v} dB`, (v) => {
+  if (eqLow) eqLow.gain.value = v;
+});
+
+setupSlider('eq-mid', 'eq-mid-val', (v) => `${v > 0 ? '+' : ''}${v} dB`, (v) => {
+  if (eqMid) eqMid.gain.value = v;
+});
+
+setupSlider('eq-high', 'eq-high-val', (v) => `${v > 0 ? '+' : ''}${v} dB`, (v) => {
+  if (eqHigh) eqHigh.gain.value = v;
+});
+
+// Delay
+setupFxToggle('delay-enabled', 'delay-controls', (on) => {
+  delayEnabled = on;
+  reconnectOutput();
+});
+
+setupSlider('delay-time', 'delay-time-val', (v) => `${Math.round(v * 1000)} ms`, (v) => {
+  if (delayNode) delayNode.delayTime.value = v;
+});
+
+setupSlider('delay-feedback', 'delay-feedback-val', (v) => `${Math.round(v * 100)}%`, (v) => {
+  if (delayFeedback) delayFeedback.gain.value = v;
+});
+
+setupSlider('delay-mix', 'delay-mix-val', (v) => `${Math.round(v * 100)}%`, (v) => {
+  if (delayWet) delayWet.gain.value = v;
+  if (delayDry) delayDry.gain.value = 1.0 - v * 0.5; // keep dry present
+});
+
+// Reverb
+setupFxToggle('reverb-enabled', 'reverb-controls', (on) => {
+  reverbEnabled = on;
+  reconnectOutput();
+});
+
+setupSlider('reverb-decay', 'reverb-decay-val', (v) => `${v.toFixed(1)} s`, (v) => {
+  if (audioContext && reverbConvolver) generateReverbIR(v);
+});
+
+setupSlider('reverb-mix', 'reverb-mix-val', (v) => `${Math.round(v * 100)}%`, (v) => {
+  if (reverbWet) reverbWet.gain.value = v;
+  if (reverbDry) reverbDry.gain.value = 1.0 - v * 0.5;
 });
 
 // ── Impulse Response ──
