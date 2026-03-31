@@ -36,11 +36,15 @@ function enableAudioControls() {
   micButton.disabled = false;
 }
 
-function showModelInfo(name, sampleRate) {
+function showModelInfo(name, sampleRate, mismatch = false, contextRate = 0) {
   currentModelName = name;
   modelInfoPanel.classList.add('visible');
   infoName.textContent = name;
-  infoSr.textContent = `${sampleRate} Hz`;
+  let srText = `${sampleRate} Hz`;
+  if (mismatch) {
+    srText += ` (browser: ${contextRate} Hz)`;
+  }
+  infoSr.textContent = srText;
   const badge = useWorklet ? 'AudioWorklet' : 'ScriptProcessor';
   const cls = useWorklet ? 'badge worklet' : 'badge';
   infoMode.innerHTML = `<span class="${cls}">${badge}</span>`;
@@ -91,8 +95,12 @@ async function ensureAudioContext() {
           console.warn('Worklet error:', e.data.message);
           resolve(false);
         } else if (e.data.type === 'model-ready') {
-          showModelInfo(currentModelName, e.data.sampleRate);
-          setStatus('Model ready. Load audio or enable mic input.');
+          showModelInfo(currentModelName, e.data.sampleRate, e.data.sampleRateMismatch, e.data.contextSampleRate);
+          if (e.data.sampleRateMismatch) {
+            setStatus(`Model ready. Warning: model expects ${e.data.sampleRate} Hz but browser is running at ${e.data.contextSampleRate} Hz.`);
+          } else {
+            setStatus('Model ready. Load audio or enable mic input.');
+          }
           enableAudioControls();
         }
       };
@@ -161,8 +169,13 @@ async function loadModelFromBytes(bytes, name) {
       mainThreadModel.reset(sr, 512);
       mainThreadModel.prewarm();
 
-      showModelInfo(name, sr);
-      setStatus('Model ready. Load audio or enable mic input.');
+      const mismatch = Math.abs(sr - audioContext.sampleRate) > 1;
+      showModelInfo(name, sr, mismatch, audioContext.sampleRate);
+      if (mismatch) {
+        setStatus(`Model ready. Warning: model expects ${sr} Hz but browser is running at ${audioContext.sampleRate} Hz.`);
+      } else {
+        setStatus('Model ready. Load audio or enable mic input.');
+      }
       enableAudioControls();
     } catch (err) {
       setStatus(`Model load failed: ${err.message}`, true);

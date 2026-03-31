@@ -86,7 +86,13 @@ class NamProcessor extends AudioWorkletProcessor {
       this._allocBuffers(128);
 
       this._ready = true;
-      this.port.postMessage({ type: 'model-ready', sampleRate: sr });
+      const mismatch = Math.abs(sr - sampleRate) > 1;
+      this.port.postMessage({
+        type: 'model-ready',
+        sampleRate: sr,
+        contextSampleRate: sampleRate,
+        sampleRateMismatch: mismatch,
+      });
     } catch (err) {
       this.port.postMessage({ type: 'error', message: `Model load failed: ${err.message}` });
     }
