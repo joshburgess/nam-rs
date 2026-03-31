@@ -43,9 +43,7 @@ async function ensureAudioContext() {
 
   // Try AudioWorklet first
   try {
-    console.log('Adding worklet module...');
     await audioContext.audioWorklet.addModule('worklet/nam-processor.js');
-    console.log('Worklet module added successfully');
 
     workletNode = new AudioWorkletNode(audioContext, 'nam-processor', {
       numberOfInputs: 1,
@@ -64,7 +62,6 @@ async function ensureAudioContext() {
       const timeout = setTimeout(() => resolve(false), 3000);
 
       workletNode.port.onmessage = (e) => {
-        console.log('Worklet message:', e.data);
         if (e.data.type === 'wasm-ready') {
           clearTimeout(timeout);
           resolve(true);
@@ -86,7 +83,6 @@ async function ensureAudioContext() {
         resolve(false);
       };
 
-      workletNode.port.postMessage({ type: 'ping' });
       workletNode.port.postMessage(
         { type: 'init-wasm', wasmBytes },
         [wasmBytes],
@@ -95,7 +91,6 @@ async function ensureAudioContext() {
 
     if (workletReady) {
       useWorklet = true;
-      console.log('Using AudioWorklet');
       return;
     }
 
@@ -107,7 +102,7 @@ async function ensureAudioContext() {
   }
 
   // Fallback to ScriptProcessorNode
-  console.log('Falling back to ScriptProcessorNode');
+  console.warn('AudioWorklet unavailable, using ScriptProcessorNode fallback');
   useWorklet = false;
   scriptNode = audioContext.createScriptProcessor(512, 1, 1);
   scriptNode.onaudioprocess = (e) => {

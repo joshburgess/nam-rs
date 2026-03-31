@@ -14,9 +14,7 @@ class NamProcessor extends AudioWorkletProcessor {
 
     this.port.onmessage = (e) => {
       const { type } = e.data;
-      if (type === 'ping') {
-        this.port.postMessage({ type: 'pong' });
-      } else if (type === 'init-wasm') {
+      if (type === 'init-wasm') {
         this._initWasm(e.data.wasmBytes);
       } else if (type === 'load-model') {
         this._loadModel(e.data.modelBytes);
