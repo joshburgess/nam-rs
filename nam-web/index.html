@@ -249,6 +249,13 @@
     }
 
     .badge.worklet { background: #0a5c2a; color: #6fcf97; }
+
+    .ir-status {
+      font-size: 0.8rem;
+      color: #888;
+      text-align: center;
+      min-height: 1.2em;
+    }
   </style>
 </head>
 <body>
@@ -282,6 +289,15 @@
         <span class="model-info-label">Processing</span>
         <span id="info-mode">—</span>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Cabinet IR</h2>
+      <label class="file-label" id="ir-label">
+        Load impulse response (.wav)
+        <input type="file" id="ir-input" accept=".wav">
+      </label>
+      <div class="ir-status" id="ir-status"></div>
     </div>
 
     <div class="card">

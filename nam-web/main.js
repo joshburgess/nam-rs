@@ -9,6 +9,7 @@ let scriptNode = null;
 let sourceNode = null;
 let micStream = null;
 let mainThreadModel = null;
+let convolverNode = null;
 let useWorklet = false;
 let wasmInitialized = false;
 let activeProfileId = null;
@@ -18,6 +19,8 @@ const statusEl = document.getElementById('status');
 const modelInput = document.getElementById('model-input');
 const audioInput = document.getElementById('audio-input');
 const audioLabel = document.getElementById('audio-label');
+const irInput = document.getElementById('ir-input');
+const irStatusEl = document.getElementById('ir-status');
 const micButton = document.getElementById('mic-toggle');
 const profileListEl = document.getElementById('profile-list');
 const modelInfoPanel = document.getElementById('model-info-panel');
@@ -66,6 +69,21 @@ function getProcessorNode() {
   return useWorklet ? workletNode : scriptNode;
 }
 
+// Reconnect the output chain: processor → [convolver] → destination
+function reconnectOutput() {
+  const processor = getProcessorNode();
+  if (!processor || !audioContext) return;
+
+  processor.disconnect();
+  if (convolverNode) {
+    convolverNode.disconnect();
+    processor.connect(convolverNode);
+    convolverNode.connect(audioContext.destination);
+  } else {
+    processor.connect(audioContext.destination);
+  }
+}
+
 async function ensureAudioContext() {
   if (audioContext) return;
   audioContext = new AudioContext({ latencyHint: 'interactive' });
@@ -78,8 +96,7 @@ async function ensureAudioContext() {
       numberOfOutputs: 1,
       outputChannelCount: [1],
     });
-    workletNode.connect(audioContext.destination);
-
+    // Connected via reconnectOutput() after init
     const wasmResponse = await fetch('pkg/nam_wasm_bg.wasm');
     const wasmBytes = await wasmResponse.arrayBuffer();
 
@@ -118,6 +135,7 @@ async function ensureAudioContext() {
 
     if (workletReady) {
       useWorklet = true;
+      reconnectOutput();
       return;
     }
 
@@ -136,7 +154,7 @@ async function ensureAudioContext() {
     const output = e.outputBuffer.getChannelData(0);
     mainThreadModel.process(input, output);
   };
-  scriptNode.connect(audioContext.destination);
+  reconnectOutput();
 }
 
 // ── Model loading ──
@@ -328,6 +346,37 @@ micButton.addEventListener('click', async () => {
   } catch (err) {
     setStatus(`Mic access denied: ${err.message}`, true);
   }
+});
+
+// ── Impulse Response ──
+
+irInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  await ensureAudioContext();
+
+  irStatusEl.textContent = `Loading: ${file.name}...`;
+
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+    // Create or replace convolver
+    if (convolverNode) {
+      convolverNode.disconnect();
+    }
+    convolverNode = audioContext.createConvolver();
+    convolverNode.normalize = true;
+    convolverNode.buffer = audioBuffer;
+
+    reconnectOutput();
+    irStatusEl.textContent = `IR: ${file.name} (${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate} Hz)`;
+  } catch (err) {
+    irStatusEl.textContent = `IR load failed: ${err.message}`;
+  }
+
+  irInput.value = '';
 });
 
 function stopSource() {
