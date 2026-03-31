@@ -1,37 +1,62 @@
 // main.js — Main thread NAM Web Audio controller
-// Prefers AudioWorklet (off main thread), falls back to ScriptProcessorNode.
 
 import initWasm, { NamModel } from './pkg/nam_wasm.js';
+import { saveProfile, listProfiles, loadProfile, deleteProfile } from './lib/profile-store.js';
 
 let audioContext = null;
 let workletNode = null;
 let scriptNode = null;
 let sourceNode = null;
 let micStream = null;
-let mainThreadModel = null; // only used for ScriptProcessorNode fallback
+let mainThreadModel = null;
 let useWorklet = false;
 let wasmInitialized = false;
-let compiledModule = null;
+let activeProfileId = null;
+let currentModelName = null;
 
-const status = document.getElementById('status');
-const modelInfo = document.getElementById('model-info');
+const statusEl = document.getElementById('status');
 const modelInput = document.getElementById('model-input');
 const audioInput = document.getElementById('audio-input');
+const audioLabel = document.getElementById('audio-label');
 const micButton = document.getElementById('mic-toggle');
+const profileListEl = document.getElementById('profile-list');
+const modelInfoPanel = document.getElementById('model-info-panel');
+const infoName = document.getElementById('info-name');
+const infoSr = document.getElementById('info-sr');
+const infoMode = document.getElementById('info-mode');
 
 function setStatus(msg, isError = false) {
-  status.textContent = msg;
-  status.className = isError ? 'error' : '';
+  statusEl.textContent = msg;
+  statusEl.className = isError ? 'error' : '';
 }
 
-// Initialize wasm-bindgen module on main thread (for fallback + model loading UI)
-setStatus('Loading WASM...');
+function enableAudioControls() {
+  audioInput.disabled = false;
+  audioLabel.classList.remove('disabled');
+  micButton.disabled = false;
+}
+
+function showModelInfo(name, sampleRate) {
+  currentModelName = name;
+  modelInfoPanel.classList.add('visible');
+  infoName.textContent = name;
+  infoSr.textContent = `${sampleRate} Hz`;
+  const badge = useWorklet ? 'AudioWorklet' : 'ScriptProcessor';
+  const cls = useWorklet ? 'badge worklet' : 'badge';
+  infoMode.innerHTML = `<span class="${cls}">${badge}</span>`;
+}
+
+// ── WASM init ──
+
 initWasm().then(() => {
   wasmInitialized = true;
-  setStatus('WASM loaded. Select a .nam model file.');
+  setStatus('Select a model from the library or import a .nam file.');
+  renderProfileList();
 }).catch((err) => {
   setStatus(`WASM init failed: ${err.message}`, true);
 });
+
+// ── Audio context + worklet ──
 
 function getProcessorNode() {
   return useWorklet ? workletNode : scriptNode;
@@ -41,7 +66,6 @@ async function ensureAudioContext() {
   if (audioContext) return;
   audioContext = new AudioContext({ latencyHint: 'interactive' });
 
-  // Try AudioWorklet first
   try {
     await audioContext.audioWorklet.addModule('worklet/nam-processor.js');
 
@@ -52,12 +76,9 @@ async function ensureAudioContext() {
     });
     workletNode.connect(audioContext.destination);
 
-    // Compile and send WASM module to worklet
     const wasmResponse = await fetch('pkg/nam_wasm_bg.wasm');
     const wasmBytes = await wasmResponse.arrayBuffer();
-    compiledModule = await WebAssembly.compile(wasmBytes);
 
-    // Wait for wasm-ready with a timeout
     const workletReady = await new Promise((resolve) => {
       const timeout = setTimeout(() => resolve(false), 3000);
 
@@ -70,15 +91,13 @@ async function ensureAudioContext() {
           console.warn('Worklet error:', e.data.message);
           resolve(false);
         } else if (e.data.type === 'model-ready') {
-          modelInfo.textContent = `Model sample rate: ${e.data.sampleRate} Hz | AudioWorklet`;
+          showModelInfo(currentModelName, e.data.sampleRate);
           setStatus('Model ready. Load audio or enable mic input.');
-          audioInput.disabled = false;
-          micButton.disabled = false;
+          enableAudioControls();
         }
       };
 
-      workletNode.onprocessorerror = (err) => {
-        console.error('Worklet processor error:', err);
+      workletNode.onprocessorerror = () => {
         clearTimeout(timeout);
         resolve(false);
       };
@@ -94,15 +113,13 @@ async function ensureAudioContext() {
       return;
     }
 
-    // Worklet failed — clean up
     workletNode.disconnect();
     workletNode = null;
   } catch (err) {
-    console.warn('AudioWorklet failed:', err, err.message, err.stack);
+    console.warn('AudioWorklet unavailable:', err.message);
   }
 
-  // Fallback to ScriptProcessorNode
-  console.warn('AudioWorklet unavailable, using ScriptProcessorNode fallback');
+  // Fallback
   useWorklet = false;
   scriptNode = audioContext.createScriptProcessor(512, 1, 1);
   scriptNode.onaudioprocess = (e) => {
@@ -114,53 +131,130 @@ async function ensureAudioContext() {
   scriptNode.connect(audioContext.destination);
 }
 
-// Model file loading
-modelInput.addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
+// ── Model loading ──
 
+async function loadModelFromBytes(bytes, name) {
   if (!wasmInitialized) {
-    setStatus('WASM not ready yet, please wait...', true);
+    setStatus('WASM not ready yet...', true);
     return;
   }
 
-  setStatus(`Loading model: ${file.name}...`);
+  setStatus(`Loading model: ${name}...`);
+  currentModelName = name;
   await ensureAudioContext();
 
-  const bytes = await file.arrayBuffer();
-
   if (useWorklet) {
-    // Send model to worklet
+    const copy = bytes.slice(0);
     workletNode.port.postMessage(
-      { type: 'load-model', modelBytes: bytes },
-      [bytes],
+      { type: 'load-model', modelBytes: copy },
+      [copy],
     );
   } else {
-    // Load on main thread
     try {
       if (mainThreadModel) {
         mainThreadModel.free();
         mainThreadModel = null;
       }
 
-      const data = new Uint8Array(bytes);
-      mainThreadModel = new NamModel(data);
-
+      mainThreadModel = new NamModel(new Uint8Array(bytes));
       const sr = mainThreadModel.sample_rate() || audioContext.sampleRate;
       mainThreadModel.reset(sr, 512);
       mainThreadModel.prewarm();
 
+      showModelInfo(name, sr);
       setStatus('Model ready. Load audio or enable mic input.');
-      modelInfo.textContent = `Model sample rate: ${sr} Hz | ScriptProcessor`;
-      audioInput.disabled = false;
-      micButton.disabled = false;
+      enableAudioControls();
     } catch (err) {
       setStatus(`Model load failed: ${err.message}`, true);
     }
   }
+}
+
+// ── Profile list ──
+
+async function renderProfileList() {
+  try {
+    const profiles = await listProfiles();
+
+    if (profiles.length === 0) {
+      profileListEl.innerHTML = '<div class="profile-empty">No models saved yet.<br>Import a .nam file above.</div>';
+      return;
+    }
+
+    profileListEl.innerHTML = profiles
+      .map((p) => {
+        const sizeKB = (p.size / 1024).toFixed(0);
+        const isActive = p.id === activeProfileId;
+        return `
+          <div class="profile-item ${isActive ? 'active' : ''}" data-id="${p.id}">
+            <div class="profile-item-info">
+              <div class="profile-item-name">${escapeHtml(p.name)}</div>
+              <div class="profile-item-meta">${sizeKB} KB</div>
+            </div>
+            <button class="profile-item-delete" data-delete-id="${p.id}" title="Delete">&times;</button>
+          </div>
+        `;
+      })
+      .join('');
+
+    // Click to load
+    profileListEl.querySelectorAll('.profile-item').forEach((el) => {
+      el.addEventListener('click', async (e) => {
+        if (e.target.closest('.profile-item-delete')) return;
+        const id = Number(el.dataset.id);
+        activeProfileId = id;
+        renderProfileList();
+        const bytes = await loadProfile(id);
+        const name = profiles.find((p) => p.id === id)?.name || 'Unknown';
+        await loadModelFromBytes(bytes, name);
+      });
+    });
+
+    // Delete buttons
+    profileListEl.querySelectorAll('.profile-item-delete').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const id = Number(btn.dataset.deleteId);
+        await deleteProfile(id);
+        if (activeProfileId === id) activeProfileId = null;
+        renderProfileList();
+      });
+    });
+  } catch (err) {
+    console.error('Failed to load profile list:', err);
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ── File import ──
+
+modelInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const bytes = await file.arrayBuffer();
+  const name = file.name.replace(/\.nam$/i, '');
+
+  // Save to IndexedDB
+  await saveProfile(name, bytes);
+  await renderProfileList();
+
+  // Load it
+  activeProfileId = (await listProfiles()).slice(-1)[0]?.id;
+  renderProfileList();
+  await loadModelFromBytes(bytes, name);
+
+  // Reset input so same file can be re-imported
+  modelInput.value = '';
 });
 
-// Audio file playback
+// ── Audio file playback ──
+
 audioInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -187,7 +281,8 @@ audioInput.addEventListener('change', async (e) => {
   }
 });
 
-// Mic input
+// ── Mic input ──
+
 micButton.addEventListener('click', async () => {
   await ensureAudioContext();
 

@@ -13,20 +13,134 @@
       color: #e0e0e0;
       min-height: 100vh;
       display: flex;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 260px;
+      min-width: 260px;
+      background: #12122a;
+      border-right: 1px solid #0f3460;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .sidebar-header {
+      padding: 1.2rem 1rem 0.8rem;
+      border-bottom: 1px solid #0f3460;
+    }
+
+    .sidebar-header h2 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #666;
+      margin-bottom: 0.6rem;
+    }
+
+    .sidebar-header label {
+      display: block;
+      padding: 0.5rem;
+      background: #0f3460;
+      border: 1px dashed #1a5276;
+      border-radius: 6px;
+      text-align: center;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: border-color 0.2s;
+    }
+
+    .sidebar-header label:hover {
+      border-color: #e94560;
+    }
+
+    .sidebar-header label input { display: none; }
+
+    .profile-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.5rem;
+    }
+
+    .profile-item {
+      display: flex;
+      align-items: center;
+      padding: 0.6rem 0.8rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s;
+      margin-bottom: 2px;
+    }
+
+    .profile-item:hover {
+      background: #1a2a4a;
+    }
+
+    .profile-item.active {
+      background: #0f3460;
+    }
+
+    .profile-item-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .profile-item-name {
+      font-size: 0.85rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .profile-item-meta {
+      font-size: 0.7rem;
+      color: #666;
+    }
+
+    .profile-item-delete {
+      background: none;
+      border: none;
+      color: #666;
+      cursor: pointer;
+      font-size: 0.8rem;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      width: auto;
+      transition: color 0.15s;
+    }
+
+    .profile-item-delete:hover {
+      color: #e94560;
+    }
+
+    .profile-empty {
+      text-align: center;
+      color: #444;
+      font-size: 0.8rem;
+      padding: 2rem 1rem;
+    }
+
+    /* Main panel */
+    .main {
+      flex: 1;
+      display: flex;
       flex-direction: column;
       align-items: center;
+      justify-content: center;
       padding: 2rem;
     }
 
     h1 {
       font-size: 1.8rem;
-      margin-bottom: 0.3rem;
+      margin-bottom: 0.2rem;
       color: #fff;
     }
 
     .subtitle {
-      color: #888;
-      font-size: 0.9rem;
+      color: #666;
+      font-size: 0.85rem;
       margin-bottom: 2rem;
     }
 
@@ -36,21 +150,21 @@
       border-radius: 12px;
       padding: 1.5rem;
       width: 100%;
-      max-width: 500px;
+      max-width: 440px;
       margin-bottom: 1rem;
     }
 
     .card h2 {
-      font-size: 0.85rem;
+      font-size: 0.75rem;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: #888;
+      letter-spacing: 0.1em;
+      color: #666;
       margin-bottom: 1rem;
     }
 
     label.file-label {
       display: block;
-      padding: 0.8rem 1rem;
+      padding: 0.7rem 1rem;
       background: #0f3460;
       border: 2px dashed #1a5276;
       border-radius: 8px;
@@ -58,89 +172,129 @@
       cursor: pointer;
       transition: border-color 0.2s, background 0.2s;
       margin-bottom: 0.8rem;
+      font-size: 0.9rem;
     }
 
-    label.file-label:hover {
-      border-color: #e94560;
-      background: #1a2a4a;
-    }
+    label.file-label:hover { border-color: #e94560; background: #1a2a4a; }
+    label.file-label input { display: none; }
 
-    label.file-label input {
-      display: none;
+    label.file-label.disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      pointer-events: none;
     }
 
     button {
       width: 100%;
-      padding: 0.8rem;
+      padding: 0.7rem;
       border: none;
       border-radius: 8px;
-      font-size: 1rem;
+      font-size: 0.95rem;
       cursor: pointer;
       background: #0f3460;
       color: #e0e0e0;
       transition: background 0.2s;
     }
 
-    button:hover:not(:disabled) {
-      background: #e94560;
-    }
+    button:hover:not(:disabled) { background: #e94560; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.active { background: #e94560; }
 
-    button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-
-    button.active {
-      background: #e94560;
-    }
-
-    #status {
-      margin-top: 1.5rem;
-      padding: 0.8rem 1rem;
+    /* Model info */
+    .model-info-panel {
       background: #0a0a1a;
       border-radius: 8px;
-      font-size: 0.9rem;
+      padding: 0.8rem 1rem;
+      margin-bottom: 1rem;
+      width: 100%;
+      max-width: 440px;
+      font-size: 0.8rem;
+      color: #888;
+      display: none;
+    }
+
+    .model-info-panel.visible { display: block; }
+
+    .model-info-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.15rem 0;
+    }
+
+    .model-info-label { color: #555; }
+
+    /* Status */
+    #status {
+      padding: 0.7rem 1rem;
+      background: #0a0a1a;
+      border-radius: 8px;
+      font-size: 0.85rem;
       text-align: center;
       width: 100%;
-      max-width: 500px;
+      max-width: 440px;
     }
 
-    #status.error {
-      color: #e94560;
-      border: 1px solid #e94560;
+    #status.error { color: #e94560; border: 1px solid #e94560; }
+
+    /* Processing mode badge */
+    .badge {
+      display: inline-block;
+      font-size: 0.65rem;
+      padding: 0.15rem 0.4rem;
+      border-radius: 3px;
+      background: #1a5276;
+      color: #aaa;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }
 
-    #model-info {
-      font-size: 0.85rem;
-      color: #888;
-      text-align: center;
-      margin-top: 0.5rem;
-    }
+    .badge.worklet { background: #0a5c2a; color: #6fcf97; }
   </style>
 </head>
 <body>
-  <h1>NAM Web</h1>
-  <p class="subtitle">Neural Amp Modeler in the browser via Rust + WebAssembly</p>
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h2>Model Library</h2>
+      <label>
+        + Import .nam file
+        <input type="file" id="model-input" accept=".nam">
+      </label>
+    </div>
+    <div class="profile-list" id="profile-list">
+      <div class="profile-empty">No models saved yet.<br>Import a .nam file above.</div>
+    </div>
+  </aside>
 
-  <div class="card">
-    <h2>1. Load Model</h2>
-    <label class="file-label">
-      Choose .nam file
-      <input type="file" id="model-input" accept=".nam">
-    </label>
-  </div>
+  <main class="main">
+    <h1>NAM Web</h1>
+    <p class="subtitle">Neural Amp Modeler in the browser</p>
 
-  <div class="card">
-    <h2>2. Audio Input</h2>
-    <label class="file-label">
-      Play audio file
-      <input type="file" id="audio-input" accept=".wav,.mp3,.ogg,.flac" disabled>
-    </label>
-    <button id="mic-toggle" disabled>Enable Mic</button>
-  </div>
+    <div class="model-info-panel" id="model-info-panel">
+      <div class="model-info-row">
+        <span class="model-info-label">Model</span>
+        <span id="info-name">—</span>
+      </div>
+      <div class="model-info-row">
+        <span class="model-info-label">Sample Rate</span>
+        <span id="info-sr">—</span>
+      </div>
+      <div class="model-info-row">
+        <span class="model-info-label">Processing</span>
+        <span id="info-mode">—</span>
+      </div>
+    </div>
 
-  <div id="status">Load a .nam model to begin.</div>
-  <div id="model-info"></div>
+    <div class="card">
+      <h2>Audio Input</h2>
+      <label class="file-label disabled" id="audio-label">
+        Play audio file
+        <input type="file" id="audio-input" accept=".wav,.mp3,.ogg,.flac" disabled>
+      </label>
+      <button id="mic-toggle" disabled>Enable Mic</button>
+    </div>
+
+    <div id="status">Loading WASM...</div>
+  </main>
 
   <script type="module" src="main.js"></script>
 </body>
