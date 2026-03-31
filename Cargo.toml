@@ -1,5 +1,5 @@
 [workspace]
-members = ["nam-core", "nam-cli", "nam-plugin", "nam-trainer", "xtask"]
+members = ["nam-core", "nam-cli", "nam-plugin", "nam-trainer", "nam-wasm", "xtask"]
 resolver = "2"
 
 [profile.release]
