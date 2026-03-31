@@ -2,6 +2,12 @@
 /upstream-core
 /upstream-trainer
 
+# WASM build artifacts
+nam-wasm/pkg/
+nam-wasm/pkg-no-modules/
+nam-web/pkg/
+nam-web/pkg-no-modules/
+
 # Training output artifacts (checkpoints, logs, plots)
 nam-trainer/test_data/test_output/
 
