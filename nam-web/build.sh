@@ -4,12 +4,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-echo "Building nam-wasm (no-modules target)..."
-wasm-pack build "$ROOT_DIR/nam-wasm" --target no-modules --release --out-dir pkg-no-modules
+echo "Building nam-wasm..."
+wasm-pack build "$ROOT_DIR/nam-wasm" --target web --release
 
 echo "Copying package to nam-web..."
-rm -rf "$SCRIPT_DIR/pkg-no-modules"
-cp -r "$ROOT_DIR/nam-wasm/pkg-no-modules" "$SCRIPT_DIR/pkg-no-modules"
+rm -rf "$SCRIPT_DIR/pkg"
+cp -r "$ROOT_DIR/nam-wasm/pkg" "$SCRIPT_DIR/pkg"
 
 echo ""
 echo "Done. To run the demo:"

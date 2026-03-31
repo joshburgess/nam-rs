@@ -1,9 +1,14 @@
 // main.js — Main thread NAM Web Audio controller
+// Uses ScriptProcessorNode for initial demo (runs WASM on main thread).
+// Will migrate to AudioWorklet once the raw WASM instantiation is sorted out.
+
+import init, { NamModel } from './pkg/nam_wasm.js';
 
 let audioContext = null;
-let workletNode = null;
+let processorNode = null;
 let sourceNode = null;
 let micStream = null;
+let model = null;
 
 const status = document.getElementById('status');
 const modelInfo = document.getElementById('model-info');
@@ -16,43 +21,39 @@ function setStatus(msg, isError = false) {
   status.className = isError ? 'error' : '';
 }
 
-async function ensureAudioContext() {
-  if (audioContext) return;
+// Initialize WASM on page load
+setStatus('Loading WASM...');
+init().then(() => {
+  setStatus('WASM loaded. Select a .nam model file.');
+}).catch((err) => {
+  setStatus(`WASM init failed: ${err.message}`, true);
+});
 
+function ensureAudioContext() {
+  if (audioContext) return audioContext;
   audioContext = new AudioContext({ latencyHint: 'interactive' });
+  return audioContext;
+}
 
-  // Add worklet module (this loads the JS glue via importScripts inside the worklet)
-  await audioContext.audioWorklet.addModule('worklet/nam-processor.js');
+function ensureProcessor() {
+  if (processorNode) return processorNode;
 
-  // Create worklet node
-  workletNode = new AudioWorkletNode(audioContext, 'nam-processor', {
-    numberOfInputs: 1,
-    numberOfOutputs: 1,
-    outputChannelCount: [1],
-  });
-  workletNode.connect(audioContext.destination);
+  const ctx = ensureAudioContext();
+  const bufferSize = 512;
 
-  // Listen for messages from the worklet
-  workletNode.port.onmessage = (e) => {
-    const { type } = e.data;
-    if (type === 'wasm-ready') {
-      setStatus('WASM loaded. Select a .nam model file.');
-    } else if (type === 'model-ready') {
-      setStatus('Model ready. Load audio or enable mic input.');
-      modelInfo.textContent = `Model sample rate: ${e.data.sampleRate} Hz`;
-      audioInput.disabled = false;
-      micButton.disabled = false;
-    } else if (type === 'error') {
-      setStatus(e.data.message, true);
-    }
+  // ScriptProcessorNode runs on the main thread — not ideal for production
+  // but reliable for initial testing
+  processorNode = ctx.createScriptProcessor(bufferSize, 1, 1);
+  processorNode.onaudioprocess = (e) => {
+    if (!model) return;
+
+    const input = e.inputBuffer.getChannelData(0);
+    const output = e.outputBuffer.getChannelData(0);
+    model.process(input, output);
   };
+  processorNode.connect(ctx.destination);
 
-  // Compile and send WASM module to worklet
-  setStatus('Loading WASM...');
-  const wasmResponse = await fetch('pkg-no-modules/nam_wasm_bg.wasm');
-  const wasmBytes = await wasmResponse.arrayBuffer();
-  const compiledModule = await WebAssembly.compile(wasmBytes);
-  workletNode.port.postMessage({ type: 'init-wasm', module: compiledModule });
+  return processorNode;
 }
 
 // Model file loading
@@ -61,13 +62,31 @@ modelInput.addEventListener('change', async (e) => {
   if (!file) return;
 
   setStatus(`Loading model: ${file.name}...`);
-  await ensureAudioContext();
 
-  const bytes = await file.arrayBuffer();
-  workletNode.port.postMessage(
-    { type: 'load-model', modelBytes: bytes },
-    [bytes],
-  );
+  try {
+    const bytes = await file.arrayBuffer();
+    const data = new Uint8Array(bytes);
+
+    // Free previous model
+    if (model) {
+      model.free();
+      model = null;
+    }
+
+    model = new NamModel(data);
+
+    const ctx = ensureAudioContext();
+    const sr = model.sample_rate() || ctx.sampleRate;
+    model.reset(sr, 512);
+    model.prewarm();
+
+    setStatus('Model ready. Load audio or enable mic input.');
+    modelInfo.textContent = `Model sample rate: ${sr} Hz`;
+    audioInput.disabled = false;
+    micButton.disabled = false;
+  } catch (err) {
+    setStatus(`Model load failed: ${err.message}`, true);
+  }
 });
 
 // Audio file playback
@@ -75,27 +94,33 @@ audioInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
 
-  await ensureAudioContext();
+  ensureAudioContext();
+  ensureProcessor();
   stopSource();
 
   setStatus('Decoding audio...');
-  const arrayBuffer = await file.arrayBuffer();
-  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
-  sourceNode = audioContext.createBufferSource();
-  sourceNode.buffer = audioBuffer;
-  sourceNode.connect(workletNode);
-  sourceNode.onended = () => {
-    setStatus('Playback finished.');
-    sourceNode = null;
-  };
-  sourceNode.start();
-  setStatus(`Playing: ${file.name}`);
+    sourceNode = audioContext.createBufferSource();
+    sourceNode.buffer = audioBuffer;
+    sourceNode.connect(processorNode);
+    sourceNode.onended = () => {
+      setStatus('Playback finished.');
+      sourceNode = null;
+    };
+    sourceNode.start();
+    setStatus(`Playing: ${file.name}`);
+  } catch (err) {
+    setStatus(`Audio decode failed: ${err.message}`, true);
+  }
 });
 
 // Mic input
 micButton.addEventListener('click', async () => {
-  await ensureAudioContext();
+  ensureAudioContext();
+  ensureProcessor();
 
   if (micStream) {
     stopSource();
@@ -119,7 +144,7 @@ micButton.addEventListener('click', async () => {
 
     stopSource();
     sourceNode = audioContext.createMediaStreamSource(micStream);
-    sourceNode.connect(workletNode);
+    sourceNode.connect(processorNode);
     micButton.textContent = 'Disable Mic';
     micButton.classList.add('active');
     setStatus('Mic active — playing through model.');
