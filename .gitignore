@@ -5,6 +5,9 @@
 # Training output artifacts (checkpoints, logs, plots)
 nam-trainer/test_data/test_output/
 
+# Internal working notes (plans, audits, inventories) — local only
+docs/internal/
+
 # IDE
 .idea/
 .vscode/
