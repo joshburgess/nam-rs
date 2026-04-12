@@ -613,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic report — run explicitly with: cargo test -p nam-core -- --ignored
     fn test_print_all_diffs() {
         let models = [
             "wavenet",
@@ -651,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // diagnostic report — run explicitly with: cargo test -p nam-core -- --ignored
     fn test_a2_max_divergence_profile() {
         let model_path = Path::new("test_fixtures/models/wavenet_a2_max.nam");
         let input_path = Path::new("test_fixtures/audio/test_input.wav");
