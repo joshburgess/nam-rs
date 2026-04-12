@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-arm64
+            trainer_bin: nam-trainer
+          - os: windows-latest
+            platform: windows-x86_64
+            trainer_bin: nam-trainer.exe
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            trainer_bin: nam-trainer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Bundle plugin
+        run: cargo xtask bundle nam-plugin --release
+
+      - name: Build trainer
+        run: cargo build --release -p nam-trainer
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p release-staging
+          cp "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}${{ matrix.trainer_bin == 'nam-trainer.exe' && '.exe' || '' }}"
+          cd target/bundled
+          for plugin in *.clap *.vst3; do
+            [ -e "$plugin" ] || continue
+            ext="${plugin##*.}"
+            zip -r "../../release-staging/nam-plugin-${{ matrix.platform }}-${ext}.zip" "$plugin"
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-staging/
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/*
