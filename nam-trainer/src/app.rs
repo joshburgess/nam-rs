@@ -76,6 +76,8 @@ pub enum PythonStatus {
     VersionTooOld {
         version: String,
     },
+    /// Python executable not found or not a real Python (e.g. Windows Store alias).
+    NotFound,
     Error(String),
 }
 
@@ -376,9 +378,21 @@ impl TrainerApp {
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    PythonStatus::Error(format!("Python error: {}", stderr.lines().next().unwrap_or("unknown")))
+                    let stderr_lower = stderr.to_lowercase();
+                    // Windows Store alias and similar "not a real Python" cases
+                    if stderr_lower.contains("was not found")
+                        || stderr_lower.contains("not recognized")
+                        || stderr_lower.contains("not found")
+                    {
+                        PythonStatus::NotFound
+                    } else {
+                        PythonStatus::Error(format!(
+                            "Python error: {}",
+                            stderr.lines().next().unwrap_or("unknown")
+                        ))
+                    }
                 }
-                Err(e) => PythonStatus::Error(format!("Cannot run '{}': {}", python, e)),
+                Err(_) => PythonStatus::NotFound,
             };
             let _ = tx.send(status);
         });

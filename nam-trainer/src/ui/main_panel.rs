@@ -484,6 +484,18 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     app.install_python();
                 }
             }
+            crate::app::PythonStatus::NotFound => {
+                let clicked = ui
+                    .button("Install Python")
+                    .on_hover_text(
+                        "Downloads and installs Miniforge (Python 3.12+) to ~/miniforge3",
+                    )
+                    .clicked();
+                ui.colored_label(RED, "Python not found");
+                if clicked {
+                    app.install_python();
+                }
+            }
             crate::app::PythonStatus::Error(msg) => {
                 if msg.contains("not installed") {
                     let clicked = ui
