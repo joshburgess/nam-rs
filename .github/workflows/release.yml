@@ -69,11 +69,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path release-staging | Out-Null
           Copy-Item "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}.exe"
-          Get-ChildItem -Path "target/bundled/*" -Include "*.clap", "*.vst3" | ForEach-Object {
-            $ext = $_.Extension.TrimStart('.')
-            $dest = "release-staging/nam-plugin-${{ matrix.platform }}-$ext.zip"
-            Compress-Archive -Path $_.FullName -DestinationPath $dest -Force
-          }
+          Compress-Archive -Path "target/bundled/nam-plugin.clap" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-clap.zip" -Force
+          Compress-Archive -Path "target/bundled/nam-plugin.vst3" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-vst3.zip" -Force
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
