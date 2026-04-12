@@ -1,3 +1,10 @@
+// The C-style FFI section below uses `static mut MODEL` because WASM modules
+// in an AudioWorklet run on a single thread with a single linear memory, so
+// there's no concurrent-access hazard. Rust's 2024 `static_mut_refs` lint
+// fires on shared/unique references to mutable statics in general — allow it
+// here where we've audited the single-threaded invariant.
+#![allow(static_mut_refs)]
+
 use wasm_bindgen::prelude::*;
 
 // ── wasm-bindgen API (used by main thread via ES module import) ────────────
@@ -62,24 +69,30 @@ pub extern "C" fn nam_alloc(size: usize, align: usize) -> *mut u8 {
 }
 
 /// Free a previous allocation.
+///
+/// # Safety
+/// `ptr`, `size`, and `align` must match a prior `nam_alloc` call.
 #[no_mangle]
-pub extern "C" fn nam_dealloc(ptr: *mut u8, size: usize, align: usize) {
+pub unsafe extern "C" fn nam_dealloc(ptr: *mut u8, size: usize, align: usize) {
     let layout = std::alloc::Layout::from_size_align(size, align).unwrap();
-    unsafe { std::alloc::dealloc(ptr, layout) }
+    std::alloc::dealloc(ptr, layout)
 }
 
 /// Load a model from JSON bytes already in WASM memory.
 /// Returns 0 on success, 1 on error.
+///
+/// # Safety
+/// `json_ptr` must point to `json_len` valid bytes in WASM linear memory.
 #[no_mangle]
-pub extern "C" fn nam_load(json_ptr: *const u8, json_len: usize) -> i32 {
-    let json_bytes = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
+pub unsafe extern "C" fn nam_load(json_ptr: *const u8, json_len: usize) -> i32 {
+    let json_bytes = std::slice::from_raw_parts(json_ptr, json_len);
     let json_str = match std::str::from_utf8(json_bytes) {
         Ok(s) => s,
         Err(_) => return 1,
     };
     match nam_core::get_dsp_from_json(json_str) {
         Ok(dsp) => {
-            unsafe { MODEL = Some(dsp) };
+            MODEL = Some(dsp);
             0
         }
         Err(_) => 1,
@@ -108,14 +121,16 @@ pub extern "C" fn nam_prewarm() {
 
 /// Process audio. Input and output pointers must point to `len` f32 values
 /// already allocated in WASM linear memory.
+///
+/// # Safety
+/// `input_ptr` and `output_ptr` must point to `len` valid f32 values in WASM
+/// linear memory. The two regions must not alias.
 #[no_mangle]
-pub extern "C" fn nam_process(input_ptr: *const f32, output_ptr: *mut f32, len: usize) {
-    unsafe {
-        if let Some(ref mut m) = MODEL {
-            let input = std::slice::from_raw_parts(input_ptr, len);
-            let output = std::slice::from_raw_parts_mut(output_ptr, len);
-            m.process(input, output);
-        }
+pub unsafe extern "C" fn nam_process(input_ptr: *const f32, output_ptr: *mut f32, len: usize) {
+    if let Some(ref mut m) = MODEL {
+        let input = std::slice::from_raw_parts(input_ptr, len);
+        let output = std::slice::from_raw_parts_mut(output_ptr, len);
+        m.process(input, output);
     }
 }
 

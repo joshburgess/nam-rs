@@ -1,3 +1,12 @@
+// `Sample` is a type alias that resolves to `f64` by default and `f32` under
+// the `float_io` feature (used by `nam-wasm`). Several internal buffers are
+// always `f32`, so the crate contains `value as f32` casts that are real
+// narrowing conversions in the default config but no-ops when `float_io` is
+// enabled. Clippy can only see the currently-compiled config and flags the
+// no-op cases as `unnecessary_cast`, which is a false positive for this
+// feature-aliased pattern — allow it crate-wide.
+#![allow(clippy::unnecessary_cast)]
+
 pub mod activations;
 pub mod convnet;
 pub mod dsp;

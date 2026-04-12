@@ -1,3 +1,9 @@
+// `nam_core::Sample` aliases to `f32` under the `float_io` feature (enabled by
+// `nam-wasm`) and `f64` otherwise. Writing a `Sample` as `f32` to a hound
+// writer is a real narrowing conversion under the default config and a no-op
+// when `float_io` is active — clippy flags the no-op case as a false positive.
+#![allow(clippy::unnecessary_cast)]
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
