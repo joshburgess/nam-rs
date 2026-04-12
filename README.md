@@ -164,7 +164,7 @@ The remaining gap after algorithmic fixes was caused by Rust's strict IEEE 754 f
 
 The C code is trivial — the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is under 300 lines. The performance comes from the compiler flag, not the language.
 
-**What we tried that didn't help:**
+**What I tried that didn't help:**
 
 - **LLVM `-enable-unsafe-fp-math` flag** — Rust's frontend generates more conservative IR than C's frontend, so the backend flag alone doesn't replicate `-ffast-math`. No measurable improvement.
 - **Apple Accelerate / BLAS** — dispatch overhead for BLAS routines exceeded the compute time for NAM's small matrices (8x16, 4x1). Pure Rust `matrixmultiply` was faster.
@@ -177,15 +177,15 @@ The C code is trivial — the same loops that exist in the Rust implementation, 
 
 Nearly every float operation in the hot path now goes through C code compiled with `-ffast-math`, so compiler flags are no longer the primary difference. The remaining gap is architectural:
 
-1. **Eigen expression templates eliminate intermediate buffers.** In C++, Eigen can write `z = conv_output + mixin_output` and the compiler sees it as one fused operation — no intermediate buffer is ever materialized. In our code, even with C kernels, we write the Conv1d output to one buffer, write the mixin output to another, then call a C function to combine them into a third. That's three separate buffers and two memory passes where Eigen does one. This applies to every step in the pipeline.
+1. **Eigen expression templates eliminate intermediate buffers.** In C++, Eigen can write `z = conv_output + mixin_output` and the compiler sees it as one fused operation — no intermediate buffer is ever materialized. In my code, even with C kernels, I write the Conv1d output to one buffer, write the mixin output to another, then call a C function to combine them into a third. That's three separate buffers and two memory passes where Eigen does one. This applies to every step in the pipeline.
 
-2. **Monolithic compilation vs. compositional architecture.** Our code has separate structs for Conv1d, Conv1x1, and FiLM, with method calls between them. Each method call is a function boundary the optimizer can't see across, especially across the Rust/C FFI boundary. Eigen compiles the entire layer pipeline as one function body where the optimizer sees everything and can keep intermediate values in registers across operations.
+2. **Monolithic compilation vs. compositional architecture.** My code has separate structs for Conv1d, Conv1x1, and FiLM, with method calls between them. Each method call is a function boundary the optimizer can't see across, especially across the Rust/C FFI boundary. Eigen compiles the entire layer pipeline as one function body where the optimizer sees everything and can keep intermediate values in registers across operations.
 
-3. **FFI call overhead is minor but measurable.** Each C kernel call has a small fixed cost (~5-10ns). For the a2_max model with its nested condition_dsp WaveNet, there are roughly 200+ C kernel calls per 64-sample buffer. However, [empirical testing](https://github.com/joshburgess/nam-rs/tree/feature/monolithic-c-layer) showed that eliminating these calls by fusing the post-convolution pipeline into a single C function produced no measurable improvement — the overhead is only ~0.4% of total runtime.
+3. **FFI call overhead is minor but measurable.** Each C kernel call has a small fixed cost (~5-10ns). For the a2_max model with its nested condition_dsp WaveNet, there are roughly 200+ C kernel calls per 64-sample buffer. However, empirical testing showed that eliminating these calls by fusing the post-convolution pipeline into a single C function produced no measurable improvement — the overhead is only ~0.4% of total runtime.
 
 ### What it would take to close the gap completely
 
-We tested the monolithic C approach on the [`feature/monolithic-c-layer`](https://github.com/joshburgess/nam-rs/tree/feature/monolithic-c-layer) branch, fusing the entire post-convolution pipeline (add + activate + layer1x1 + residual + head) into a single C function to eliminate intermediate buffers and FFI overhead. Two variants were tried:
+I tested a monolithic C approach that fused the entire post-convolution pipeline (add + activate + layer1x1 + residual + head) into a single C function to eliminate intermediate buffers and FFI overhead. Two variants were tried:
 
 1. **Monolithic function** with all FiLM/gating/head parameters: **8–11% regression**. The large parameter list and conditional branches caused register pressure, defeating the compiler's ability to optimize each individual loop.
 2. **Focused per-gating-mode functions** (ungated/gated/blended) with no FiLM, minimal parameters, keeping z in stack registers: **0% change** (within noise). The theoretical FFI overhead savings is only ~0.4% of total runtime (~300ns out of ~70µs for the standard model), far too small to measure.

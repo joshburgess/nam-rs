@@ -69,11 +69,11 @@ PGO, LTO, and codegen-units=1 all made things worse. The workload is dominated b
 
 ### 4. tanh is not the bottleneck
 
-Despite C++ getting 1.5-2x speedup from fast_tanh, in our Rust implementation tanh only accounts for ~11% of total time. The difference is that C++ Eigen's GEMM is so fast that tanh becomes a significant fraction of the remaining time, while our GEMM is slower so it dominates.
+Despite C++ getting 1.5-2x speedup from fast_tanh, in my Rust implementation tanh only accounts for ~11% of total time. The difference is that C++ Eigen's GEMM is so fast that tanh becomes a significant fraction of the remaining time, while my GEMM is slower so it dominates.
 
 ### 5. Small models match or beat C++
 
-For models with channels ≤ 8 (small WaveNet, LSTM), our scalar dot-product loops are competitive with or faster than C++. The gap only appears at channels ≥ 16 where Eigen's SIMD micro-kernels have a significant advantage.
+For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loops are competitive with or faster than C++. The gap only appears at channels ≥ 16 where Eigen's SIMD micro-kernels have a significant advantage.
 
 ## What would close the remaining gap
 
