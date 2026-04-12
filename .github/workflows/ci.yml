@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Override .cargo/config.toml's target-cpu=native which can crash on CI runners
+  CARGO_BUILD_RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
 
 jobs:
   test:
