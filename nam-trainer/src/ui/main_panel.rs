@@ -80,15 +80,13 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
         // Output audio
         ui.horizontal(|ui| {
-            let btn = egui::Button::new("Output Audio...")
-                .min_size(egui::vec2(BUTTON_WIDTH, 0.0));
+            let btn = egui::Button::new("Output Audio...").min_size(egui::vec2(BUTTON_WIDTH, 0.0));
             if ui.add(btn).clicked() {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("WAV files", &["wav"])
                     .pick_files()
                 {
-                    app.output_paths =
-                        paths.iter().map(|p| p.display().to_string()).collect();
+                    app.output_paths = paths.iter().map(|p| p.display().to_string()).collect();
                 }
             }
             match app.output_paths.len() {
@@ -108,8 +106,8 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
         // Destination
         ui.horizontal(|ui| {
-            let btn = egui::Button::new("Output Directory...")
-                .min_size(egui::vec2(BUTTON_WIDTH, 0.0));
+            let btn =
+                egui::Button::new("Output Directory...").min_size(egui::vec2(BUTTON_WIDTH, 0.0));
             if ui.add(btn).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     let p = path.display().to_string();
@@ -150,11 +148,7 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     ui.label("Device:");
                     ui.add_space(4.0);
                     for dev in devices {
-                        ui.selectable_value(
-                            &mut app.selected_device,
-                            dev.id.clone(),
-                            &dev.name,
-                        );
+                        ui.selectable_value(&mut app.selected_device, dev.id.clone(), &dev.name);
                     }
                 });
             }
@@ -209,11 +203,7 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 for entry in &discovered {
                     let label = format!("{} ({})", entry.label, entry.path);
                     if ui
-                        .selectable_value(
-                            &mut app.python_path,
-                            entry.path.clone(),
-                            label,
-                        )
+                        .selectable_value(&mut app.python_path, entry.path.clone(), label)
                         .changed()
                     {
                         changed = true;
@@ -239,44 +229,33 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
         }
 
         // Management buttons
-        let not_installing =
-            !matches!(app.install_state, crate::app::InstallState::Installing(_));
+        let not_installing = !matches!(app.install_state, crate::app::InstallState::Installing(_));
         if not_installing {
-            let miniforge_dir = home_dir()
-                .map(|h| h.join("miniforge3"))
-                .unwrap_or_default();
+            let miniforge_dir = home_dir().map(|h| h.join("miniforge3")).unwrap_or_default();
             let has_miniforge = miniforge_dir.exists();
             let has_nam = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
 
             if has_miniforge || has_nam {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if has_miniforge
-                                && ui
-                                    .small_button("Uninstall Miniforge")
-                                    .on_hover_text(format!(
-                                        "Removes {}",
-                                        miniforge_dir.display()
-                                    ))
-                                    .clicked()
-                            {
-                                app.uninstall_miniforge();
-                            }
-                            if has_nam
-                                && ui
-                                    .small_button("Uninstall NAM")
-                                    .on_hover_text(
-                                        "Runs: pip uninstall neural-amp-modeler",
-                                    )
-                                    .clicked()
-                            {
-                                app.uninstall_nam();
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if has_miniforge
+                            && ui
+                                .small_button("Uninstall Miniforge")
+                                .on_hover_text(format!("Removes {}", miniforge_dir.display()))
+                                .clicked()
+                        {
+                            app.uninstall_miniforge();
+                        }
+                        if has_nam
+                            && ui
+                                .small_button("Uninstall NAM")
+                                .on_hover_text("Runs: pip uninstall neural-amp-modeler")
+                                .clicked()
+                        {
+                            app.uninstall_nam();
+                        }
+                    });
                 });
             }
         }
@@ -300,32 +279,24 @@ fn show_install_log(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         crate::app::InstallAction::InstallingPython => "Installing Python",
                         crate::app::InstallAction::InstallingNam => "Installing NAM",
                         crate::app::InstallAction::UninstallingNam => "Uninstalling NAM",
-                        crate::app::InstallAction::UninstallingMiniforge => {
-                            "Removing Miniforge"
-                        }
+                        crate::app::InstallAction::UninstallingMiniforge => "Removing Miniforge",
                     },
                     _ => "Setup",
                 };
                 ui.strong(header);
-                if matches!(
-                    app.install_state,
-                    crate::app::InstallState::Installing(_)
-                ) {
+                if matches!(app.install_state, crate::app::InstallState::Installing(_)) {
                     ui.add(egui::Spinner::new().color(AMBER));
                 }
                 if matches!(
                     app.install_state,
                     crate::app::InstallState::Done | crate::app::InstallState::Failed
                 ) {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("Dismiss").clicked() {
-                                app.install_log.clear();
-                                app.install_state = crate::app::InstallState::Idle;
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Dismiss").clicked() {
+                            app.install_log.clear();
+                            app.install_state = crate::app::InstallState::Idle;
+                        }
+                    });
                 }
             });
             ui.add_space(2.0);
@@ -344,9 +315,8 @@ fn show_install_log(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
 fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
     let env_ready = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
-    let no_active_install =
-        !matches!(app.install_state, crate::app::InstallState::Installing(_))
-            && app.install_log.is_empty();
+    let no_active_install = !matches!(app.install_state, crate::app::InstallState::Installing(_))
+        && app.install_log.is_empty();
 
     if env_ready && no_active_install {
         ui.add_space(SECTION_GAP + 2.0);
@@ -354,11 +324,9 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
         match &app.training_state {
             TrainingState::Idle => {
                 let can_train = app.can_train();
-                let btn_text = egui::RichText::new("Train")
-                    .size(16.0)
-                    .strong();
-                let btn = egui::Button::new(btn_text)
-                    .min_size(egui::vec2(ui.available_width(), 34.0));
+                let btn_text = egui::RichText::new("Train").size(16.0).strong();
+                let btn =
+                    egui::Button::new(btn_text).min_size(egui::vec2(ui.available_width(), 34.0));
 
                 if ui.add_enabled(can_train, btn).clicked() {
                     start_training(app);
@@ -382,10 +350,8 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
             TrainingState::Training => {
                 ui.horizontal(|ui| {
-                    let cancel_btn = egui::Button::new(
-                        egui::RichText::new("Cancel").color(RED),
-                    )
-                    .min_size(egui::vec2(100.0, 32.0));
+                    let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").color(RED))
+                        .min_size(egui::vec2(100.0, 32.0));
                     if ui.add(cancel_btn).clicked() {
                         if let Some(ref mut w) = app.worker {
                             w.cancel();
@@ -426,9 +392,7 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
     // Hidden demo mode: Ctrl+Shift+D triggers a simulated training run
     if app.training_state == TrainingState::Idle
-        && ui.input(|i| {
-            i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D)
-        })
+        && ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D))
     {
         app.start_demo_training();
     }
@@ -458,7 +422,9 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 ui.spinner();
                 ui.colored_label(DIM, "Checking Python...");
             }
-            crate::app::PythonStatus::Ok { version, devices, .. } => {
+            crate::app::PythonStatus::Ok {
+                version, devices, ..
+            } => {
                 let best = devices
                     .iter()
                     .find(|d| d.id.starts_with("cuda") || d.id == "mps")

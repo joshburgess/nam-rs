@@ -42,8 +42,9 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
                     ui.end_row();
 
                     // Batch size
-                    ui.label("Batch size:")
-                        .on_hover_text("Samples per training step (reduce if running out of memory)");
+                    ui.label("Batch size:").on_hover_text(
+                        "Samples per training step (reduce if running out of memory)",
+                    );
                     let mut bs_str = app.config.batch_size.to_string();
                     if ui
                         .add(egui::TextEdit::singleline(&mut bs_str).desired_width(80.0))
@@ -56,8 +57,9 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
                     ui.end_row();
 
                     // Latency
-                    ui.label("Reamp latency:")
-                        .on_hover_text("Sample delay between input and output. Leave blank for auto-detection.");
+                    ui.label("Reamp latency:").on_hover_text(
+                        "Sample delay between input and output. Leave blank for auto-detection.",
+                    );
                     let mut lat_str = app
                         .config
                         .latency

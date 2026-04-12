@@ -21,10 +21,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 let current = app.epoch_history.last().map(|e| e.epoch).unwrap_or(0);
                 let total = app.config.epochs;
                 let fraction = current as f32 / total.max(1) as f32;
-                ui.add(
-                    egui::ProgressBar::new(fraction)
-                        .text(format!("{current}/{total} epochs")),
-                );
+                ui.add(egui::ProgressBar::new(fraction).text(format!("{current}/{total} epochs")));
 
                 // Stats row
                 if let Some(last) = app.epoch_history.last() {
@@ -106,10 +103,7 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
         .name("Val loss")
         .color(AMBER)
         .width(1.5);
-    let esr_line = Line::new(esr_points)
-        .name("ESR")
-        .color(GREEN)
-        .width(2.0);
+    let esr_line = Line::new(esr_points).name("ESR").color(GREEN).width(2.0);
 
     Plot::new("loss_plot")
         .height(height)

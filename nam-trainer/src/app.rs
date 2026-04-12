@@ -322,9 +322,7 @@ impl TrainerApp {
 
                         // Check Python version meets minimum
                         let version_ok = parse_version_tuple(&version)
-                            .map(|(maj, min)| {
-                                (maj, min) >= NAM_MIN_PYTHON
-                            })
+                            .map(|(maj, min)| (maj, min) >= NAM_MIN_PYTHON)
                             .unwrap_or(false);
 
                         if !version_ok {
@@ -345,10 +343,12 @@ impl TrainerApp {
                                         })
                                         .collect()
                                 })
-                                .unwrap_or_else(|| vec![TrainingDevice {
-                                    id: "cpu".into(),
-                                    name: "CPU".into(),
-                                }]);
+                                .unwrap_or_else(|| {
+                                    vec![TrainingDevice {
+                                        id: "cpu".into(),
+                                        name: "CPU".into(),
+                                    }]
+                                });
 
                             let warnings: Vec<String> = val
                                 .get("warnings")
@@ -367,9 +367,7 @@ impl TrainerApp {
                                     warnings,
                                 }
                             } else {
-                                PythonStatus::Error(
-                                    "NAM not installed".into(),
-                                )
+                                PythonStatus::Error("NAM not installed".into())
                             }
                         }
                     } else {
@@ -483,7 +481,9 @@ impl TrainerApp {
             let mut dl_child = match dl {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!("Failed to start download: {e}")));
+                    let _ = tx.send(InstallMessage::Log(format!(
+                        "Failed to start download: {e}"
+                    )));
                     let _ = tx.send(InstallMessage::Done { success: false });
                     return;
                 }
@@ -505,7 +505,9 @@ impl TrainerApp {
             let _ = tx.send(InstallMessage::Log("Download complete.".into()));
 
             // Step 2: Run installer in batch mode
-            let _ = tx.send(InstallMessage::Log(format!("Installing to {install_dir}...")));
+            let _ = tx.send(InstallMessage::Log(format!(
+                "Installing to {install_dir}..."
+            )));
             let install = run_miniforge_installer(&installer_path, &install_dir);
 
             let mut inst_child = match install {
@@ -541,9 +543,7 @@ impl TrainerApp {
             )));
 
             // Send special done message with the new python path
-            let _ = tx.send(InstallMessage::PythonInstalled {
-                python_path,
-            });
+            let _ = tx.send(InstallMessage::PythonInstalled { python_path });
             let _ = tx.send(InstallMessage::Done { success: true });
         });
     }
@@ -595,7 +595,8 @@ impl TrainerApp {
         self.install_rx = Some(rx);
         self.install_state = InstallState::Installing(InstallAction::UninstallingMiniforge);
         self.install_log.clear();
-        self.install_log.push("Removing ~/miniforge3 (includes NAM if installed there)...".into());
+        self.install_log
+            .push("Removing ~/miniforge3 (includes NAM if installed there)...".into());
 
         std::thread::spawn(move || {
             let home = home_dir_string();
@@ -614,16 +615,12 @@ impl TrainerApp {
                         let _ = tx.send(InstallMessage::Done { success: true });
                     }
                     Err(e) => {
-                        let _ = tx.send(InstallMessage::Log(format!(
-                            "Failed to remove: {e}"
-                        )));
+                        let _ = tx.send(InstallMessage::Log(format!("Failed to remove: {e}")));
                         let _ = tx.send(InstallMessage::Done { success: false });
                     }
                 }
             } else {
-                let _ = tx.send(InstallMessage::Log(
-                    "~/miniforge3 does not exist.".into(),
-                ));
+                let _ = tx.send(InstallMessage::Log("~/miniforge3 does not exist.".into()));
                 let _ = tx.send(InstallMessage::Done { success: true });
             }
         });
@@ -677,9 +674,7 @@ impl TrainerApp {
             let status = child.wait();
             let success = status.map(|s| s.success()).unwrap_or(false);
             if success {
-                let _ = tx.send(InstallMessage::Log(
-                    "NAM uninstalled successfully.".into(),
-                ));
+                let _ = tx.send(InstallMessage::Log("NAM uninstalled successfully.".into()));
             }
             let _ = tx.send(InstallMessage::Done { success });
         });
@@ -762,8 +757,10 @@ impl TrainerApp {
                     ));
                 }
                 WorkerMessage::TrainingComplete { model_path, esr } => {
-                    self.training_log
-                        .push(format!("Training complete! ESR={:.6} Model: {}", esr, model_path));
+                    self.training_log.push(format!(
+                        "Training complete! ESR={:.6} Model: {}",
+                        esr, model_path
+                    ));
                     self.training_state = TrainingState::Complete;
                     self.worker = None;
                 }
@@ -782,7 +779,6 @@ impl TrainerApp {
             }
         }
     }
-
 }
 
 // ── Platform helpers ────────────────────────────────────────────────────
@@ -828,10 +824,7 @@ fn miniforge_installer_info() -> (Option<&'static str>, &'static str) {
 }
 
 /// Download a file using curl (macOS/Linux) or PowerShell (Windows).
-fn download_file(
-    url: &str,
-    dest: &str,
-) -> Result<std::process::Child, std::io::Error> {
+fn download_file(url: &str, dest: &str) -> Result<std::process::Child, std::io::Error> {
     if cfg!(target_os = "windows") {
         std::process::Command::new("powershell")
             .args([

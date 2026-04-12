@@ -1,4 +1,3 @@
-
 use crate::activations::Activation;
 use crate::dsp::{Dsp, DspMetadata, Sample};
 use crate::error::NamError;
@@ -33,7 +32,11 @@ unsafe fn sgemm_colmajor(
         let c_slice = core::slice::from_raw_parts_mut(c, m * n);
 
         let a_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(a_slice, m, k);
-        let b_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(b_slice, b_col_stride as usize, n);
+        let b_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(
+            b_slice,
+            b_col_stride as usize,
+            n,
+        );
         // B may have stride > k (when input buffer has extra rows). Use only top k rows.
         let b_mat = b_mat.subrows(0, k);
         let c_mat = faer::mat::from_column_major_slice_mut::<f32, usize, usize>(c_slice, m, n);
@@ -427,16 +430,26 @@ impl Conv1x1 {
         #[cfg(not(feature = "fast-kernels"))]
         match (out_ch, in_ch) {
             (3, 3) => {
-                let w00 = w[0]; let w10 = w[1]; let w20 = w[2];
-                let w01 = w[3]; let w11 = w[4]; let w21 = w[5];
-                let w02 = w[6]; let w12 = w[7]; let w22 = w[8];
+                let w00 = w[0];
+                let w10 = w[1];
+                let w20 = w[2];
+                let w01 = w[3];
+                let w11 = w[4];
+                let w21 = w[5];
+                let w02 = w[6];
+                let w12 = w[7];
+                let w22 = w[8];
                 if let Some(ref b) = bias {
-                    let b0 = b[0]; let b1 = b[1]; let b2 = b[2];
+                    let b0 = b[0];
+                    let b1 = b[1];
+                    let b2 = b[2];
                     for f in 0..num_frames {
                         let ic = f * input_stride;
                         let oc = f * 3;
-                        let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
-                        out[oc]     = w00.mul_add(i0, w01.mul_add(i1, w02.mul_add(i2, b0)));
+                        let i0 = input_data[ic];
+                        let i1 = input_data[ic + 1];
+                        let i2 = input_data[ic + 2];
+                        out[oc] = w00.mul_add(i0, w01.mul_add(i1, w02.mul_add(i2, b0)));
                         out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12.mul_add(i2, b1)));
                         out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22.mul_add(i2, b2)));
                     }
@@ -444,21 +457,27 @@ impl Conv1x1 {
                     for f in 0..num_frames {
                         let ic = f * input_stride;
                         let oc = f * 3;
-                        let i0 = input_data[ic]; let i1 = input_data[ic + 1]; let i2 = input_data[ic + 2];
-                        out[oc]     = w00.mul_add(i0, w01.mul_add(i1, w02 * i2));
+                        let i0 = input_data[ic];
+                        let i1 = input_data[ic + 1];
+                        let i2 = input_data[ic + 2];
+                        out[oc] = w00.mul_add(i0, w01.mul_add(i1, w02 * i2));
                         out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12 * i2));
                         out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22 * i2));
                     }
                 }
             }
             (3, 1) => {
-                let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
+                let w0 = w[0];
+                let w1 = w[1];
+                let w2 = w[2];
                 if let Some(ref b) = bias {
-                    let b0 = b[0]; let b1 = b[1]; let b2 = b[2];
+                    let b0 = b[0];
+                    let b1 = b[1];
+                    let b2 = b[2];
                     for f in 0..num_frames {
                         let v = input_data[f * input_stride];
                         let oc = f * 3;
-                        out[oc]     = w0.mul_add(v, b0);
+                        out[oc] = w0.mul_add(v, b0);
                         out[oc + 1] = w1.mul_add(v, b1);
                         out[oc + 2] = w2.mul_add(v, b2);
                     }
@@ -466,26 +485,32 @@ impl Conv1x1 {
                     for f in 0..num_frames {
                         let v = input_data[f * input_stride];
                         let oc = f * 3;
-                        out[oc]     = w0 * v;
+                        out[oc] = w0 * v;
                         out[oc + 1] = w1 * v;
                         out[oc + 2] = w2 * v;
                     }
                 }
             }
             (1, 3) => {
-                let w0 = w[0]; let w1 = w[1]; let w2 = w[2];
+                let w0 = w[0];
+                let w1 = w[1];
+                let w2 = w[2];
                 if let Some(ref b) = bias {
                     let b0 = b[0];
                     for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        *o = w0.mul_add(input_data[ic], w1.mul_add(input_data[ic + 1],
-                            w2.mul_add(input_data[ic + 2], b0)));
+                        *o = w0.mul_add(
+                            input_data[ic],
+                            w1.mul_add(input_data[ic + 1], w2.mul_add(input_data[ic + 2], b0)),
+                        );
                     }
                 } else {
                     for (f, o) in out.iter_mut().enumerate().take(num_frames) {
                         let ic = f * input_stride;
-                        *o = w0.mul_add(input_data[ic], w1.mul_add(input_data[ic + 1],
-                            w2 * input_data[ic + 2]));
+                        *o = w0.mul_add(
+                            input_data[ic],
+                            w1.mul_add(input_data[ic + 1], w2 * input_data[ic + 2]),
+                        );
                     }
                 }
             }
@@ -500,7 +525,8 @@ impl Conv1x1 {
                             for o in 0..out_ch {
                                 let mut sum = b[o];
                                 for i in 0..in_ch {
-                                    sum = w[i * out_ch + o].mul_add(input_data[in_col_start + i], sum);
+                                    sum = w[i * out_ch + o]
+                                        .mul_add(input_data[in_col_start + i], sum);
                                 }
                                 out[out_col_start + o] = sum;
                             }
@@ -512,7 +538,8 @@ impl Conv1x1 {
                             for o in 0..out_ch {
                                 let mut sum = 0.0f32;
                                 for i in 0..in_ch {
-                                    sum = w[i * out_ch + o].mul_add(input_data[in_col_start + i], sum);
+                                    sum = w[i * out_ch + o]
+                                        .mul_add(input_data[in_col_start + i], sum);
                                 }
                                 out[out_col_start + o] = sum;
                             }
@@ -714,16 +741,21 @@ impl Conv1d {
                     // Large matrix: initialize with bias, then accumulate via sgemm
                     for f in 0..num_frames {
                         let off = f * out_ch;
-                        self.output_buf.data[off..off + out_ch]
-                            .copy_from_slice(&self.bias);
+                        self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
                     }
                     for k in 0..ks {
                         let w = &weights_colmajor[k];
                         unsafe {
                             sgemm_colmajor(
-                                out_ch, in_ch, num_frames,
-                                1.0, w.as_ptr(), tap_ptrs[k], in_ch as isize,
-                                1.0, self.output_buf.data.as_mut_ptr(),
+                                out_ch,
+                                in_ch,
+                                num_frames,
+                                1.0,
+                                w.as_ptr(),
+                                tap_ptrs[k],
+                                in_ch as isize,
+                                1.0,
+                                self.output_buf.data.as_mut_ptr(),
                             );
                         }
                     }
@@ -750,8 +782,7 @@ impl Conv1d {
                 if ch == 3 {
                     // 3-channel specialization: fully unrolled inner loop
                     for (k, tap_w) in dw.iter().enumerate() {
-                        let offset_signed: isize =
-                            dil as isize * (k as isize + 1 - ks as isize);
+                        let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
                         let w0 = tap_w[0];
@@ -759,22 +790,26 @@ impl Conv1d {
                         let w2 = tap_w[2];
                         for f in 0..num_frames {
                             let off = f * 3;
-                            self.output_buf.data[off] = w0.mul_add(tap_data[off], self.output_buf.data[off]);
-                            self.output_buf.data[off + 1] = w1.mul_add(tap_data[off + 1], self.output_buf.data[off + 1]);
-                            self.output_buf.data[off + 2] = w2.mul_add(tap_data[off + 2], self.output_buf.data[off + 2]);
+                            self.output_buf.data[off] =
+                                w0.mul_add(tap_data[off], self.output_buf.data[off]);
+                            self.output_buf.data[off + 1] =
+                                w1.mul_add(tap_data[off + 1], self.output_buf.data[off + 1]);
+                            self.output_buf.data[off + 2] =
+                                w2.mul_add(tap_data[off + 2], self.output_buf.data[off + 2]);
                         }
                     }
                 } else {
                     for (k, tap_w) in dw.iter().enumerate() {
-                        let offset_signed: isize =
-                            dil as isize * (k as isize + 1 - ks as isize);
+                        let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
                         let lookback = (-offset_signed) as usize;
                         let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
                         for f in 0..num_frames {
                             let col_start = f * ch;
                             for c in 0..ch {
-                                self.output_buf.data[col_start + c] =
-                                    tap_w[c].mul_add(tap_data[col_start + c], self.output_buf.data[col_start + c]);
+                                self.output_buf.data[col_start + c] = tap_w[c].mul_add(
+                                    tap_data[col_start + c],
+                                    self.output_buf.data[col_start + c],
+                                );
                             }
                         }
                     }
@@ -783,8 +818,7 @@ impl Conv1d {
             Conv1dWeights::General(weights_colmajor) => {
                 let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
                 for (k, w) in weights_colmajor.iter().enumerate() {
-                    let offset_signed: isize =
-                        dil as isize * (k as isize + 1 - ks as isize);
+                    let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
                     let lookback = (-offset_signed) as usize;
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
 
@@ -809,7 +843,8 @@ impl Conv1d {
                             for o in 0..out_ch {
                                 let mut sum = 0.0f32;
                                 for i in 0..in_ch {
-                                    sum = w[i * out_ch + o].mul_add(tap_data[in_col_start + i], sum);
+                                    sum =
+                                        w[i * out_ch + o].mul_add(tap_data[in_col_start + i], sum);
                                 }
                                 self.output_buf.data[out_col_start + o] += sum;
                             }
@@ -892,12 +927,7 @@ impl FiLM {
 
     /// Inner FiLM application with 3-channel specialization.
     #[inline]
-    fn apply_film_inner(
-        &mut self,
-        input_data: &[f32],
-        input_stride: usize,
-        num_frames: usize,
-    ) {
+    fn apply_film_inner(&mut self, input_data: &[f32], input_stride: usize, num_frames: usize) {
         let scale_shift = &self.cond_to_scale_shift.output_buf;
         let ss_rows = self.cond_to_scale_shift.out_channels;
         let dim = self.input_dim;
@@ -910,14 +940,22 @@ impl FiLM {
                         self.output_buf.data.as_mut_ptr(),
                         input_data.as_ptr(),
                         scale_shift.data.as_ptr(),
-                        dim, input_stride, dim, ss_rows, num_frames,
+                        dim,
+                        input_stride,
+                        dim,
+                        ss_rows,
+                        num_frames,
                     );
                 } else {
                     crate::fast_kernels::fast_film_scale(
                         self.output_buf.data.as_mut_ptr(),
                         input_data.as_ptr(),
                         scale_shift.data.as_ptr(),
-                        dim, input_stride, dim, ss_rows, num_frames,
+                        dim,
+                        input_stride,
+                        dim,
+                        ss_rows,
+                        num_frames,
                     );
                 }
             }
@@ -946,8 +984,10 @@ impl FiLM {
                     let ss_off = f * ss_rows;
                     let out_off = f * dim;
                     for i in 0..dim {
-                        self.output_buf.data[out_off + i] = input_data[in_off + i]
-                            .mul_add(scale_shift.data[ss_off + i], scale_shift.data[ss_off + dim + i]);
+                        self.output_buf.data[out_off + i] = input_data[in_off + i].mul_add(
+                            scale_shift.data[ss_off + i],
+                            scale_shift.data[ss_off + dim + i],
+                        );
                     }
                 }
             }
@@ -956,8 +996,7 @@ impl FiLM {
                 let in_off = f * input_stride;
                 let ss_off = f * ss_rows;
                 let out_off = f * 3;
-                self.output_buf.data[out_off] =
-                    input_data[in_off] * scale_shift.data[ss_off];
+                self.output_buf.data[out_off] = input_data[in_off] * scale_shift.data[ss_off];
                 self.output_buf.data[out_off + 1] =
                     input_data[in_off + 1] * scale_shift.data[ss_off + 1];
                 self.output_buf.data[out_off + 2] =
@@ -997,13 +1036,19 @@ impl FiLM {
                     crate::fast_kernels::fast_film_inplace_scale_shift(
                         target_data.as_mut_ptr(),
                         scale_shift.data.as_ptr(),
-                        dim, target_stride, ss_rows, num_frames,
+                        dim,
+                        target_stride,
+                        ss_rows,
+                        num_frames,
                     );
                 } else {
                     crate::fast_kernels::fast_film_inplace_scale(
                         target_data.as_mut_ptr(),
                         scale_shift.data.as_ptr(),
-                        dim, target_stride, ss_rows, num_frames,
+                        dim,
+                        target_stride,
+                        ss_rows,
+                        num_frames,
                     );
                 }
             }
@@ -1018,8 +1063,10 @@ impl FiLM {
                 let t_off = f * target_stride;
                 let ss_off = f * ss_rows;
                 for i in 0..dim {
-                    target_data[t_off + i] = target_data[t_off + i]
-                        .mul_add(scale_shift.data[ss_off + i], scale_shift.data[ss_off + dim + i]);
+                    target_data[t_off + i] = target_data[t_off + i].mul_add(
+                        scale_shift.data[ss_off + i],
+                        scale_shift.data[ss_off + dim + i],
+                    );
                 }
             }
         } else {
@@ -1403,7 +1450,8 @@ impl WaveNetLayer {
             }
             #[cfg(not(feature = "fast-kernels"))]
             for i in 0..z_len {
-                self.z_buf.data[i] = self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
+                self.z_buf.data[i] =
+                    self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
             }
         }
 
@@ -1445,8 +1493,12 @@ impl WaveNetLayer {
                         unsafe {
                             crate::fast_kernels::fast_gated_activation(
                                 self.z_buf.data.as_mut_ptr(),
-                                z_rows, bottleneck, num_frames,
-                                p, s, use_fast as i32,
+                                z_rows,
+                                bottleneck,
+                                num_frames,
+                                p,
+                                s,
+                                use_fast as i32,
                             );
                         }
                     } else {
@@ -1455,10 +1507,16 @@ impl WaveNetLayer {
                         for f in 0..num_frames {
                             let z_off = f * z_rows;
                             for c in 0..bottleneck {
-                                let primary = self.activation
-                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + c], c, use_fast);
-                                let gate = self.secondary_activation
-                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
+                                let primary = self.activation.apply_scalar_channel_fast(
+                                    self.z_buf.data[z_off + c],
+                                    c,
+                                    use_fast,
+                                );
+                                let gate = self.secondary_activation.apply_scalar_channel_fast(
+                                    self.z_buf.data[z_off + bottleneck + c],
+                                    c,
+                                    use_fast,
+                                );
                                 self.z_buf.data[z_off + c] = primary * gate;
                             }
                         }
@@ -1466,19 +1524,23 @@ impl WaveNetLayer {
                 }
                 #[cfg(not(feature = "fast-kernels"))]
                 {
-                let use_fast = crate::util::is_fast_tanh_enabled();
-                for f in 0..num_frames {
-                    let z_off = f * z_rows;
-                    for c in 0..bottleneck {
-                        let primary = self
-                            .activation
-                            .apply_scalar_channel_fast(self.z_buf.data[z_off + c], c, use_fast);
-                        let gate = self
-                            .secondary_activation
-                            .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
-                        self.z_buf.data[z_off + c] = primary * gate;
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        for c in 0..bottleneck {
+                            let primary = self.activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + c],
+                                c,
+                                use_fast,
+                            );
+                            let gate = self.secondary_activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + bottleneck + c],
+                                c,
+                                use_fast,
+                            );
+                            self.z_buf.data[z_off + c] = primary * gate;
+                        }
                     }
-                }
                 }
 
                 // activation_post_film on topRows(bottleneck)
@@ -1511,8 +1573,12 @@ impl WaveNetLayer {
                         unsafe {
                             crate::fast_kernels::fast_blended_activation(
                                 self.z_buf.data.as_mut_ptr(),
-                                z_rows, bottleneck, num_frames,
-                                p, s, use_fast as i32,
+                                z_rows,
+                                bottleneck,
+                                num_frames,
+                                p,
+                                s,
+                                use_fast as i32,
                             );
                         }
                     } else {
@@ -1521,28 +1587,39 @@ impl WaveNetLayer {
                             let z_off = f * z_rows;
                             for c in 0..bottleneck {
                                 let pre_act = self.z_buf.data[z_off + c];
-                                let activated = self.activation.apply_scalar_channel_fast(pre_act, c, use_fast);
-                                let alpha = self.secondary_activation
-                                    .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
-                                self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
+                                let activated = self
+                                    .activation
+                                    .apply_scalar_channel_fast(pre_act, c, use_fast);
+                                let alpha = self.secondary_activation.apply_scalar_channel_fast(
+                                    self.z_buf.data[z_off + bottleneck + c],
+                                    c,
+                                    use_fast,
+                                );
+                                self.z_buf.data[z_off + c] =
+                                    alpha * activated + (1.0 - alpha) * pre_act;
                             }
                         }
                     }
                 }
                 #[cfg(not(feature = "fast-kernels"))]
                 {
-                let use_fast = crate::util::is_fast_tanh_enabled();
-                for f in 0..num_frames {
-                    let z_off = f * z_rows;
-                    for c in 0..bottleneck {
-                        let pre_act = self.z_buf.data[z_off + c];
-                        let activated = self.activation.apply_scalar_channel_fast(pre_act, c, use_fast);
-                        let alpha = self
-                            .secondary_activation
-                            .apply_scalar_channel_fast(self.z_buf.data[z_off + bottleneck + c], c, use_fast);
-                        self.z_buf.data[z_off + c] = alpha * activated + (1.0 - alpha) * pre_act;
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        for c in 0..bottleneck {
+                            let pre_act = self.z_buf.data[z_off + c];
+                            let activated = self
+                                .activation
+                                .apply_scalar_channel_fast(pre_act, c, use_fast);
+                            let alpha = self.secondary_activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + bottleneck + c],
+                                c,
+                                use_fast,
+                            );
+                            self.z_buf.data[z_off + c] =
+                                alpha * activated + (1.0 - alpha) * pre_act;
+                        }
                     }
-                }
                 } // end cfg(not(fast-kernels))
 
                 // activation_post_film
@@ -1802,19 +1879,19 @@ impl WaveNetLayerArray {
                 }
                 #[cfg(not(feature = "fast-kernels"))]
                 {
-                let dst = &mut self.head_inputs.data;
-                let mut j = 0;
-                while j + 3 < total {
-                    dst[j] += head_data[j];
-                    dst[j + 1] += head_data[j + 1];
-                    dst[j + 2] += head_data[j + 2];
-                    dst[j + 3] += head_data[j + 3];
-                    j += 4;
-                }
-                while j < total {
-                    dst[j] += head_data[j];
-                    j += 1;
-                }
+                    let dst = &mut self.head_inputs.data;
+                    let mut j = 0;
+                    while j + 3 < total {
+                        dst[j] += head_data[j];
+                        dst[j + 1] += head_data[j + 1];
+                        dst[j + 2] += head_data[j + 2];
+                        dst[j + 3] += head_data[j + 3];
+                        j += 4;
+                    }
+                    while j < total {
+                        dst[j] += head_data[j];
+                        j += 1;
+                    }
                 } // end cfg(not(fast-kernels))
             } else {
                 // Different strides: per-frame copy
@@ -2302,7 +2379,11 @@ impl WaveNet {
         // For single-channel output (typical NAM): data is contiguous
         if out_ch == 1 {
             let scale = self.head_scale;
-            for (o, &h) in output.iter_mut().zip(final_head.data.iter()).take(num_frames) {
+            for (o, &h) in output
+                .iter_mut()
+                .zip(final_head.data.iter())
+                .take(num_frames)
+            {
                 *o = (scale * h) as Sample;
             }
         } else {
@@ -2471,7 +2552,10 @@ impl Activation {
                     let use_fast = crate::util::is_fast_tanh_enabled();
                     unsafe {
                         crate::fast_kernels::fast_activation_inplace(
-                            data.as_mut_ptr(), len, act_id, use_fast as i32,
+                            data.as_mut_ptr(),
+                            len,
+                            act_id,
+                            use_fast as i32,
                         );
                     }
                     return;
@@ -3032,7 +3116,11 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        assert!(result.is_ok(), "Legacy kernel_size int should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Legacy kernel_size int should parse: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -3042,20 +3130,24 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        assert!(result.is_ok(), "Per-layer kernel_sizes should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Per-layer kernel_sizes should parse: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_kernel_size_mutual_exclusivity() {
         // Providing both kernel_size and kernel_sizes should error
-        let (config_str, weights) = make_kernel_size_config(
-            r#""kernel_size": 3, "kernel_sizes": [2, 3, 5]"#,
-            3,
-        );
+        let (config_str, weights) =
+            make_kernel_size_config(r#""kernel_size": 3, "kernel_sizes": [2, 3, 5]"#, 3);
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        let err = result.err().expect("Both kernel_size and kernel_sizes should be rejected");
+        let err = result
+            .err()
+            .expect("Both kernel_size and kernel_sizes should be rejected");
         let err_msg = format!("{}", err);
         assert!(
             err_msg.contains("only one of"),
@@ -3071,7 +3163,9 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        let err = result.err().expect("Mismatched kernel_sizes length should be rejected");
+        let err = result
+            .err()
+            .expect("Mismatched kernel_sizes length should be rejected");
         let err_msg = format!("{}", err);
         assert!(
             err_msg.contains("must match"),
@@ -3124,7 +3218,11 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        assert!(result.is_ok(), "kernel_size as array should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "kernel_size as array should parse: {:?}",
+            result.err()
+        );
         let model = result.unwrap();
         // dilations [1, 2], kernel_sizes [2, 3]: RF = 1*(2-1) + 2*(3-1) = 5, prewarm = 1 + 5 = 6
         assert_eq!(model.prewarm_samples(), 6);
@@ -3229,7 +3327,15 @@ mod tests {
         // Frame 1 output:
         //   ch0: w[0]*prev[ch0] + w[1]*now[ch0] = 1*1 + 2*0 = 1
         //   ch1: w[0]*prev[ch1] + w[1]*now[ch1] = 3*0 + 4*1 = 4
-        assert!((conv.output_buf.data[0] - 1.0).abs() < 1e-6, "ch0: {}", conv.output_buf.data[0]);
-        assert!((conv.output_buf.data[1] - 4.0).abs() < 1e-6, "ch1: {}", conv.output_buf.data[1]);
+        assert!(
+            (conv.output_buf.data[0] - 1.0).abs() < 1e-6,
+            "ch0: {}",
+            conv.output_buf.data[0]
+        );
+        assert!(
+            (conv.output_buf.data[1] - 4.0).abs() < 1e-6,
+            "ch1: {}",
+            conv.output_buf.data[1]
+        );
     }
 }

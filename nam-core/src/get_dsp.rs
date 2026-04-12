@@ -627,7 +627,10 @@ mod tests {
         for name in models {
             if let Some((max_diff, rms_diff)) = regression_compare(name) {
                 any = true;
-                report.push_str(&format!("{:<30} max_diff={:.2e}  rms_diff={:.2e}\n", name, max_diff, rms_diff));
+                report.push_str(&format!(
+                    "{:<30} max_diff={:.2e}  rms_diff={:.2e}\n",
+                    name, max_diff, rms_diff
+                ));
             }
         }
         if any {
@@ -637,7 +640,13 @@ mod tests {
             let input_exists = Path::new("test_fixtures/audio/test_input.wav").exists();
             let model_exists = Path::new("test_fixtures/models/wavenet.nam").exists();
             let ref_exists = Path::new("test_fixtures/audio/wavenet_cpp_ref.wav").exists();
-            panic!("\n\nNo test fixtures found! cwd={}\ninput={} model={} ref={}\n", cwd.display(), input_exists, model_exists, ref_exists);
+            panic!(
+                "\n\nNo test fixtures found! cwd={}\ninput={} model={} ref={}\n",
+                cwd.display(),
+                input_exists,
+                model_exists,
+                ref_exists
+            );
         }
     }
 
@@ -660,7 +669,8 @@ mod tests {
         let chunk_size = 64;
         let mut output = Vec::with_capacity(input_samples.len());
         for chunk in input_samples.chunks(chunk_size) {
-            let input: Vec<crate::dsp::Sample> = chunk.iter().map(|&s| s as crate::dsp::Sample).collect();
+            let input: Vec<crate::dsp::Sample> =
+                chunk.iter().map(|&s| s as crate::dsp::Sample).collect();
             let mut out_chunk = vec![0.0 as crate::dsp::Sample; input.len()];
             model.process(&input, &mut out_chunk);
             output.extend(out_chunk);
@@ -701,15 +711,25 @@ mod tests {
             if c < 10 || c == worst_chunk || c >= num_chunks - 5 {
                 report.push_str(&format!(
                     "{:<5} | {:>5}-{:<5} | {:.2e}  | {}\n",
-                    c, start, end - 1, max_diff, max_idx
+                    c,
+                    start,
+                    end - 1,
+                    max_diff,
+                    max_idx
                 ));
             } else if c == 10 {
                 report.push_str("...   | ...         | ...        | ...\n");
             }
         }
 
-        report.push_str(&format!("\nFirst non-zero divergence at chunk: {:?}\n", first_nonzero));
-        report.push_str(&format!("Worst chunk: {} (max_diff={:.2e})\n", worst_chunk, worst_chunk_diff));
+        report.push_str(&format!(
+            "\nFirst non-zero divergence at chunk: {:?}\n",
+            first_nonzero
+        ));
+        report.push_str(&format!(
+            "Worst chunk: {} (max_diff={:.2e})\n",
+            worst_chunk, worst_chunk_diff
+        ));
 
         // Also show the 10 worst individual samples
         let mut diffs: Vec<(usize, f64)> = (0..n)
