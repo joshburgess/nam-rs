@@ -308,6 +308,7 @@ impl TrainerApp {
             let script = include_str!("../python/detect_environment.py");
             let output = std::process::Command::new(&python)
                 .args(["-c", script])
+                .hide_console()
                 .output();
 
             let status = match output {
@@ -412,6 +413,7 @@ impl TrainerApp {
                 .args(["-m", "pip", "install", "neural-amp-modeler"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
+                .hide_console()
                 .spawn();
 
             let mut child = match result {
@@ -448,7 +450,10 @@ impl TrainerApp {
             .push("Installing Python via Miniforge...".into());
 
         let home = home_dir_string();
-        let install_dir = format!("{home}/miniforge3");
+        let install_dir = std::path::PathBuf::from(&home)
+            .join("miniforge3")
+            .to_string_lossy()
+            .into_owned();
 
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
@@ -653,6 +658,7 @@ impl TrainerApp {
                 .args(["-m", "pip", "uninstall", "-y", "neural-amp-modeler"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
+                .hide_console()
                 .spawn();
 
             let mut child = match result {
@@ -836,11 +842,13 @@ fn download_file(url: &str, dest: &str) -> Result<std::process::Child, std::io::
                 ),
             ])
             .stderr(std::process::Stdio::piped())
+            .hide_console()
             .spawn()
     } else {
         std::process::Command::new("curl")
             .args(["-fSL", "-o", dest, url])
             .stderr(std::process::Stdio::piped())
+            .hide_console()
             .spawn()
     }
 }
@@ -862,12 +870,14 @@ fn run_miniforge_installer(
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .hide_console()
             .spawn()
     } else {
         std::process::Command::new("bash")
             .args([installer_path, "-b", "-u", "-p", install_dir])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .hide_console()
             .spawn()
     }
 }
@@ -878,6 +888,28 @@ fn miniforge_python_path(install_dir: &str) -> String {
         format!("{install_dir}\\python.exe")
     } else {
         format!("{install_dir}/bin/python")
+    }
+}
+
+/// Chainable helper that suppresses the child console window on Windows.
+/// No-op on other platforms so call sites can be unconditional.
+pub(crate) trait HideConsoleExt {
+    fn hide_console(&mut self) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl HideConsoleExt for std::process::Command {
+    fn hide_console(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+}
+
+#[cfg(not(windows))]
+impl HideConsoleExt for std::process::Command {
+    fn hide_console(&mut self) -> &mut Self {
+        self
     }
 }
 

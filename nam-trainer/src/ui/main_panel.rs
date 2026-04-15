@@ -1,4 +1,4 @@
-use crate::app::TrainerApp;
+use crate::app::{HideConsoleExt, TrainerApp};
 use crate::worker::{self, TrainingState};
 
 // ── Color palette ───────────────────────────────────────────────────────
@@ -526,7 +526,11 @@ fn discover_pythons() -> Vec<PythonEntry> {
     let (which_cmd, candidates) = ("where", vec!["python", "python3"]);
 
     for name in &candidates {
-        if let Ok(output) = std::process::Command::new(which_cmd).arg(name).output() {
+        if let Ok(output) = std::process::Command::new(which_cmd)
+            .arg(name)
+            .hide_console()
+            .output()
+        {
             if output.status.success() {
                 // `where` on Windows can return multiple lines; take each one
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -541,6 +545,7 @@ fn discover_pythons() -> Vec<PythonEntry> {
                     if seen.insert(resolved) {
                         let version = std::process::Command::new(&path)
                             .args(["--version"])
+                            .hide_console()
                             .output()
                             .ok()
                             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

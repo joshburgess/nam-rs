@@ -5,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use crate::app::TrainerApp;
+use crate::app::{HideConsoleExt, TrainerApp};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TrainingState {
@@ -96,6 +96,7 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .hide_console()
             .spawn();
 
         let mut child = match result {
