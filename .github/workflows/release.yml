@@ -6,7 +6,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
+  # Override .cargo/config.toml's target-cpu=native so release binaries run on
+  # any x86_64 CPU, not just the GitHub runner's. Use RUSTFLAGS (higher Cargo
+  # precedence) rather than CARGO_BUILD_RUSTFLAGS so build.rustflags is fully
+  # replaced, not merged.
+  RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
 
 jobs:
   build:
