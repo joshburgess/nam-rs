@@ -25,7 +25,10 @@ jobs:
           - os: windows-latest
             platform: windows-x86_64
             trainer_bin: nam-trainer.exe
-          - os: ubuntu-latest
+          # Pin to 22.04 (glibc 2.35) instead of ubuntu-latest (24.04, glibc
+          # 2.39) so the binary runs on Debian bookworm, RHEL 9, and older
+          # LTS Ubuntus without hitting GLIBC_2.38-not-found errors.
+          - os: ubuntu-22.04
             platform: linux-x86_64
             trainer_bin: nam-trainer
     steps:
@@ -35,7 +38,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev xvfb
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -53,6 +56,43 @@ jobs:
 
       - name: Build trainer
         run: cargo build --release -p nam-trainer
+
+      # Smoke test: launch the trainer binary, wait 5 seconds, and verify it's
+      # still alive. Catches crashes on startup (SIGILL from bad codegen,
+      # missing dynamic libraries, panic during eframe::run_native, config
+      # path crashes, etc). macOS is skipped because the GitHub-hosted macOS
+      # runner has no login session with WindowServer access, so AppKit
+      # can't initialize.
+      - name: Smoke test trainer (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          xvfb-run -a bash -c '
+            ./target/release/${{ matrix.trainer_bin }} &
+            pid=$!
+            sleep 5
+            if kill -0 $pid 2>/dev/null; then
+              kill $pid
+              echo "Trainer stayed alive for 5s"
+              exit 0
+            fi
+            echo "Trainer died before 5s"
+            wait $pid
+            exit 1
+          '
+
+      - name: Smoke test trainer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "target/release/${{ matrix.trainer_bin }}" -PassThru
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            Write-Host "Trainer died before 5s (exit code $($proc.ExitCode))"
+            exit 1
+          }
+          Stop-Process -Id $proc.Id -Force
+          Write-Host "Trainer stayed alive for 5s"
 
       - name: Package artifacts (Unix)
         if: runner.os != 'Windows'
