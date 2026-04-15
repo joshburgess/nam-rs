@@ -61,9 +61,10 @@ jobs:
       # Smoke test: launch the trainer binary, wait 5 seconds, and verify it's
       # still alive. Catches crashes on startup (SIGILL from bad codegen,
       # missing dynamic libraries, panic during eframe::run_native, config
-      # path crashes, etc). macOS is skipped because the GitHub-hosted macOS
-      # runner has no login session with WindowServer access, so AppKit
-      # can't initialize.
+      # path crashes, etc). macOS and Windows are skipped because the
+      # GitHub-hosted runners lack a proper desktop session (no WindowServer
+      # on macOS, no GPU/OpenGL context on Windows Server), so eframe's
+      # wgpu/glow backend fails to initialize. Linux works via xvfb.
       - name: Smoke test trainer (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -81,19 +82,6 @@ jobs:
             wait $pid
             exit 1
           '
-
-      - name: Smoke test trainer (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $proc = Start-Process -FilePath "target/release/${{ matrix.trainer_bin }}" -PassThru
-          Start-Sleep -Seconds 5
-          if ($proc.HasExited) {
-            Write-Host "Trainer died before 5s (exit code $($proc.ExitCode))"
-            exit 1
-          }
-          Stop-Process -Id $proc.Id -Force
-          Write-Host "Trainer stayed alive for 5s"
 
       - name: Package artifacts (Unix)
         if: runner.os != 'Windows'
