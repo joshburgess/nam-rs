@@ -115,15 +115,32 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
             let _ = writeln!(stdin, "{}", request_json);
         }
 
-        // Take stdout before storing child in the Arc
+        // Take stdout and stderr before storing child in the Arc
         let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
 
         // Store child in the shared Arc so the main thread can kill it
         if let Ok(mut guard) = child_arc_thread.lock() {
             *guard = Some(child);
         }
 
-        // Read stdout line by line
+        // Drain stderr in a background thread to prevent pipe buffer
+        // deadlock. PyTorch/Lightning write progress and warnings to
+        // stderr; on Windows the pipe buffer is 64KB and fills up over
+        // long training runs, blocking the Python process.
+        let tx_stderr = tx.clone();
+        let stderr_thread = stderr.map(|stderr| {
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        let _ = tx_stderr.send(WorkerMessage::Log(line));
+                    }
+                }
+            })
+        });
+
+        // Read stdout line by line (JSON protocol events)
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -151,6 +168,11 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
                     }
                 }
             }
+        }
+
+        // Wait for stderr drain to finish
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
         }
 
         // Wait for process to finish
