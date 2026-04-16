@@ -148,13 +148,22 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        let _ = tx_stderr.send(WorkerMessage::Log(line.clone()));
-                        if let Ok(mut buf) = last_stderr_writer.lock() {
-                            buf.push(line);
-                            if buf.len() > 20 {
-                                buf.remove(0);
-                            }
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    // Try to parse as a JSON protocol event first. The
+                    // worker falls back to stderr when stdout is broken
+                    // (e.g. after a CUDA crash), so training_failed
+                    // events may arrive here instead of stdout.
+                    let msg = match serde_json::from_str::<protocol::WorkerEvent>(&line) {
+                        Ok(event) => event_to_message(event),
+                        Err(_) => WorkerMessage::Log(line.clone()),
+                    };
+                    let _ = tx_stderr.send(msg);
+                    if let Ok(mut buf) = last_stderr_writer.lock() {
+                        buf.push(line);
+                        if buf.len() > 20 {
+                            buf.remove(0);
                         }
                     }
                 }

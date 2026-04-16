@@ -20,7 +20,13 @@ import traceback
 
 def emit(event: dict):
     """Write a JSON event to stdout and flush immediately."""
-    print(json.dumps(event), flush=True)
+    try:
+        print(json.dumps(event), flush=True)
+    except OSError:
+        # stdout pipe may be broken (e.g. after a CUDA crash corrupts
+        # process state). Fall back to stderr so the Rust side can still
+        # capture the message via the stderr drain thread.
+        print(json.dumps(event), file=sys.stderr, flush=True)
 
 
 def main():
