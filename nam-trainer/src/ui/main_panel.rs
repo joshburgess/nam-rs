@@ -138,25 +138,44 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
         });
 
-        // Device selector — only show when multiple devices available
-        if let crate::app::PythonStatus::Ok {
+        // Device selector — only show when multiple devices available.
+        // Clone out of python_status first so we can mutate `app` (e.g. to
+        // re-run detection from the warning's Re-check button) below.
+        let env_info = if let crate::app::PythonStatus::Ok {
             devices, warnings, ..
         } = &app.python_status
         {
+            Some((devices.clone(), warnings.clone()))
+        } else {
+            None
+        };
+        if let Some((devices, warnings)) = env_info {
             if devices.len() > 1 {
                 ui.horizontal(|ui| {
                     ui.label("Device:");
                     ui.add_space(4.0);
-                    for dev in devices {
+                    for dev in &devices {
                         ui.selectable_value(&mut app.selected_device, dev.id.clone(), &dev.name);
                     }
                 });
             }
 
-            // GPU warnings (e.g., NVIDIA hardware detected but PyTorch lacks CUDA)
-            for warning in warnings {
+            // GPU warnings (e.g., NVIDIA hardware detected but PyTorch lacks CUDA).
+            // Each warning gets a Re-check button so the user can refresh
+            // detection after manually reinstalling torch in a terminal.
+            for warning in &warnings {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(AMBER, format!("\u{26A0} {warning}"));
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button("Re-check environment")
+                        .on_hover_text("Re-run Python/PyTorch detection")
+                        .clicked()
+                    {
+                        app.python_status = crate::app::PythonStatus::Unknown;
+                        app.check_python();
+                    }
                 });
             }
         }
