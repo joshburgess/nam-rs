@@ -85,14 +85,14 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
 
     let request_json = serde_json::to_string(&request).unwrap_or_default();
     let python_path = app.python_path.clone();
-    let worker_script = find_worker_script();
+    let worker_script = include_str!("../../python/nam_worker.py");
 
     let child_arc: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let child_arc_thread = Arc::clone(&child_arc);
 
     thread::spawn(move || {
         let result = Command::new(&python_path)
-            .arg(&worker_script)
+            .args(["-c", worker_script])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -196,39 +196,6 @@ fn event_to_message(event: protocol::WorkerEvent) -> WorkerMessage {
         protocol::WorkerEvent::Error { message } => WorkerMessage::Error(message),
         protocol::WorkerEvent::Log { message } => WorkerMessage::Log(message),
     }
-}
-
-fn find_worker_script() -> String {
-    let candidates = [
-        // Next to the binary
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("python").join("nam_worker.py")))
-            .unwrap_or_default(),
-        // Development: binary is in target/debug/, project root is ../../
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| {
-                p.parent()?
-                    .parent()?
-                    .parent()
-                    .map(|d| d.join("nam-trainer").join("python").join("nam_worker.py"))
-            })
-            .unwrap_or_default(),
-        // CWD
-        std::env::current_dir()
-            .ok()
-            .map(|d| d.join("nam-trainer").join("python").join("nam_worker.py"))
-            .unwrap_or_default(),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.display().to_string();
-        }
-    }
-
-    "nam_worker.py".to_string()
 }
 
 fn non_empty(s: &str) -> Option<String> {

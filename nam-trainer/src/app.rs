@@ -928,14 +928,19 @@ fn run_miniforge_installer(
     install_dir: &str,
 ) -> Result<std::process::Child, std::io::Error> {
     if cfg!(target_os = "windows") {
-        // Windows .exe installer with /S (silent) /D=path (destination)
-        std::process::Command::new(installer_path)
+        // Run the NSIS installer through PowerShell with -WindowStyle Hidden
+        // so any sub-process console windows the installer spawns stay hidden.
+        // Direct invocation with CREATE_NO_WINDOW only hides the parent.
+        std::process::Command::new("powershell")
             .args([
-                "/S",
-                "/InstallationType=JustMe",
-                "/RegisterPython=0",
-                "/AddToPath=0",
-                &format!("/D={}", install_dir),
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!(
+                    "Start-Process -FilePath '{}' -ArgumentList '/S /InstallationType=JustMe /RegisterPython=0 /AddToPath=0 /D={}' -Wait -WindowStyle Hidden",
+                    installer_path, install_dir
+                ),
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
