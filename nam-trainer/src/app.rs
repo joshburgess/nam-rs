@@ -844,10 +844,15 @@ impl TrainerApp {
                     self.training_state = TrainingState::Error(err);
                     self.worker = None;
                 }
-                WorkerMessage::WorkerExited => {
+                WorkerMessage::WorkerExited { exit_code } => {
                     if self.training_state == TrainingState::Training {
-                        self.training_state =
-                            TrainingState::Error("Worker process exited unexpectedly".into());
+                        let msg = match exit_code {
+                            Some(code) => {
+                                format!("Worker process exited unexpectedly (exit code {code})")
+                            }
+                            None => "Worker process exited unexpectedly".into(),
+                        };
+                        self.training_state = TrainingState::Error(msg);
                     }
                     self.worker = None;
                 }

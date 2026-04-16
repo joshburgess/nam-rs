@@ -146,13 +146,15 @@ def main():
                 "model_path": model_path,
             })
 
-        except Exception as e:
+        except BaseException as e:
             emit({
                 "type": "training_failed",
                 "file": output_path,
                 "error": str(e),
             })
             emit({"type": "log", "message": traceback.format_exc()})
+            if isinstance(e, (SystemExit, KeyboardInterrupt)):
+                break
 
     emit({"type": "all_complete"})
 

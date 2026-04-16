@@ -29,7 +29,9 @@ pub enum WorkerMessage {
         esr: f64,
     },
     Error(String),
-    WorkerExited,
+    WorkerExited {
+        exit_code: Option<i32>,
+    },
 }
 
 pub struct WorkerHandle {
@@ -85,14 +87,24 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
 
     let request_json = serde_json::to_string(&request).unwrap_or_default();
     let python_path = app.python_path.clone();
-    let worker_script = include_str!("../../python/nam_worker.py");
 
     let child_arc: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let child_arc_thread = Arc::clone(&child_arc);
 
     thread::spawn(move || {
+        // Write the embedded worker script to a temp file so we can run it
+        // as `python /path/to/script.py` rather than `python -c "..."`.
+        // The -c form can have subtle encoding and import issues on Windows.
+        let script_path = std::env::temp_dir().join("nam_worker.py");
+        if let Err(e) = std::fs::write(&script_path, include_str!("../../python/nam_worker.py")) {
+            let _ = tx.send(WorkerMessage::Error(format!(
+                "Failed to write worker script: {e}"
+            )));
+            return;
+        }
+
         let result = Command::new(&python_path)
-            .args(["-c", worker_script])
+            .arg(script_path.as_os_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -127,14 +139,23 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
         // Drain stderr in a background thread to prevent pipe buffer
         // deadlock. PyTorch/Lightning write progress and warnings to
         // stderr; on Windows the pipe buffer is 64KB and fills up over
-        // long training runs, blocking the Python process.
+        // long training runs, blocking the Python process. Also collect
+        // the last few lines for diagnostics if the worker crashes.
+        let last_stderr: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let last_stderr_writer = Arc::clone(&last_stderr);
         let tx_stderr = tx.clone();
         let stderr_thread = stderr.map(|stderr| {
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
                     if !line.trim().is_empty() {
-                        let _ = tx_stderr.send(WorkerMessage::Log(line));
+                        let _ = tx_stderr.send(WorkerMessage::Log(line.clone()));
+                        if let Ok(mut buf) = last_stderr_writer.lock() {
+                            buf.push(line);
+                            if buf.len() > 20 {
+                                buf.remove(0);
+                            }
+                        }
                     }
                 }
             })
@@ -161,7 +182,6 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
                         }
                     }
                     Err(_) => {
-                        // Non-JSON line, treat as log output
                         if tx.send(WorkerMessage::Log(line)).is_err() {
                             break;
                         }
@@ -175,14 +195,37 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
             let _ = t.join();
         }
 
-        // Wait for process to finish
-        if let Ok(mut guard) = child_arc_thread.lock() {
+        // Wait for process to finish and capture exit code
+        let exit_code = if let Ok(mut guard) = child_arc_thread.lock() {
             if let Some(ref mut child) = *guard {
-                let _ = child.wait();
+                child.wait().ok().and_then(|s| s.code())
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        // If exit was non-zero and we never sent a completion/error event,
+        // include the last stderr lines to help diagnose the crash.
+        if exit_code.unwrap_or(0) != 0 {
+            if let Ok(buf) = last_stderr.lock() {
+                if !buf.is_empty() {
+                    let tail = buf.join("\n");
+                    let _ = tx.send(WorkerMessage::Error(format!(
+                        "Python exited with code {} — last output:\n{}",
+                        exit_code.unwrap_or(-1),
+                        tail
+                    )));
+                }
+            }
+        }
+
+        // Clean up the mutex before sending WorkerExited
+        if let Ok(mut guard) = child_arc_thread.lock() {
             *guard = None;
         }
-        let _ = tx.send(WorkerMessage::WorkerExited);
+        let _ = tx.send(WorkerMessage::WorkerExited { exit_code });
     });
 
     let handle = WorkerHandle { child: child_arc };
