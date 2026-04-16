@@ -160,16 +160,34 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 });
             }
 
-            // GPU warnings (e.g., NVIDIA hardware detected but PyTorch lacks CUDA).
-            // Each warning gets a Re-check button so the user can refresh
-            // detection after manually reinstalling torch in a terminal.
+            // GPU warnings (e.g., NVIDIA hardware detected but PyTorch lacks
+            // CUDA). The Install PyTorch button runs pip through the absolute
+            // Miniforge python path so PATH is irrelevant. Re-check is a
+            // secondary action for users who fixed their install some other way.
+            let cuda_install = app.cuda_install.clone();
+            let installing = matches!(app.install_state, crate::app::InstallState::Installing(_));
             for warning in &warnings {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(AMBER, format!("\u{26A0} {warning}"));
                 });
+            }
+            if !warnings.is_empty() {
                 ui.horizontal(|ui| {
+                    if let Some(ref ci) = cuda_install {
+                        let btn_text = format!("Install PyTorch with CUDA {}", ci.cuda_version);
+                        if ui
+                            .add_enabled(!installing, egui::Button::new(btn_text))
+                            .on_hover_text(format!(
+                                "Runs pip install torch --index-url {}",
+                                ci.wheel_index
+                            ))
+                            .clicked()
+                        {
+                            app.install_cuda_torch();
+                        }
+                    }
                     if ui
-                        .small_button("Re-check environment")
+                        .add_enabled(!installing, egui::Button::new("Re-check"))
                         .on_hover_text("Re-run Python/PyTorch detection")
                         .clicked()
                     {
@@ -297,6 +315,9 @@ fn show_install_log(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     crate::app::InstallState::Installing(action) => match action {
                         crate::app::InstallAction::InstallingPython => "Installing Python",
                         crate::app::InstallAction::InstallingNam => "Installing NAM",
+                        crate::app::InstallAction::InstallingCudaTorch => {
+                            "Installing PyTorch (CUDA)"
+                        }
                         crate::app::InstallAction::UninstallingNam => "Uninstalling NAM",
                         crate::app::InstallAction::UninstallingMiniforge => "Removing Miniforge",
                     },
@@ -431,6 +452,7 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
         let label = match action {
             crate::app::InstallAction::InstallingPython => "Installing Python...",
             crate::app::InstallAction::InstallingNam => "Installing NAM...",
+            crate::app::InstallAction::InstallingCudaTorch => "Installing PyTorch (CUDA)...",
             crate::app::InstallAction::UninstallingNam => "Uninstalling NAM...",
             crate::app::InstallAction::UninstallingMiniforge => "Removing Miniforge...",
         };

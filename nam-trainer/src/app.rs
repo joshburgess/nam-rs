@@ -38,7 +38,8 @@ pub struct TrainerApp {
     // Python discovery and environment status
     pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
     pub python_status: PythonStatus,
-    python_check_rx: Option<mpsc::Receiver<PythonStatus>>,
+    pub cuda_install: Option<CudaInstall>,
+    python_check_rx: Option<mpsc::Receiver<DetectionResult>>,
 
     // NAM install state
     pub install_state: InstallState,
@@ -58,8 +59,21 @@ pub enum InstallState {
 pub enum InstallAction {
     InstallingPython,
     InstallingNam,
+    InstallingCudaTorch,
     UninstallingNam,
     UninstallingMiniforge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CudaInstall {
+    pub cuda_version: String,
+    pub wheel_index: String,
+    pub gpu_names: Vec<String>,
+}
+
+pub struct DetectionResult {
+    pub status: PythonStatus,
+    pub cuda_install: Option<CudaInstall>,
 }
 
 /// Minimum Python version required by neural-amp-modeler.
@@ -288,6 +302,7 @@ impl TrainerApp {
             selected_device: "cpu".to_string(),
             discovered_pythons: None,
             python_status: PythonStatus::Unknown,
+            cuda_install: None,
             python_check_rx: None,
             install_state: InstallState::Idle,
             install_log: Vec::new(),
@@ -311,7 +326,7 @@ impl TrainerApp {
                 .hide_console()
                 .output();
 
-            let status = match output {
+            let result = match output {
                 Ok(out) if out.status.success() => {
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
@@ -321,12 +336,14 @@ impl TrainerApp {
                             .unwrap_or("unknown")
                             .to_string();
 
+                        let cuda_install = parse_cuda_install(&val);
+
                         // Check Python version meets minimum
                         let version_ok = parse_version_tuple(&version)
                             .map(|(maj, min)| (maj, min) >= NAM_MIN_PYTHON)
                             .unwrap_or(false);
 
-                        if !version_ok {
+                        let status = if !version_ok {
                             PythonStatus::VersionTooOld { version }
                         } else {
                             let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -370,16 +387,23 @@ impl TrainerApp {
                             } else {
                                 PythonStatus::Error("NAM not installed".into())
                             }
+                        };
+                        DetectionResult {
+                            status,
+                            cuda_install,
                         }
                     } else {
-                        PythonStatus::Error("Unexpected Python output".into())
+                        DetectionResult {
+                            status: PythonStatus::Error("Unexpected Python output".into()),
+                            cuda_install: None,
+                        }
                     }
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     let stderr_lower = stderr.to_lowercase();
                     // Windows Store alias and similar "not a real Python" cases
-                    if stderr_lower.contains("was not found")
+                    let status = if stderr_lower.contains("was not found")
                         || stderr_lower.contains("not recognized")
                         || stderr_lower.contains("not found")
                     {
@@ -389,53 +413,98 @@ impl TrainerApp {
                             "Python error: {}",
                             stderr.lines().next().unwrap_or("unknown")
                         ))
+                    };
+                    DetectionResult {
+                        status,
+                        cuda_install: None,
                     }
                 }
-                Err(_) => PythonStatus::NotFound,
+                Err(_) => DetectionResult {
+                    status: PythonStatus::NotFound,
+                    cuda_install: None,
+                },
             };
-            let _ = tx.send(status);
+            let _ = tx.send(result);
         });
     }
 
     /// Install neural-amp-modeler into the selected Python environment.
+    /// If an NVIDIA GPU was detected, installs a CUDA-enabled PyTorch wheel
+    /// first so the user gets a working GPU setup from a single button click.
     pub fn install_nam(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.install_rx = Some(rx);
         self.install_state = InstallState::Installing(InstallAction::InstallingNam);
         self.install_log.clear();
-        self.install_log
-            .push("Installing neural-amp-modeler...".into());
 
         let python = self.python_path.clone();
+        let cuda_install = self.cuda_install.clone();
 
         std::thread::spawn(move || {
-            let result = std::process::Command::new(&python)
-                .args(["-m", "pip", "install", "neural-amp-modeler"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .hide_console()
-                .spawn();
-
-            let mut child = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
+            if let Some(ref ci) = cuda_install {
+                let _ = tx.send(InstallMessage::Log(format!(
+                    "NVIDIA GPU detected ({}). Installing PyTorch with CUDA {} first...",
+                    ci.gpu_names.join(", "),
+                    ci.cuda_version,
+                )));
+                let torch_args = [
+                    "-m",
+                    "pip",
+                    "install",
+                    "torch",
+                    "--index-url",
+                    ci.wheel_index.as_str(),
+                ];
+                if !run_pip(&python, &torch_args, &tx) {
+                    let _ = tx.send(InstallMessage::Log(
+                        "PyTorch CUDA install failed. Aborting.".into(),
+                    ));
                     let _ = tx.send(InstallMessage::Done { success: false });
                     return;
                 }
-            };
-
-            // Stream stderr (pip writes progress there)
-            if let Some(stderr) = child.stderr.take() {
-                use std::io::{BufRead, BufReader};
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(InstallMessage::Log(line));
-                }
             }
 
-            let status = child.wait();
-            let success = status.map(|s| s.success()).unwrap_or(false);
+            let _ = tx.send(InstallMessage::Log(
+                "Installing neural-amp-modeler...".into(),
+            ));
+            let success = run_pip(
+                &python,
+                &["-m", "pip", "install", "neural-amp-modeler"],
+                &tx,
+            );
+            let _ = tx.send(InstallMessage::Done { success });
+        });
+    }
+
+    /// Reinstall PyTorch with CUDA support using the wheel index detected by
+    /// `detect_environment.py`. No-op if no CUDA install was detected.
+    pub fn install_cuda_torch(&mut self) {
+        let Some(ci) = self.cuda_install.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_state = InstallState::Installing(InstallAction::InstallingCudaTorch);
+        self.install_log.clear();
+        self.install_log.push(format!(
+            "Reinstalling PyTorch with CUDA {} for {}...",
+            ci.cuda_version,
+            ci.gpu_names.join(", "),
+        ));
+
+        let python = self.python_path.clone();
+        std::thread::spawn(move || {
+            let args = [
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "--force-reinstall",
+                "torch",
+                "--index-url",
+                ci.wheel_index.as_str(),
+            ];
+            let success = run_pip(&python, &args, &tx);
             let _ = tx.send(InstallMessage::Done { success });
         });
     }
@@ -927,9 +996,9 @@ fn parse_version_tuple(version: &str) -> Option<(u32, u32)> {
 impl TrainerApp {
     fn poll_python_check(&mut self) {
         if let Some(ref rx) = self.python_check_rx {
-            if let Ok(status) = rx.try_recv() {
+            if let Ok(result) = rx.try_recv() {
                 // Auto-select best device when status changes to Ok
-                if let PythonStatus::Ok { ref devices, .. } = status {
+                if let PythonStatus::Ok { ref devices, .. } = result.status {
                     let best = devices
                         .iter()
                         .find(|d| d.id.starts_with("cuda"))
@@ -939,11 +1008,65 @@ impl TrainerApp {
                         self.selected_device = dev.id.clone();
                     }
                 }
-                self.python_status = status;
+                self.python_status = result.status;
+                self.cuda_install = result.cuda_install;
                 self.python_check_rx = None;
             }
         }
     }
+}
+
+/// Run `python <args>` with stderr streamed to `tx` as install log lines.
+/// Returns true on exit-zero, false otherwise. Used by install_nam and
+/// install_cuda_torch to share streaming + error handling.
+fn run_pip(python: &str, args: &[&str], tx: &mpsc::Sender<InstallMessage>) -> bool {
+    let spawn_result = std::process::Command::new(python)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .hide_console()
+        .spawn();
+
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
+            return false;
+        }
+    };
+
+    if let Some(stderr) = child.stderr.take() {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(InstallMessage::Log(line));
+        }
+    }
+
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+fn parse_cuda_install(val: &serde_json::Value) -> Option<CudaInstall> {
+    let ci = val.get("cuda_install")?;
+    if ci.is_null() {
+        return None;
+    }
+    let cuda_version = ci.get("cuda_version")?.as_str()?.to_string();
+    let wheel_index = ci.get("wheel_index")?.as_str()?.to_string();
+    let gpu_names = ci
+        .get("gpu_names")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| n.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CudaInstall {
+        cuda_version,
+        wheel_index,
+        gpu_names,
+    })
 }
 
 impl eframe::App for TrainerApp {
