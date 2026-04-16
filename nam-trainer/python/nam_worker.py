@@ -17,6 +17,13 @@ import os
 import sys
 import traceback
 
+# Force matplotlib to use the non-interactive Agg backend BEFORE anything
+# imports it. The worker runs as a headless child process (CREATE_NO_WINDOW
+# on Windows), so GUI backends like TkAgg crash when they try to open a
+# display. This must happen before pytorch_lightning or nam import
+# matplotlib.
+os.environ["MPLBACKEND"] = "Agg"
+
 
 def emit(event: dict):
     """Write a JSON event to stdout and flush immediately."""
