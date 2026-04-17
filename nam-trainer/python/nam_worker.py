@@ -143,14 +143,26 @@ def main():
                 user_metadata=user_metadata,
             )
 
-            # Find the exported model path
-            model_path = os.path.join(destination, basename, f"{basename}.nam")
-            if not os.path.exists(model_path):
-                for root, dirs, files in os.walk(os.path.join(destination, basename)):
-                    for f in files:
-                        if f.endswith(".nam"):
-                            model_path = os.path.join(root, f)
-                            break
+            # Find the .nam file. core.train() puts it deep inside
+            # lightning_logs/version_N/checkpoints/. Search for it and
+            # copy to the output directory with a clean name.
+            train_dir = os.path.join(destination, basename)
+            found_nam = None
+            for root, dirs, files in os.walk(train_dir):
+                for f in files:
+                    if f.endswith(".nam"):
+                        found_nam = os.path.join(root, f)
+                        break
+                if found_nam:
+                    break
+
+            if found_nam:
+                import shutil
+                final_path = os.path.join(destination, f"{basename}.nam")
+                shutil.copy2(found_nam, final_path)
+                model_path = final_path
+            else:
+                model_path = os.path.join(train_dir, f"{basename}.nam")
 
             emit({
                 "type": "training_complete",
@@ -174,3 +186,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Replace stdout/stderr with devnull before interpreter shutdown so
+    # Python's atexit flush doesn't fail on the broken pipe and print
+    # "Exception ignored on flushing sys.stdout: OSError".
+    try:
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+    except OSError:
+        pass
