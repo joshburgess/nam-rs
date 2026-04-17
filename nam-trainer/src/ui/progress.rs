@@ -1,7 +1,7 @@
 use crate::app::TrainerApp;
 use egui_plot::{Line, Plot, PlotPoints};
 
-const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(255, 180, 60);
 const CYAN: egui::Color32 = egui::Color32::from_rgb(80, 180, 255);
 
 pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
@@ -28,7 +28,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     ui.horizontal(|ui| {
                         stat_label(ui, "Train", last.train_loss, CYAN);
                         ui.separator();
-                        stat_label(ui, "ESR", last.esr, GREEN);
+                        stat_label(ui, "ESR", last.esr, AMBER);
                     });
                 }
             }
@@ -106,7 +106,7 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
         .name("Train loss")
         .color(CYAN)
         .width(1.5);
-    let esr_line = Line::new(esr_points).name("ESR").color(GREEN).width(2.0);
+    let esr_line = Line::new(esr_points).name("ESR").color(AMBER).width(2.0);
 
     Plot::new("loss_plot")
         .height(height)

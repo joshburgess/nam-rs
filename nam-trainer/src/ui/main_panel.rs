@@ -34,6 +34,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 fn show_header(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("NAM Trainer").size(20.0).strong());
+        ui.colored_label(DIM, egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             show_status_badge(app, ui);
         });
@@ -62,6 +63,9 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
             if let Some(ref p) = app.input_path {
                 ui.colored_label(GREEN, "\u{2713}"); // checkmark
                 ui.label(file_name(p));
+                if let Some(info) = wav_info(p) {
+                    ui.colored_label(DIM, info);
+                }
             } else {
                 ui.colored_label(DIM, "No file selected");
             }
@@ -96,6 +100,9 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 1 => {
                     ui.colored_label(GREEN, "\u{2713}");
                     ui.label(file_name(&app.output_paths[0]));
+                    if let Some(info) = wav_info(&app.output_paths[0]) {
+                        ui.colored_label(DIM, info);
+                    }
                 }
                 n => {
                     ui.colored_label(GREEN, "\u{2713}");
@@ -738,6 +745,30 @@ fn truncate_path(path: &str, max_len: usize) -> String {
         path.to_string()
     } else {
         format!("...{}", &path[path.len() - max_len + 3..])
+    }
+}
+
+fn wav_info(path: &str) -> Option<String> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    let samples = reader.len() as f64;
+    let channels = spec.channels as f64;
+    let rate = spec.sample_rate as f64;
+    let duration = samples / channels / rate;
+
+    let rate_khz = spec.sample_rate as f64 / 1000.0;
+    let rate_str = if rate_khz == rate_khz.floor() {
+        format!("{}kHz", rate_khz as u32)
+    } else {
+        format!("{:.1}kHz", rate_khz)
+    };
+
+    if duration < 60.0 {
+        Some(format!("({}, {:.1}s)", rate_str, duration))
+    } else {
+        let mins = (duration / 60.0).floor() as u32;
+        let secs = (duration % 60.0).round() as u32;
+        Some(format!("({}, {}m {}s)", rate_str, mins, secs))
     }
 }
 

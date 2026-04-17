@@ -1427,6 +1427,35 @@ impl eframe::App for TrainerApp {
             }
         });
 
+        // Update window title with training progress
+        match &self.training_state {
+            TrainingState::Training => {
+                if let Some(last) = self.epoch_history.last() {
+                    let pct = (last.epoch as f32 / self.config.epochs.max(1) as f32 * 100.0) as u32;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                        "NAM Trainer - {}% (ESR: {:.4})",
+                        pct, last.esr
+                    )));
+                }
+            }
+            TrainingState::Complete => {
+                let esr_str = self
+                    .epoch_history
+                    .last()
+                    .map(|e| format!(" (ESR: {:.4})", e.esr))
+                    .unwrap_or_default();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                    "NAM Trainer - Complete{}",
+                    esr_str
+                )));
+            }
+            _ => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                    "NAM Trainer".to_string(),
+                ));
+            }
+        }
+
         // Request continuous repaints while training or installing
         let needs_repaint = self.training_state == TrainingState::Training
             || matches!(self.install_state, InstallState::Installing(_))
