@@ -56,6 +56,21 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
 fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
     ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Log").small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Save Log").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name("training_log.txt")
+                    .add_filter("Text files", &["txt"])
+                    .save_file()
+                {
+                    let content = app.training_log.join("\n");
+                    let _ = std::fs::write(path, content);
+                }
+            }
+        });
+    });
     egui::Frame::default()
         .fill(egui::Color32::from_rgb(20, 20, 25))
         .corner_radius(4.0)

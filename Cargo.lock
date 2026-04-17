@@ -2829,6 +2829,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "hound",
  "nam-core",
  "open",
  "rfd",

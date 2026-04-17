@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use std::time::Instant;
 
 use crate::settings::Settings;
 use crate::ui;
@@ -30,6 +31,11 @@ pub struct TrainerApp {
     // Batch training progress (file N of M)
     pub current_file_index: usize,
     pub total_files: usize,
+
+    // ETA tracking
+    pub training_start_time: Option<Instant>,
+    pub last_epoch_time: Option<Instant>,
+    pub avg_epoch_secs: Option<f64>,
 
     // Persistent settings
     pub settings: Settings,
@@ -180,6 +186,15 @@ impl Architecture {
             "feather" => Self::Feather,
             "nano" => Self::Nano,
             _ => Self::Standard,
+        }
+    }
+
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Standard => "Best quality, largest model, slowest to train (~30 min for 100 epochs on GPU)",
+            Self::Lite => "Good quality with faster training and smaller model size",
+            Self::Feather => "Lightweight model for low-latency use, trades some accuracy for speed",
+            Self::Nano => "Smallest and fastest model, best for quick tests or low-power devices",
         }
     }
 }
@@ -380,6 +395,9 @@ impl TrainerApp {
             model_path: None,
             current_file_index: 0,
             total_files: 0,
+            training_start_time: None,
+            last_epoch_time: None,
+            avg_epoch_secs: None,
             python_path: settings
                 .python_path
                 .clone()
@@ -939,6 +957,18 @@ impl TrainerApp {
                     val_loss,
                     esr,
                 } => {
+                    // Update ETA tracking
+                    let now = Instant::now();
+                    if let Some(last) = self.last_epoch_time {
+                        let elapsed = now.duration_since(last).as_secs_f64();
+                        // Exponential moving average for smoother estimates
+                        self.avg_epoch_secs = Some(match self.avg_epoch_secs {
+                            Some(avg) => avg * 0.7 + elapsed * 0.3,
+                            None => elapsed,
+                        });
+                    }
+                    self.last_epoch_time = Some(now);
+
                     self.epoch_history.push(EpochStats {
                         epoch,
                         train_loss,
@@ -963,6 +993,12 @@ impl TrainerApp {
                     self.model_path = Some(model_path);
                     self.training_state = TrainingState::Complete;
                     self.worker = None;
+
+                    // Send desktop notification
+                    send_notification(
+                        "NAM Trainer",
+                        &format!("Training complete! (ESR: {:.6})", final_esr),
+                    );
                 }
                 WorkerMessage::Error(err) => {
                     self.training_log.push(format!("Error: {}", err));
@@ -984,6 +1020,150 @@ impl TrainerApp {
             }
         }
     }
+}
+
+// ── Audio validation ───────────────────────────────────────────────────
+
+/// Validate that audio files are suitable for training. Returns a list of
+/// warnings/errors. An empty list means everything looks good.
+pub fn validate_audio_files(
+    input_path: &str,
+    output_paths: &[String],
+) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    let input_spec = match hound::WavReader::open(input_path) {
+        Ok(r) => r.spec(),
+        Err(e) => {
+            issues.push(format!("Cannot read input file: {e}"));
+            return issues;
+        }
+    };
+
+    let input_duration = match hound::WavReader::open(input_path) {
+        Ok(r) => {
+            let samples = r.len() as f64;
+            let channels = input_spec.channels as f64;
+            let rate = input_spec.sample_rate as f64;
+            samples / channels / rate
+        }
+        Err(_) => 0.0,
+    };
+
+    if input_duration < 1.0 {
+        issues.push(format!(
+            "Input file is very short ({:.1}s). Training needs at least a few seconds of audio.",
+            input_duration
+        ));
+    }
+
+    for output_path in output_paths {
+        let basename = std::path::Path::new(output_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| output_path.clone());
+
+        let output_spec = match hound::WavReader::open(output_path) {
+            Ok(r) => r.spec(),
+            Err(e) => {
+                issues.push(format!("{basename}: cannot read file: {e}"));
+                continue;
+            }
+        };
+
+        let output_duration = match hound::WavReader::open(output_path) {
+            Ok(r) => {
+                let samples = r.len() as f64;
+                let channels = output_spec.channels as f64;
+                let rate = output_spec.sample_rate as f64;
+                samples / channels / rate
+            }
+            Err(_) => 0.0,
+        };
+
+        if output_spec.sample_rate != input_spec.sample_rate {
+            issues.push(format!(
+                "{basename}: sample rate {}Hz does not match input ({}Hz)",
+                output_spec.sample_rate, input_spec.sample_rate
+            ));
+        }
+
+        if output_duration < 1.0 {
+            issues.push(format!(
+                "{basename}: very short ({:.1}s)",
+                output_duration
+            ));
+        }
+
+        let ratio = if input_duration > 0.0 {
+            output_duration / input_duration
+        } else {
+            1.0
+        };
+        if ratio < 0.5 || ratio > 2.0 {
+            issues.push(format!(
+                "{basename}: duration ({:.1}s) differs significantly from input ({:.1}s)",
+                output_duration, input_duration
+            ));
+        }
+    }
+
+    issues
+}
+
+// ── Desktop notifications ──────────────────────────────────────────────
+
+fn send_notification(title: &str, body: &str) {
+    let title = title.to_string();
+    let body = body.to_string();
+    // Run in background thread so it never blocks the UI
+    std::thread::spawn(move || {
+        let _ = send_notification_sync(&title, &body);
+    });
+}
+
+fn send_notification_sync(title: &str, body: &str) -> Result<(), std::io::Error> {
+    if cfg!(target_os = "macos") {
+        std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    body.replace('\"', "\\\""),
+                    title.replace('\"', "\\\"")
+                ),
+            ])
+            .hide_console()
+            .output()?;
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); \
+                     $n = New-Object System.Windows.Forms.NotifyIcon; \
+                     $n.Icon = [System.Drawing.SystemIcons]::Information; \
+                     $n.BalloonTipTitle = '{}'; \
+                     $n.BalloonTipText = '{}'; \
+                     $n.Visible = $true; \
+                     $n.ShowBalloonTip(5000); \
+                     Start-Sleep -Seconds 6; \
+                     $n.Dispose()",
+                    title.replace('\'', "''"),
+                    body.replace('\'', "''")
+                ),
+            ])
+            .hide_console()
+            .output()?;
+    } else {
+        // Linux: notify-send
+        std::process::Command::new("notify-send")
+            .args([title, body])
+            .hide_console()
+            .output()?;
+    }
+    Ok(())
 }
 
 // ── Platform helpers ────────────────────────────────────────────────────
@@ -1217,6 +1397,35 @@ impl eframe::App for TrainerApp {
         self.poll_worker();
         self.poll_python_check();
         self.poll_install();
+
+        // Handle drag-and-drop of WAV files
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                let wav_files: Vec<String> = i
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.as_ref())
+                    .filter(|p| {
+                        p.extension()
+                            .map(|e| e.eq_ignore_ascii_case("wav"))
+                            .unwrap_or(false)
+                    })
+                    .map(|p| p.display().to_string())
+                    .collect();
+
+                if wav_files.len() == 1 && self.input_path.is_none() {
+                    // Single WAV dropped with no input set: use as input
+                    let p = wav_files[0].clone();
+                    self.settings.last_input_path = Some(p.clone());
+                    self.settings.save();
+                    self.input_path = Some(p);
+                } else if !wav_files.is_empty() {
+                    // Multiple WAVs or input already set: use as output
+                    self.output_paths = wav_files;
+                }
+            }
+        });
 
         // Request continuous repaints while training or installing
         let needs_repaint = self.training_state == TrainingState::Training

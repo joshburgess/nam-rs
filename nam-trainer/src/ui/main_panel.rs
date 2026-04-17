@@ -135,7 +135,8 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
             ui.add_space(4.0);
             let prev_arch = app.config.architecture;
             for &arch in crate::app::Architecture::all() {
-                ui.selectable_value(&mut app.config.architecture, arch, arch.label());
+                ui.selectable_value(&mut app.config.architecture, arch, arch.label())
+                    .on_hover_text(arch.tooltip());
             }
             if app.config.architecture != prev_arch {
                 app.save_config();
@@ -383,7 +384,21 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 let btn =
                     egui::Button::new(btn_text).min_size(egui::vec2(ui.available_width(), 34.0));
 
-                if ui.add_enabled(can_train, btn).clicked() {
+                // Enter key to start training
+                let enter_pressed = can_train
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.any());
+
+                if ui.add_enabled(can_train, btn).clicked() || enter_pressed {
+                    // Validate audio files before starting
+                    if let Some(ref input) = app.input_path {
+                        let issues =
+                            crate::app::validate_audio_files(input, &app.output_paths);
+                        if !issues.is_empty() {
+                            for issue in &issues {
+                                app.training_log.push(format!("Warning: {issue}"));
+                            }
+                        }
+                    }
                     start_training(app);
                 }
                 if !can_train {
@@ -404,10 +419,13 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             }
             TrainingState::Training => {
+                // Escape key to cancel training
+                let escape_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+
                 ui.horizontal(|ui| {
                     let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").color(RED))
                         .min_size(egui::vec2(100.0, 32.0));
-                    if ui.add(cancel_btn).clicked() {
+                    if ui.add(cancel_btn).clicked() || escape_pressed {
                         if let Some(ref mut w) = app.worker {
                             w.cancel();
                         }
@@ -425,10 +443,17 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         ui.separator();
                     }
                     if let Some(last) = app.epoch_history.last() {
-                        ui.label(format!(
+                        let mut status = format!(
                             "Epoch {}/{} \u{2014} ESR: {:.6}",
                             last.epoch, app.config.epochs, last.esr
-                        ));
+                        );
+                        // Show ETA if we have enough data
+                        if let Some(avg) = app.avg_epoch_secs {
+                            let remaining = app.config.epochs.saturating_sub(last.epoch);
+                            let eta_secs = avg * remaining as f64;
+                            status.push_str(&format!(" \u{2014} {}", format_eta(eta_secs)));
+                        }
+                        ui.label(status);
                     }
                 });
             }
@@ -587,6 +612,9 @@ fn start_training(app: &mut TrainerApp) {
     app.model_path = None;
     app.current_file_index = 0;
     app.total_files = app.output_paths.len();
+    app.training_start_time = Some(std::time::Instant::now());
+    app.last_epoch_time = None;
+    app.avg_epoch_secs = None;
     app.training_log.push("Starting training...".into());
 
     let (handle, rx) = worker::spawn(app);
@@ -710,5 +738,24 @@ fn truncate_path(path: &str, max_len: usize) -> String {
         path.to_string()
     } else {
         format!("...{}", &path[path.len() - max_len + 3..])
+    }
+}
+
+fn format_eta(secs: f64) -> String {
+    let secs = secs.round() as u64;
+    if secs < 60 {
+        format!("~{secs}s remaining")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("~{m} min remaining")
+        } else {
+            format!("~{m}m {s}s remaining")
+        }
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("~{h}h {m}m remaining")
     }
 }
