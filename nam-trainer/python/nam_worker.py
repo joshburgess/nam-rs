@@ -58,18 +58,43 @@ def main():
               "Install with: pip install neural-amp-modeler"})
         sys.exit(1)
 
-    # Custom callback for JSON progress reporting
+    # Custom callback for JSON progress reporting. We use
+    # on_validation_epoch_end so both training and validation metrics
+    # are available. on_train_epoch_end fires before validation runs,
+    # so val_loss/ESR would be stale or missing.
     class JsonProgressCallback(pl.Callback):
         """Reports training progress as JSON lines to stdout."""
 
-        def on_train_epoch_end(self, trainer, pl_module):
+        def __init__(self):
+            self._logged_keys = False
+
+        def on_validation_epoch_end(self, trainer, pl_module):
             metrics = trainer.callback_metrics
+
+            # Log available metric keys on the first epoch to aid debugging
+            if not self._logged_keys:
+                emit({"type": "log", "message": f"Available metrics: {sorted(metrics.keys())}"})
+                self._logged_keys = True
+
+            # NAM logs training loss as "loss", validation as "val_loss".
+            # ESR may appear as "ESR" or may just be val_loss (NAM uses
+            # ESR as the loss function). Try multiple key names.
+            train_loss = float(
+                metrics.get("loss", metrics.get("train_loss",
+                metrics.get("train_loss_epoch", 0.0)))
+            )
+            val_loss = float(metrics.get("val_loss", 0.0))
+            esr = float(
+                metrics.get("ESR", metrics.get("val_esr",
+                metrics.get("val_loss", 0.0)))
+            )
+
             emit({
                 "type": "epoch_end",
                 "epoch": trainer.current_epoch + 1,
-                "train_loss": float(metrics.get("train_loss", 0.0)),
-                "val_loss": float(metrics.get("val_loss", 0.0)),
-                "esr": float(metrics.get("ESR", metrics.get("val_loss", 0.0))),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "esr": esr,
             })
 
     # Monkey-patch the Trainer to inject our callback
