@@ -2830,6 +2830,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "hound",
+ "image",
  "nam-core",
  "open",
  "rfd",
