@@ -1,7 +1,6 @@
 use crate::app::TrainerApp;
 use egui_plot::{Line, Plot, PlotPoints};
 
-const AMBER: egui::Color32 = egui::Color32::from_rgb(255, 180, 60);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
 const CYAN: egui::Color32 = egui::Color32::from_rgb(80, 180, 255);
 
@@ -28,8 +27,6 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         stat_label(ui, "Train", last.train_loss, CYAN);
-                        ui.separator();
-                        stat_label(ui, "Val", last.val_loss, AMBER);
                         ui.separator();
                         stat_label(ui, "ESR", last.esr, GREEN);
                     });
@@ -84,11 +81,6 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
         .iter()
         .map(|e| [e.epoch as f64, e.train_loss])
         .collect();
-    let val_points: PlotPoints = app
-        .epoch_history
-        .iter()
-        .map(|e| [e.epoch as f64, e.val_loss])
-        .collect();
     let esr_points: PlotPoints = app
         .epoch_history
         .iter()
@@ -98,10 +90,6 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
     let train_line = Line::new(train_points)
         .name("Train loss")
         .color(CYAN)
-        .width(1.5);
-    let val_line = Line::new(val_points)
-        .name("Val loss")
-        .color(AMBER)
         .width(1.5);
     let esr_line = Line::new(esr_points).name("ESR").color(GREEN).width(2.0);
 
@@ -113,11 +101,10 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
         .allow_boxed_zoom(false)
         .show_axes([true, true])
         .x_axis_label("Epoch")
-        .y_axis_label("Loss")
+        .y_axis_label("Loss / ESR")
         .legend(egui_plot::Legend::default())
         .show(ui, |plot_ui| {
             plot_ui.line(train_line);
-            plot_ui.line(val_line);
             plot_ui.line(esr_line);
         });
 }
