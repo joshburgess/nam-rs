@@ -48,8 +48,9 @@ pub enum WorkerEvent {
 
     #[serde(rename = "training_complete")]
     TrainingComplete {
-        #[allow(dead_code)] // present in JSON, matched with `..`
+        #[allow(dead_code)]
         file: String,
+        #[allow(dead_code)]
         validation_esr: f64,
         model_path: String,
     },

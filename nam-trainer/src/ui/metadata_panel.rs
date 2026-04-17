@@ -2,6 +2,7 @@ use crate::app::{GearType, ToneType, TrainerApp};
 
 pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
     let mut open = app.show_metadata;
+    let was_open = open;
     egui::Window::new("Model Metadata")
         .open(&mut open)
         .resizable(false)
@@ -110,5 +111,9 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
                     ui.end_row();
                 });
         });
+    // Save metadata when the window is closed
+    if was_open && !open {
+        app.save_metadata();
+    }
     app.show_metadata = open;
 }

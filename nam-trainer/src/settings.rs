@@ -6,6 +6,26 @@ pub struct Settings {
     pub last_input_path: Option<String>,
     pub last_destination: Option<String>,
     pub python_path: Option<String>,
+
+    // Training configuration (persisted across restarts)
+    pub architecture: Option<String>,
+    pub epochs: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub lr: Option<f64>,
+    pub lr_decay: Option<f64>,
+    pub latency: Option<i32>,
+    pub threshold_esr: Option<f64>,
+    pub save_plot: Option<bool>,
+
+    // Model metadata (persisted across restarts)
+    pub meta_name: Option<String>,
+    pub meta_modeled_by: Option<String>,
+    pub meta_gear_make: Option<String>,
+    pub meta_gear_model: Option<String>,
+    pub meta_gear_type: Option<String>,
+    pub meta_tone_type: Option<String>,
+    pub meta_input_level_dbu: Option<String>,
+    pub meta_output_level_dbu: Option<String>,
 }
 
 impl Settings {

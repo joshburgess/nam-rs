@@ -18,6 +18,10 @@ pub enum TrainingState {
 #[derive(Debug)]
 pub enum WorkerMessage {
     Log(String),
+    TrainingStart {
+        file: String,
+        total_epochs: u32,
+    },
     EpochEnd {
         epoch: u32,
         train_loss: f64,
@@ -26,7 +30,6 @@ pub enum WorkerMessage {
     },
     TrainingComplete {
         model_path: String,
-        esr: f64,
     },
     Error(String),
     WorkerExited {
@@ -255,16 +258,11 @@ fn event_to_message(event: protocol::WorkerEvent) -> WorkerMessage {
             esr,
         },
         protocol::WorkerEvent::TrainingComplete {
-            model_path,
-            validation_esr,
-            ..
-        } => WorkerMessage::TrainingComplete {
-            model_path,
-            esr: validation_esr,
-        },
+            model_path, ..
+        } => WorkerMessage::TrainingComplete { model_path },
         protocol::WorkerEvent::TrainingFailed { error, .. } => WorkerMessage::Error(error),
         protocol::WorkerEvent::TrainingStart { file, total_epochs } => {
-            WorkerMessage::Log(format!("Training {} ({} epochs)...", file, total_epochs))
+            WorkerMessage::TrainingStart { file, total_epochs }
         }
         protocol::WorkerEvent::AllComplete => WorkerMessage::Log("All training complete.".into()),
         protocol::WorkerEvent::Error { message } => WorkerMessage::Error(message),

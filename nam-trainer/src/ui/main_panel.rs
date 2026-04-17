@@ -133,8 +133,12 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Model:");
             ui.add_space(4.0);
+            let prev_arch = app.config.architecture;
             for &arch in crate::app::Architecture::all() {
                 ui.selectable_value(&mut app.config.architecture, arch, arch.label());
+            }
+            if app.config.architecture != prev_arch {
+                app.save_config();
             }
         });
 
@@ -218,9 +222,20 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
 fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
     section(ui, "Python Environment", |ui| {
-        // Auto-discover on first frame
-        if app.discovered_pythons.is_none() {
-            app.discovered_pythons = Some(discover_pythons());
+        // Auto-discover on first frame (async to avoid blocking UI)
+        if app.discovered_pythons.is_none() && app.python_discovery_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.python_discovery_rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(discover_pythons());
+            });
+        }
+        // Check if discovery completed
+        if let Some(ref rx) = app.python_discovery_rx {
+            if let Ok(result) = rx.try_recv() {
+                app.discovered_pythons = Some(result);
+                app.python_discovery_rx = None;
+            }
         }
 
         let full_width = ui.available_width();
@@ -401,6 +416,14 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         app.message_rx = None;
                         app.training_log.push("Training cancelled.".into());
                     }
+                    // Batch progress indicator
+                    if app.total_files > 1 {
+                        ui.label(format!(
+                            "File {}/{}",
+                            app.current_file_index, app.total_files
+                        ));
+                        ui.separator();
+                    }
                     if let Some(last) = app.epoch_history.last() {
                         ui.label(format!(
                             "Epoch {}/{} \u{2014} ESR: {:.6}",
@@ -410,12 +433,32 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 });
             }
             TrainingState::Complete => {
+                let final_esr = app.epoch_history.last().map(|e| e.esr);
                 ui.horizontal(|ui| {
-                    ui.colored_label(GREEN, egui::RichText::new("Training complete!").size(15.0));
+                    let label = if let Some(esr) = final_esr {
+                        format!("Training complete! (ESR: {:.6})", esr)
+                    } else {
+                        "Training complete!".to_string()
+                    };
+                    ui.colored_label(GREEN, egui::RichText::new(label).size(15.0));
+                });
+                ui.horizontal(|ui| {
                     if ui.button("Train Again").clicked() {
                         app.training_state = TrainingState::Idle;
                         app.epoch_history.clear();
                         app.training_log.clear();
+                        app.model_path = None;
+                    }
+                    if app.destination_dir.is_some() {
+                        if ui
+                            .button("Open Output Folder")
+                            .on_hover_text("Open the output directory in your file manager")
+                            .clicked()
+                        {
+                            if let Some(ref dir) = app.destination_dir {
+                                let _ = open::that(dir);
+                            }
+                        }
                     }
                 });
             }
@@ -541,6 +584,9 @@ fn start_training(app: &mut TrainerApp) {
     app.training_state = TrainingState::Training;
     app.training_log.clear();
     app.epoch_history.clear();
+    app.model_path = None;
+    app.current_file_index = 0;
+    app.total_files = app.output_paths.len();
     app.training_log.push("Starting training...".into());
 
     let (handle, rx) = worker::spawn(app);

@@ -1,4 +1,4 @@
-use crate::app::{Architecture, TrainerApp};
+use crate::app::TrainerApp;
 
 pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
     let mut open = app.show_advanced;
@@ -7,26 +7,11 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
         .resizable(false)
         .default_width(320.0)
         .show(ctx, |ui| {
+            let before = app.config.clone();
             egui::Grid::new("advanced_grid")
                 .num_columns(2)
                 .spacing([16.0, 8.0])
                 .show(ui, |ui| {
-                    // Architecture
-                    ui.label("Architecture:");
-                    egui::ComboBox::from_id_salt("arch_combo")
-                        .selected_text(app.config.architecture.label())
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            for &arch in Architecture::all() {
-                                ui.selectable_value(
-                                    &mut app.config.architecture,
-                                    arch,
-                                    arch.label(),
-                                );
-                            }
-                        });
-                    ui.end_row();
-
                     // Epochs
                     ui.label("Epochs:")
                         .on_hover_text("Number of training passes over the data");
@@ -134,6 +119,18 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
 
             ui.add_space(6.0);
             ui.checkbox(&mut app.config.save_plot, "Save ESR comparison plot");
+
+            // Save config if anything changed
+            if app.config.epochs != before.epochs
+                || app.config.batch_size != before.batch_size
+                || app.config.lr != before.lr
+                || app.config.lr_decay != before.lr_decay
+                || app.config.latency != before.latency
+                || app.config.threshold_esr != before.threshold_esr
+                || app.config.save_plot != before.save_plot
+            {
+                app.save_config();
+            }
         });
     app.show_advanced = open;
 }

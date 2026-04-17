@@ -25,6 +25,11 @@ pub struct TrainerApp {
     pub epoch_history: Vec<EpochStats>,
     pub worker: Option<WorkerHandle>,
     pub message_rx: Option<mpsc::Receiver<WorkerMessage>>,
+    pub model_path: Option<String>,
+
+    // Batch training progress (file N of M)
+    pub current_file_index: usize,
+    pub total_files: usize,
 
     // Persistent settings
     pub settings: Settings,
@@ -37,6 +42,7 @@ pub struct TrainerApp {
 
     // Python discovery and environment status
     pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
+    pub python_discovery_rx: Option<mpsc::Receiver<Vec<crate::ui::main_panel::PythonEntry>>>,
     pub python_status: PythonStatus,
     pub cuda_install: Option<CudaInstall>,
     python_check_rx: Option<mpsc::Receiver<DetectionResult>>,
@@ -167,6 +173,15 @@ impl Architecture {
             Self::Nano => "nano",
         }
     }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "lite" => Self::Lite,
+            "feather" => Self::Feather,
+            "nano" => Self::Nano,
+            _ => Self::Standard,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -217,6 +232,19 @@ impl GearType {
         }
     }
 
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "amp" => Some(Self::Amp),
+            "pedal" => Some(Self::Pedal),
+            "pedal_amp" => Some(Self::PedalAmp),
+            "amp_cab" => Some(Self::AmpCab),
+            "amp_pedal_cab" => Some(Self::AmpPedalCab),
+            "preamp" => Some(Self::Preamp),
+            "studio" => Some(Self::Studio),
+            _ => None,
+        }
+    }
+
     pub fn all() -> &'static [GearType] {
         &[
             Self::Amp,
@@ -260,6 +288,17 @@ impl ToneType {
         }
     }
 
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "clean" => Some(Self::Clean),
+            "overdrive" => Some(Self::Overdrive),
+            "crunch" => Some(Self::Crunch),
+            "hi_gain" => Some(Self::HiGain),
+            "fuzz" => Some(Self::Fuzz),
+            _ => None,
+        }
+    }
+
     pub fn all() -> &'static [ToneType] {
         &[
             Self::Clean,
@@ -275,6 +314,7 @@ impl ToneType {
 pub struct EpochStats {
     pub epoch: u32,
     pub train_loss: f64,
+    #[allow(dead_code)] // used in training log text, not in plot
     pub val_loss: f64,
     pub esr: f64,
 }
@@ -282,12 +322,54 @@ pub struct EpochStats {
 impl TrainerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
+
+        // Restore training config from settings, falling back to defaults
+        let mut config = TrainingConfig::default();
+        if let Some(ref arch_str) = settings.architecture {
+            config.architecture = Architecture::from_str(arch_str);
+        }
+        if let Some(v) = settings.epochs {
+            config.epochs = v;
+        }
+        if let Some(v) = settings.batch_size {
+            config.batch_size = v;
+        }
+        if let Some(v) = settings.lr {
+            config.lr = v;
+        }
+        if let Some(v) = settings.lr_decay {
+            config.lr_decay = v;
+        }
+        config.latency = settings.latency;
+        config.threshold_esr = settings.threshold_esr;
+        if let Some(v) = settings.save_plot {
+            config.save_plot = v;
+        }
+
+        // Restore metadata from settings
+        let metadata = ModelMetadata {
+            name: settings.meta_name.clone().unwrap_or_default(),
+            modeled_by: settings.meta_modeled_by.clone().unwrap_or_default(),
+            gear_make: settings.meta_gear_make.clone().unwrap_or_default(),
+            gear_model: settings.meta_gear_model.clone().unwrap_or_default(),
+            gear_type: settings
+                .meta_gear_type
+                .as_deref()
+                .and_then(GearType::from_str),
+            tone_type: settings
+                .meta_tone_type
+                .as_deref()
+                .and_then(ToneType::from_str),
+            input_level_dbu: settings.meta_input_level_dbu.clone().unwrap_or_default(),
+            output_level_dbu: settings.meta_output_level_dbu.clone().unwrap_or_default(),
+        };
+
         let mut app = Self {
             input_path: settings.last_input_path.clone(),
             output_paths: Vec::new(),
             destination_dir: settings.last_destination.clone(),
-            config: TrainingConfig::default(),
-            metadata: ModelMetadata::default(),
+            config,
+            metadata,
             show_advanced: false,
             show_metadata: false,
             training_state: TrainingState::Idle,
@@ -295,12 +377,16 @@ impl TrainerApp {
             epoch_history: Vec::new(),
             worker: None,
             message_rx: None,
+            model_path: None,
+            current_file_index: 0,
+            total_files: 0,
             python_path: settings
                 .python_path
                 .clone()
                 .unwrap_or_else(default_python_name),
             selected_device: "cpu".to_string(),
             discovered_pythons: None,
+            python_discovery_rx: None,
             python_status: PythonStatus::Unknown,
             cuda_install: None,
             python_check_rx: None,
@@ -311,6 +397,32 @@ impl TrainerApp {
         };
         app.check_python();
         app
+    }
+
+    /// Save the current training config and metadata to persistent settings.
+    pub fn save_config(&mut self) {
+        self.settings.architecture = Some(self.config.architecture.as_str().to_string());
+        self.settings.epochs = Some(self.config.epochs);
+        self.settings.batch_size = Some(self.config.batch_size);
+        self.settings.lr = Some(self.config.lr);
+        self.settings.lr_decay = Some(self.config.lr_decay);
+        self.settings.latency = self.config.latency;
+        self.settings.threshold_esr = self.config.threshold_esr;
+        self.settings.save_plot = Some(self.config.save_plot);
+        self.settings.save();
+    }
+
+    /// Save the current metadata fields to persistent settings.
+    pub fn save_metadata(&mut self) {
+        self.settings.meta_name = non_empty_opt(&self.metadata.name);
+        self.settings.meta_modeled_by = non_empty_opt(&self.metadata.modeled_by);
+        self.settings.meta_gear_make = non_empty_opt(&self.metadata.gear_make);
+        self.settings.meta_gear_model = non_empty_opt(&self.metadata.gear_model);
+        self.settings.meta_gear_type = self.metadata.gear_type.map(|g| g.as_str().to_string());
+        self.settings.meta_tone_type = self.metadata.tone_type.map(|t| t.as_str().to_string());
+        self.settings.meta_input_level_dbu = non_empty_opt(&self.metadata.input_level_dbu);
+        self.settings.meta_output_level_dbu = non_empty_opt(&self.metadata.output_level_dbu);
+        self.settings.save();
     }
 
     /// Spawn a background thread to verify Python + NAM are available and detect GPU.
@@ -641,6 +753,7 @@ impl TrainerApp {
                     self.settings.save();
                     // Refresh the discovery list
                     self.discovered_pythons = None;
+                    self.python_discovery_rx = None;
                 }
                 InstallMessage::Done { success } => {
                     if success {
@@ -790,7 +903,6 @@ impl TrainerApp {
             }
             let _ = tx.send(WorkerMessage::TrainingComplete {
                 model_path: "/tmp/demo_model.nam".into(),
-                esr: 0.01,
             });
         });
     }
@@ -814,6 +926,13 @@ impl TrainerApp {
                 WorkerMessage::Log(text) => {
                     self.training_log.push(text);
                 }
+                WorkerMessage::TrainingStart { ref file, total_epochs } => {
+                    self.current_file_index += 1;
+                    self.training_log.push(format!(
+                        "Training {} ({} epochs)...",
+                        file, total_epochs
+                    ));
+                }
                 WorkerMessage::EpochEnd {
                     epoch,
                     train_loss,
@@ -831,11 +950,17 @@ impl TrainerApp {
                         epoch, train_loss, val_loss, esr
                     ));
                 }
-                WorkerMessage::TrainingComplete { model_path, esr } => {
+                WorkerMessage::TrainingComplete { model_path } => {
+                    let final_esr = self
+                        .epoch_history
+                        .last()
+                        .map(|e| e.esr)
+                        .unwrap_or(0.0);
                     self.training_log.push(format!(
                         "Training complete! ESR={:.6} Model: {}",
-                        esr, model_path
+                        final_esr, model_path
                     ));
+                    self.model_path = Some(model_path);
                     self.training_state = TrainingState::Complete;
                     self.worker = None;
                 }
@@ -992,6 +1117,14 @@ impl HideConsoleExt for std::process::Command {
     }
 }
 
+fn non_empty_opt(s: &str) -> Option<String> {
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 fn parse_version_tuple(version: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version.split('.').collect();
     if parts.len() >= 2 {
@@ -1088,7 +1221,8 @@ impl eframe::App for TrainerApp {
         // Request continuous repaints while training or installing
         let needs_repaint = self.training_state == TrainingState::Training
             || matches!(self.install_state, InstallState::Installing(_))
-            || matches!(self.python_status, PythonStatus::Unknown);
+            || matches!(self.python_status, PythonStatus::Unknown)
+            || self.python_discovery_rx.is_some();
         if needs_repaint {
             ctx.request_repaint();
         }
