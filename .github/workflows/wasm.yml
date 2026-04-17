@@ -1,0 +1,37 @@
+name: WASM Build
+on:
+  push:
+    branches: [main, experiment/nam-wasm]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      - name: Run nam-core tests
+        run: cargo test -p nam-core --lib -- --skip test_print_all_diffs --skip test_a2_max_divergence_profile
+
+      - name: Build WASM (web target)
+        run: wasm-pack build nam-wasm --target web --release
+
+      - name: Check WASM binary size
+        run: |
+          SIZE=$(stat -c%s nam-wasm/pkg/nam_wasm_bg.wasm)
+          echo "WASM binary size: $SIZE bytes ($(( SIZE / 1024 )) KB)"
+          if [ "$SIZE" -gt 1048576 ]; then
+            echo "ERROR: WASM binary exceeds 1MB threshold"
+            exit 1
+          fi
+
+      - name: List build artifacts
+        run: ls -lh nam-wasm/pkg/

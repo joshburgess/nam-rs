@@ -3,3 +3,6 @@ xtask = "run --package xtask --release --"
 
 [build]
 rustflags = ["-C", "target-cpu=native", "-C", "llvm-args=--fp-contract=fast"]
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

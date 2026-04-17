@@ -1,3 +1,10 @@
+// Same feature-aliased `Sample` situation as `nam-core`: `Sample` is `f64` by
+// default and `f32` under the `float_io` feature (activated transitively by
+// `nam-wasm`). Casts that are real narrowing conversions in the default
+// config become no-ops under `float_io`, which clippy flags as false
+// positives — allow it crate-wide.
+#![allow(clippy::unnecessary_cast)]
+
 use nih_plug::prelude::*;
 use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
@@ -216,8 +223,10 @@ impl NamPlugin {
         let num_samples = input.len();
 
         // 1. Push host-rate input into pending buffer
+        //    `f64::from` is a no-op when `Sample = f64` (default) and a
+        //    widening conversion when `Sample = f32` (`float_io` feature).
         for &s in input {
-            rs.input_pending.push_back(s);
+            rs.input_pending.push_back(f64::from(s));
         }
 
         // 2. Resample host_rate -> model_rate in fixed-size chunks
@@ -254,7 +263,8 @@ impl NamPlugin {
             // 4. Push model output into model_rate_pending for back-resampling
             //    (reuse the same deque — it was just drained)
             for i in 0..model_samples {
-                rs.model_rate_pending.push_back(rs.model_output[i]);
+                rs.model_rate_pending
+                    .push_back(f64::from(rs.model_output[i]));
             }
         }
 
