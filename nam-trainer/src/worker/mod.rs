@@ -67,6 +67,7 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
         output_paths: app.output_paths.clone(),
         destination: app.destination_dir.clone().unwrap_or_default(),
         architecture: app.config.architecture.as_str().to_string(),
+        packed: app.config.architecture == crate::app::Architecture::Packed,
         epochs: app.config.epochs,
         batch_size: app.config.batch_size,
         lr: app.config.lr,
@@ -75,6 +76,9 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
         threshold_esr: app.config.threshold_esr,
         save_plot: app.config.save_plot,
         fit_mrstft: app.config.fit_mrstft,
+        ignore_checks: app.config.ignore_checks,
+        num_output_samples_per_datum: app.config.num_output_samples_per_datum,
+        use_full_config_trainer: app.config.use_full_config_trainer,
         device: app.selected_device.clone(),
         metadata: protocol::MetadataRequest {
             name: non_empty(&app.metadata.name),
@@ -225,7 +229,7 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, mpsc::Receiver<WorkerMessage>) 
                 if !buf.is_empty() {
                     let tail = buf.join("\n");
                     let _ = tx.send(WorkerMessage::Error(format!(
-                        "Python exited with code {} — last output:\n{}",
+                        "Python exited with code {}. Last output:\n{}",
                         exit_code.unwrap_or(-1),
                         tail
                     )));
@@ -257,9 +261,9 @@ fn event_to_message(event: protocol::WorkerEvent) -> WorkerMessage {
             val_loss,
             esr,
         },
-        protocol::WorkerEvent::TrainingComplete {
-            model_path, ..
-        } => WorkerMessage::TrainingComplete { model_path },
+        protocol::WorkerEvent::TrainingComplete { model_path, .. } => {
+            WorkerMessage::TrainingComplete { model_path }
+        }
         protocol::WorkerEvent::TrainingFailed { error, .. } => WorkerMessage::Error(error),
         protocol::WorkerEvent::TrainingStart { file, total_epochs } => {
             WorkerMessage::TrainingStart { file, total_epochs }

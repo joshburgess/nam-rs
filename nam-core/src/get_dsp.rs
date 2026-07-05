@@ -33,7 +33,7 @@ pub fn get_dsp_from_value(val: &serde_json::Value) -> Result<Box<dyn Dsp>, NamEr
         verify_config_version(version)?;
     }
     let mut model = get_dsp_from_value_inner(val, false)?;
-    // C++ get_dsp() calls prewarm() during construction — match that behavior
+    // C++ get_dsp() calls prewarm() during construction, match that behavior
     model.prewarm();
     Ok(model)
 }
@@ -59,8 +59,13 @@ fn get_dsp_from_value_inner(
         .as_array()
         .ok_or_else(|| NamError::MissingField("weights".into()))?
         .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-        .collect();
+        .enumerate()
+        .map(|(idx, v)| {
+            v.as_f64().map(|value| value as f32).ok_or_else(|| {
+                NamError::InvalidConfig(format!("weight at index {idx} is not a number"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
 
     // Parse metadata
     let metadata = parse_metadata(root);
@@ -68,9 +73,7 @@ fn get_dsp_from_value_inner(
     let config = &root["config"];
 
     match arch {
-        "Linear" => Ok(Box::new(Linear::from_config(config, &weights, metadata)?)),
-        "ConvNet" => Ok(Box::new(ConvNet::from_config(config, &weights, metadata)?)),
-        "LSTM" => Ok(Box::new(Lstm::from_config(config, &weights, metadata)?)),
+        "Linear" | "ConvNet" | "LSTM" => build_dsp_from_parts(arch, config, &weights, metadata),
         "WaveNet" => {
             // Check for condition_dsp in config
             let condition_dsp = if let Some(cd) = config.get("condition_dsp") {
@@ -89,7 +92,184 @@ fn get_dsp_from_value_inner(
                 condition_dsp,
             )?))
         }
+        "Sequential" => Sequential::from_config(config, &weights, metadata),
         other => Err(NamError::UnknownArchitecture(other.into())),
+    }
+}
+
+fn build_dsp_from_parts(
+    arch: &str,
+    config: &serde_json::Value,
+    weights: &[f32],
+    metadata: DspMetadata,
+) -> Result<Box<dyn Dsp>, NamError> {
+    match arch {
+        "Linear" => Ok(Box::new(Linear::from_config(config, weights, metadata)?)),
+        "ConvNet" => Ok(Box::new(ConvNet::from_config(config, weights, metadata)?)),
+        "LSTM" => Ok(Box::new(Lstm::from_config(config, weights, metadata)?)),
+        "WaveNet" => {
+            let condition_dsp = if let Some(cd) = config.get("condition_dsp") {
+                if !cd.is_null() {
+                    Some(get_dsp_from_value(cd)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(Box::new(WaveNet::from_config_with_condition_dsp(
+                config,
+                weights,
+                metadata,
+                condition_dsp,
+            )?))
+        }
+        "Sequential" => Sequential::from_config(config, weights, metadata),
+        other => Err(NamError::UnknownArchitecture(other.into())),
+    }
+}
+
+fn submodel_arch_and_config(
+    entry: &serde_json::Value,
+) -> Result<(&str, &serde_json::Value), NamError> {
+    let arch = entry
+        .get("name")
+        .or_else(|| entry.get("architecture"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NamError::MissingField("sequential model name".into()))?;
+    let config = entry
+        .get("config")
+        .ok_or_else(|| NamError::MissingField("sequential model config".into()))?;
+    Ok((arch, config))
+}
+
+fn build_submodel_from_weight_prefix(
+    arch: &str,
+    config: &serde_json::Value,
+    weights: &[f32],
+    metadata: &DspMetadata,
+) -> Result<(Box<dyn Dsp>, usize), NamError> {
+    for end in 0..=weights.len() {
+        if let Ok(model) = build_dsp_from_parts(arch, config, &weights[..end], metadata.clone()) {
+            return Ok((model, end));
+        }
+    }
+    Err(NamError::WeightMismatch {
+        expected: weights.len() + 1,
+        actual: weights.len(),
+    })
+}
+
+// ── Sequential ─────────────────────────────────────────────────────────────
+
+struct Sequential {
+    models: Vec<Box<dyn Dsp>>,
+    metadata: DspMetadata,
+    scratch: Vec<Vec<Sample>>,
+}
+
+impl Sequential {
+    fn from_config(
+        config: &serde_json::Value,
+        weights: &[f32],
+        metadata: DspMetadata,
+    ) -> Result<Box<dyn Dsp>, NamError> {
+        let model_entries = config["models"]
+            .as_array()
+            .ok_or_else(|| NamError::MissingField("config.models".into()))?;
+        if model_entries.is_empty() {
+            return Err(NamError::InvalidConfig(
+                "Sequential models must be non-empty".into(),
+            ));
+        }
+
+        let mut models = Vec::with_capacity(model_entries.len());
+        let mut offset = 0usize;
+        for (idx, entry) in model_entries.iter().enumerate() {
+            let (arch, config) = submodel_arch_and_config(entry)?;
+            let remaining = &weights[offset..];
+            let (model, consumed) = if idx + 1 == model_entries.len() {
+                (
+                    build_dsp_from_parts(arch, config, remaining, metadata.clone())?,
+                    remaining.len(),
+                )
+            } else {
+                build_submodel_from_weight_prefix(arch, config, remaining, &metadata)?
+            };
+            offset += consumed;
+            models.push(model);
+        }
+        if offset != weights.len() {
+            return Err(NamError::WeightMismatch {
+                expected: offset,
+                actual: weights.len(),
+            });
+        }
+
+        let scratch = if models.len() > 1 {
+            vec![Vec::new(); models.len() - 1]
+        } else {
+            Vec::new()
+        };
+
+        Ok(Box::new(Self {
+            models,
+            metadata,
+            scratch,
+        }))
+    }
+}
+
+impl Dsp for Sequential {
+    fn process(&mut self, input: &[Sample], output: &mut [Sample]) {
+        if self.models.len() == 1 {
+            self.models[0].process(input, output);
+            return;
+        }
+
+        let len = input.len();
+        for buf in &mut self.scratch {
+            buf.resize(len, Sample::default());
+        }
+
+        self.models[0].process(input, &mut self.scratch[0]);
+        for i in 1..self.models.len() - 1 {
+            let (prev, next) = self.scratch.split_at_mut(i);
+            self.models[i].process(&prev[i - 1], &mut next[0]);
+        }
+        let last_input = &self.scratch[self.scratch.len() - 1];
+        let last_model = self.models.len() - 1;
+        self.models[last_model].process(last_input, output);
+    }
+
+    fn reset(&mut self, sample_rate: f64, max_buffer_size: usize) {
+        for model in &mut self.models {
+            model.reset(sample_rate, max_buffer_size);
+        }
+        for buf in &mut self.scratch {
+            buf.fill(Sample::default());
+        }
+    }
+
+    fn prewarm_samples(&self) -> usize {
+        self.models
+            .iter()
+            .map(|model| model.prewarm_samples())
+            .sum()
+    }
+
+    fn prewarm(&mut self) {
+        let n = self.prewarm_samples();
+        if n == 0 {
+            return;
+        }
+        let silence = vec![Sample::default(); n];
+        let mut discard = vec![Sample::default(); n];
+        self.process(&silence, &mut discard);
+    }
+
+    fn metadata(&self) -> &DspMetadata {
+        &self.metadata
     }
 }
 
@@ -161,6 +341,22 @@ impl Dsp for SlimmableContainer {
         }
     }
 
+    fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
+        if !value.is_finite() {
+            return Err(NamError::InvalidConfig(
+                "Slimming value must be finite".into(),
+            ));
+        }
+        let ratio = value.clamp(0.0, 1.0);
+        let idx = self
+            .submodels
+            .iter()
+            .position(|(max_value, _)| ratio <= *max_value)
+            .unwrap_or(self.submodels.len() - 1);
+        self.active_index = idx;
+        Ok(())
+    }
+
     fn metadata(&self) -> &DspMetadata {
         &self.metadata
     }
@@ -169,13 +365,22 @@ impl Dsp for SlimmableContainer {
 fn parse_metadata(root: &serde_json::Value) -> DspMetadata {
     let m = &root["metadata"];
     DspMetadata {
+        raw: root.get("metadata").filter(|v| !v.is_null()).cloned(),
         loudness: m["loudness"].as_f64(),
+        gain: m["gain"].as_f64(),
         expected_sample_rate: root
             .get("sample_rate")
             .and_then(|v| v.as_f64())
             .or_else(|| m["sample_rate"].as_f64()),
+        name: m["name"].as_str().map(str::to_owned),
+        modeled_by: m["modeled_by"].as_str().map(str::to_owned),
+        gear_type: m["gear_type"].as_str().map(str::to_owned),
+        gear_make: m["gear_make"].as_str().map(str::to_owned),
+        gear_model: m["gear_model"].as_str().map(str::to_owned),
+        tone_type: m["tone_type"].as_str().map(str::to_owned),
         input_level_dbu: m["input_level_dbu"].as_f64(),
         output_level_dbu: m["output_level_dbu"].as_f64(),
+        validation_esr: m["validation_esr"].as_f64(),
     }
 }
 
@@ -271,6 +476,15 @@ mod tests {
     }
 
     #[test]
+    fn test_non_numeric_weight_rejected() {
+        let json = r#"{"version":"0.5.0","architecture":"Linear","config":{"receptive_field":1},"weights":["bad"]}"#;
+        let Err(err) = get_dsp_from_json(json) else {
+            panic!("non-numeric weight should fail");
+        };
+        assert!(format!("{err}").contains("not a number"));
+    }
+
+    #[test]
     fn test_valid_minimal_linear() {
         let json = r#"{"version":"0.5.0","architecture":"Linear","config":{"receptive_field":3},"weights":[1.0,0.5,0.25]}"#;
         assert!(get_dsp_from_json(json).is_ok());
@@ -290,10 +504,36 @@ mod tests {
             "metadata":{"loudness":-15.5,"sample_rate":44100.0,"input_level_dbu":12.0,"output_level_dbu":6.0}}"#;
         let model = get_dsp_from_json(json).unwrap();
         let meta = model.metadata();
+        assert!(meta.raw.is_some());
         assert!((meta.loudness.unwrap() - (-15.5)).abs() < 1e-6);
         assert!((meta.expected_sample_rate.unwrap() - 44100.0).abs() < 1e-6);
         assert!((meta.input_level_dbu.unwrap() - 12.0).abs() < 1e-6);
         assert!((meta.output_level_dbu.unwrap() - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_metadata_parses_upstream_user_fields() {
+        let json = r#"{"version":"0.5.0","architecture":"Linear","config":{"receptive_field":1},"weights":[1.0],
+            "metadata":{
+                "gain":0.25,
+                "name":"Amp",
+                "modeled_by":"Builder",
+                "gear_type":"amp",
+                "gear_make":"Make",
+                "gear_model":"Model",
+                "tone_type":"clean",
+                "validation_esr":0.0123
+            }}"#;
+        let model = get_dsp_from_json(json).unwrap();
+        let meta = model.metadata();
+        assert!((meta.gain.unwrap() - 0.25).abs() < 1e-6);
+        assert_eq!(meta.name.as_deref(), Some("Amp"));
+        assert_eq!(meta.modeled_by.as_deref(), Some("Builder"));
+        assert_eq!(meta.gear_type.as_deref(), Some("amp"));
+        assert_eq!(meta.gear_make.as_deref(), Some("Make"));
+        assert_eq!(meta.gear_model.as_deref(), Some("Model"));
+        assert_eq!(meta.tone_type.as_deref(), Some("clean"));
+        assert!((meta.validation_esr.unwrap() - 0.0123).abs() < 1e-6);
     }
 
     #[test]
@@ -359,7 +599,7 @@ mod tests {
                             model.process(&input, &mut output);
                             for (s, &val) in output.iter().enumerate() {
                                 assert!(
-                                    (val as f64).is_finite(),
+                                    val.is_finite(),
                                     "Non-finite output from {:?} at sample {}",
                                     path,
                                     s
@@ -368,7 +608,7 @@ mod tests {
                         }
                     }
                     Err(_) => {
-                        // Some models use unsupported features (slimmable, etc.)
+                        panic!("Failed to load fixture model {:?}", path);
                     }
                 }
             }
@@ -398,7 +638,7 @@ mod tests {
             model.process(input, &mut output);
             for (s, &val) in output.iter().enumerate() {
                 assert!(
-                    (val as f64).is_finite(),
+                    val.is_finite(),
                     "Non-finite at test {}, sample {}: {}",
                     idx,
                     s,
@@ -431,7 +671,7 @@ mod tests {
         let input = vec![0.1 as crate::dsp::Sample; 64];
         let mut output = vec![0.0 as crate::dsp::Sample; 64];
         model.process(&input, &mut output);
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -444,7 +684,7 @@ mod tests {
         let input = vec![0.1 as crate::dsp::Sample; 64];
         let mut output = vec![0.0 as crate::dsp::Sample; 64];
         model.process(&input, &mut output);
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     // ── C++ regression tests ──────────────────────────────────────────────
@@ -478,7 +718,7 @@ mod tests {
             }
 
             pos += 8 + chunk_size;
-            if chunk_size % 2 != 0 {
+            if !chunk_size.is_multiple_of(2) {
                 pos += 1;
             }
         }
@@ -498,9 +738,9 @@ mod tests {
         }
 
         let input_samples = read_wav_f32(input_path)?;
-        let ref_samples = read_wav_f32(&ref_path)?;
+        let ref_samples = read_wav_f32(ref_path.as_path())?;
 
-        let mut model = get_dsp(&model_path).ok()?;
+        let mut model = get_dsp(model_path.as_path()).ok()?;
 
         // Match C++ render: Reset(sampleRate, 64) then process in chunks of 64
         let sample_rate = model.metadata().expected_sample_rate.unwrap_or(48000.0);
@@ -522,7 +762,49 @@ mod tests {
         let mut max_diff: f64 = 0.0;
         let mut sum_sq_diff: f64 = 0.0;
         for i in 0..n {
-            let diff = (output[i] as f64 - ref_samples[i] as f64).abs();
+            let diff = (output[i] - ref_samples[i] as f64).abs();
+            max_diff = max_diff.max(diff);
+            sum_sq_diff += diff * diff;
+        }
+        let rms_diff = (sum_sq_diff / n as f64).sqrt();
+        Some((max_diff, rms_diff))
+    }
+
+    fn compare_model_to_reference(
+        model_path: &Path,
+        input_path: &Path,
+        ref_path: &Path,
+        prewarm: bool,
+    ) -> Option<(f64, f64)> {
+        if !model_path.exists() || !input_path.exists() || !ref_path.exists() {
+            return None;
+        }
+
+        let input_samples = read_wav_f32(input_path)?;
+        let ref_samples = read_wav_f32(ref_path)?;
+        let mut model = get_dsp(model_path).ok()?;
+
+        let sample_rate = model.metadata().expected_sample_rate.unwrap_or(48000.0);
+        model.reset(sample_rate, 64);
+        if prewarm {
+            model.prewarm();
+        }
+
+        let chunk_size = 64;
+        let mut output = Vec::with_capacity(input_samples.len());
+        for chunk in input_samples.chunks(chunk_size) {
+            let input: Vec<crate::dsp::Sample> =
+                chunk.iter().map(|&s| s as crate::dsp::Sample).collect();
+            let mut out_chunk = vec![0.0 as crate::dsp::Sample; input.len()];
+            model.process(&input, &mut out_chunk);
+            output.extend(out_chunk);
+        }
+
+        let n = output.len().min(ref_samples.len());
+        let mut max_diff: f64 = 0.0;
+        let mut sum_sq_diff: f64 = 0.0;
+        for i in 0..n {
+            let diff = (output[i] - ref_samples[i] as f64).abs();
             max_diff = max_diff.max(diff);
             sum_sq_diff += diff * diff;
         }
@@ -613,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // diagnostic report — run explicitly with: cargo test -p nam-core -- --ignored
+    #[ignore] // diagnostic report, run explicitly with: cargo test -p nam-core -- --ignored
     fn test_print_all_diffs() {
         let models = [
             "wavenet",
@@ -652,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // diagnostic report — run explicitly with: cargo test -p nam-core -- --ignored
+    #[ignore] // diagnostic report, run explicitly with: cargo test -p nam-core -- --ignored
     fn test_a2_max_divergence_profile() {
         let model_path = Path::new("test_fixtures/models/wavenet_a2_max.nam");
         let input_path = Path::new("test_fixtures/audio/test_input.wav");
@@ -662,8 +944,8 @@ mod tests {
         }
 
         let input_samples = read_wav_f32(input_path).unwrap();
-        let ref_samples = read_wav_f32(&ref_path).unwrap();
-        let mut model = get_dsp(&model_path).unwrap();
+        let ref_samples = read_wav_f32(ref_path).unwrap();
+        let mut model = get_dsp(model_path).unwrap();
         let sample_rate = model.metadata().expected_sample_rate.unwrap_or(48000.0);
         model.reset(sample_rate, 64);
         model.prewarm();
@@ -685,7 +967,7 @@ mod tests {
 
         // Report per-chunk divergence
         let chunk_report_size = 64;
-        let num_chunks = (n + chunk_report_size - 1) / chunk_report_size;
+        let num_chunks = n.div_ceil(chunk_report_size);
         let mut first_nonzero = None;
         let mut worst_chunk = 0usize;
         let mut worst_chunk_diff = 0.0f64;
@@ -696,7 +978,7 @@ mod tests {
             let mut max_diff = 0.0f64;
             let mut max_idx = start;
             for i in start..end {
-                let diff = (output[i] as f64 - ref_samples[i] as f64).abs();
+                let diff = (output[i] - ref_samples[i] as f64).abs();
                 if diff > max_diff {
                     max_diff = diff;
                     max_idx = i;
@@ -735,7 +1017,7 @@ mod tests {
 
         // Also show the 10 worst individual samples
         let mut diffs: Vec<(usize, f64)> = (0..n)
-            .map(|i| (i, (output[i] as f64 - ref_samples[i] as f64).abs()))
+            .map(|i| (i, (output[i] - ref_samples[i] as f64).abs()))
             .collect();
         diffs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         report.push_str("\nTop 10 worst samples:\n");
@@ -757,11 +1039,12 @@ mod tests {
             return;
         }
         let mut model = get_dsp(path).unwrap();
+        model.set_slimming(0.0).unwrap();
         let input = vec![0.1 as crate::dsp::Sample; 64];
         let mut output = vec![0.0 as crate::dsp::Sample; 64];
         model.process(&input, &mut output);
         assert!(
-            output.iter().all(|&x| (x as f64).is_finite()),
+            output.iter().all(|&x| x.is_finite()),
             "slimmable_wavenet produced non-finite output"
         );
     }
@@ -773,13 +1056,175 @@ mod tests {
             return;
         }
         let mut model = get_dsp(path).unwrap();
+        model.set_slimming(0.0).unwrap();
         let input = vec![0.1 as crate::dsp::Sample; 64];
         let mut output = vec![0.0 as crate::dsp::Sample; 64];
         model.process(&input, &mut output);
         assert!(
-            output.iter().all(|&x| (x as f64).is_finite()),
+            output.iter().all(|&x| x.is_finite()),
             "slimmable_container produced non-finite output"
         );
+    }
+
+    #[test]
+    fn test_get_dsp_sequential_linear_fixture() {
+        let path = Path::new("test_fixtures/models/sequential_linear.nam");
+        if !path.exists() {
+            return;
+        }
+        let mut model = get_dsp(path).unwrap();
+        let input = vec![1.0 as crate::dsp::Sample, 2.0, 4.0, 8.0];
+        let mut output = vec![0.0 as crate::dsp::Sample; input.len()];
+        model.process(&input, &mut output);
+
+        let expected = [0.75, 1.75, 3.25, 6.25];
+        for (actual, expected) in output.iter().zip(expected) {
+            assert!((*actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_get_dsp_sequential_requires_models() {
+        let json = r#"{
+            "version": "0.7.0",
+            "architecture": "Sequential",
+            "metadata": {},
+            "config": {"models": []},
+            "weights": []
+        }"#;
+        let Err(err) = get_dsp_from_json(json) else {
+            panic!("Sequential with no models should fail");
+        };
+        assert!(format!("{}", err).contains("non-empty"));
+    }
+
+    #[test]
+    fn test_get_dsp_a2_slimmable_container_upstream_style_fixture() {
+        let path = Path::new("test_fixtures/models/a2_slimmable_container_upstream_style.nam");
+        if !path.exists() {
+            return;
+        }
+        let mut model = get_dsp(path).unwrap();
+        let input = vec![0.1 as crate::dsp::Sample; 16];
+        let mut output = vec![0.0 as crate::dsp::Sample; 16];
+        model.process(&input, &mut output);
+        assert!(output.iter().all(|&x| x.is_finite()));
+    }
+
+    #[test]
+    fn test_a2_slimmable_container_set_slimming_selects_submodel() {
+        let path = Path::new("test_fixtures/models/a2_slimmable_container_upstream_style.nam");
+        if !path.exists() {
+            return;
+        }
+        let input = vec![0.1 as crate::dsp::Sample; 16];
+
+        let mut default_model = get_dsp(path).unwrap();
+        let mut default_output = vec![0.0 as crate::dsp::Sample; 16];
+        default_model.process(&input, &mut default_output);
+
+        let mut small_model = get_dsp(path).unwrap();
+        small_model.set_slimming(0.0).unwrap();
+        let mut small_output = vec![0.0 as crate::dsp::Sample; 16];
+        small_model.process(&input, &mut small_output);
+
+        let mut large_model = get_dsp(path).unwrap();
+        large_model.set_slimming(0.75).unwrap();
+        let mut large_output = vec![0.0 as crate::dsp::Sample; 16];
+        large_model.process(&input, &mut large_output);
+
+        assert_eq!(
+            default_output, large_output,
+            "SlimmableContainer should default to the largest submodel"
+        );
+        assert_ne!(
+            small_output, large_output,
+            "set_slimming should select a different upstream-style submodel"
+        );
+    }
+
+    #[test]
+    fn test_upstream_packed_a2_export_shape() {
+        let path = Path::new("test_fixtures/models/upstream_packed_a2_export.nam");
+        if !path.exists() {
+            return;
+        }
+
+        let content = std::fs::read_to_string(path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(root["architecture"], "SlimmableContainer");
+        assert_eq!(root["weights"].as_array().unwrap().len(), 0);
+
+        let submodels = root["config"]["submodels"].as_array().unwrap();
+        assert_eq!(submodels.len(), 2);
+        assert_eq!(submodels[0]["max_value"], 0.5);
+        assert_eq!(submodels[1]["max_value"], 1.0);
+
+        for entry in submodels {
+            assert_eq!(entry["model"]["architecture"], "WaveNet");
+            assert!(entry["model"]["config"]["layers"].is_array());
+            assert!(entry["model"]["weights"].as_array().unwrap().len() > 1);
+        }
+
+        let container_loudness = root["metadata"]["loudness"].as_f64().unwrap();
+        let largest_loudness = submodels[1]["model"]["metadata"]["loudness"]
+            .as_f64()
+            .unwrap();
+        assert!((container_loudness - largest_loudness).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_upstream_packed_a2_export_reference_render() {
+        let model_path = Path::new("test_fixtures/models/upstream_packed_a2_export.nam");
+        let input_path = Path::new("test_fixtures/audio/upstream_packed_a2_input.wav");
+        let ref_path = Path::new("test_fixtures/audio/upstream_packed_a2_ref.wav");
+
+        if let Some((max_diff, rms_diff)) =
+            compare_model_to_reference(model_path, input_path, ref_path, true)
+        {
+            assert!(
+                max_diff <= 2.0e-6,
+                "upstream_packed_a2_export: max_diff={:.2e}, rms_diff={:.2e}",
+                max_diff,
+                rms_diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_full_packed_a2_trained_export_shape() {
+        let path = Path::new("test_fixtures/models/upstream_full_packed_a2_trained.nam");
+        if !path.exists() {
+            return;
+        }
+
+        let content = std::fs::read_to_string(path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(root["architecture"], "SlimmableContainer");
+        assert_eq!(root["weights"].as_array().unwrap().len(), 0);
+
+        let submodels = root["config"]["submodels"].as_array().unwrap();
+        assert_eq!(submodels.len(), 2);
+        assert_eq!(submodels[0]["max_value"], 0.5);
+        assert_eq!(submodels[1]["max_value"], 1.0);
+
+        for entry in submodels {
+            let model = &entry["model"];
+            assert_eq!(model["architecture"], "WaveNet");
+            let head_scale = model["config"]["head_scale"].as_f64().unwrap();
+            let weights = model["weights"].as_array().unwrap();
+            let exported_head_scale = weights.last().and_then(|value| value.as_f64()).unwrap();
+            assert!((head_scale - exported_head_scale).abs() < 1e-12);
+            assert!((head_scale - 0.25).abs() > 1e-6);
+        }
+
+        let mut model = get_dsp(path).unwrap();
+        let input = vec![0.05 as crate::dsp::Sample; 32];
+        let mut output = vec![0.0 as crate::dsp::Sample; input.len()];
+        model.reset(48000.0, 32);
+        model.prewarm();
+        model.process(&input, &mut output);
+        assert!(output.iter().all(|&sample| sample.is_finite()));
     }
 
     #[test]
@@ -798,7 +1243,7 @@ mod tests {
             let mut output = vec![0.0 as crate::dsp::Sample; 64];
             model.process(&input, &mut output);
             assert!(
-                output.iter().all(|&x| (x as f64).is_finite()),
+                output.iter().all(|&x| x.is_finite()),
                 "slimmable_container: non-finite after multiple chunks"
             );
         }

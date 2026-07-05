@@ -539,10 +539,19 @@ mod tests {
         fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {}
         fn metadata(&self) -> &nam_core::dsp::DspMetadata {
             static META: nam_core::dsp::DspMetadata = nam_core::dsp::DspMetadata {
+                raw: None,
                 loudness: None,
+                gain: None,
                 expected_sample_rate: None,
+                name: None,
+                modeled_by: None,
+                gear_type: None,
+                gear_make: None,
+                gear_model: None,
+                tone_type: None,
                 input_level_dbu: None,
                 output_level_dbu: None,
+                validation_esr: None,
             };
             &META
         }
@@ -608,7 +617,7 @@ mod tests {
 
         // Check the latter half (fully settled)
         let tail = &output[1024..];
-        let mean: f64 = tail.iter().map(|&x| x as f64).sum::<f64>() / tail.len() as f64;
+        let mean: f64 = tail.iter().copied().sum::<f64>() / tail.len() as f64;
         assert!(
             (mean - 0.5).abs() < 0.05,
             "Mean output {:.4} should be close to input 0.5 after settling",
@@ -626,7 +635,10 @@ mod tests {
         let mut output = vec![0.0 as nam_core::Sample; 512];
         NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
 
-        assert!(!rs.input_pending.is_empty() || !rs.output_pending.is_empty() || true);
+        assert!(
+            !rs.input_pending.is_empty() || !rs.output_pending.is_empty(),
+            "processing should leave pending samples in at least one resampler buffer"
+        );
 
         // Reset should clear buffers
         rs.reset();

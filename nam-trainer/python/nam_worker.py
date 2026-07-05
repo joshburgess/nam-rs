@@ -16,6 +16,9 @@ import json
 import os
 import sys
 import traceback
+import inspect
+import shutil
+from pathlib import Path
 
 # Force matplotlib to use the non-interactive Agg backend BEFORE anything
 # imports it. The worker runs as a headless child process (CREATE_NO_WINDOW
@@ -52,10 +55,11 @@ def main():
     try:
         import pytorch_lightning as pl
         from nam.train import core
+        from nam.train import full as nam_full
         from nam.models.metadata import UserMetadata
     except ImportError as e:
         emit({"type": "error", "message": f"Missing dependency: {e}. "
-              "Install with: pip install neural-amp-modeler"})
+              "Install with: pip install --upgrade neural-amp-modeler"})
         sys.exit(1)
 
     # Custom callback for JSON progress reporting. We use
@@ -117,15 +121,24 @@ def main():
     # Build user metadata
     meta = request.get("metadata", {})
     user_metadata = None
-    if any(meta.get(k) for k in ("name", "modeled_by", "gear_make", "gear_model",
-                                   "gear_type", "tone_type")):
+    text_metadata_keys = (
+        "name",
+        "modeled_by",
+        "gear_make",
+        "gear_model",
+        "gear_type",
+        "tone_type",
+    )
+    level_metadata_keys = ("input_level_dbu", "output_level_dbu")
+    if any(meta.get(k) for k in text_metadata_keys) or any(
+        meta.get(k) is not None for k in level_metadata_keys
+    ):
         user_metadata_dict = {}
-        for key in ("name", "modeled_by", "gear_make", "gear_model",
-                     "gear_type", "tone_type"):
+        for key in text_metadata_keys:
             val = meta.get(key)
             if val:
                 user_metadata_dict[key] = val
-        for key in ("input_level_dbu", "output_level_dbu"):
+        for key in level_metadata_keys:
             val = meta.get(key)
             if val is not None:
                 user_metadata_dict[key] = val
@@ -137,6 +150,93 @@ def main():
     input_path = request["input_path"]
     output_paths = request["output_paths"]
     destination = request["destination"]
+    train_signature = inspect.signature(core.train)
+
+    def call_core_train(**kwargs):
+        supported = {
+            key: value for key, value in kwargs.items()
+            if key in train_signature.parameters
+        }
+        return core.train(**supported)
+
+    def supports_full_config_training():
+        required_core_attrs = (
+            "_detect_input_version",
+            "_analyze_latency",
+            "_get_final_latency",
+            "_check_data",
+            "_get_configs",
+        )
+        return all(hasattr(core, name) for name in required_core_attrs) and hasattr(
+            nam_full, "main"
+        )
+
+    def build_packed_full_configs(output_path):
+        input_version, _strong_match = core._detect_input_version(input_path)
+        latency_analysis = core._analyze_latency(
+            request.get("latency"),
+            input_version,
+            input_path,
+            output_path,
+            silent=True,
+        )
+        final_latency = core._get_final_latency(latency_analysis)
+        data_check_output = core._check_data(
+            input_path,
+            output_path,
+            input_version,
+            final_latency,
+            True,
+        )
+        if (
+            data_check_output is not None
+            and not data_check_output.passed
+            and not request.get("ignore_checks", False)
+        ):
+            raise RuntimeError(
+                "NAM data checks failed. Enable ignore checks to train anyway."
+            )
+
+        data_config, model_config, learning_config = core._get_configs(
+            input_version,
+            input_path,
+            output_path,
+            final_latency,
+            request.get("epochs", 100),
+            request.get("num_output_samples_per_datum", 8192),
+            request.get("batch_size", 16),
+        )
+
+        if "optimizer" in model_config and "lr" in model_config["optimizer"]:
+            model_config["optimizer"]["lr"] = request.get("lr", 0.004)
+
+        learning_config.setdefault("trainer", {})
+        learning_config["trainer"]["max_epochs"] = request.get("epochs", 100)
+        learning_config.setdefault("train_dataloader", {})
+        learning_config["train_dataloader"]["batch_size"] = request.get(
+            "batch_size", 16
+        )
+
+        return data_config, model_config, learning_config
+
+    def train_with_full_config(output_path, train_dir):
+        data_config, model_config, learning_config = build_packed_full_configs(
+            output_path
+        )
+        train_dir_path = Path(train_dir)
+        train_dir_path.mkdir(parents=True, exist_ok=True)
+        nam_full.main(
+            data_config,
+            model_config,
+            learning_config,
+            train_dir_path,
+            no_show=True,
+            make_plots=request.get("save_plot", True),
+        )
+        model_path = train_dir_path / "model.nam"
+        if not model_path.exists():
+            raise RuntimeError(f"Packed full training did not export {model_path}")
+        return str(model_path)
 
     for output_path in output_paths:
         basename = os.path.splitext(os.path.basename(output_path))[0]
@@ -148,41 +248,57 @@ def main():
         })
 
         try:
-            trained_model = core.train(
-                input_path=input_path,
-                output_path=output_path,
-                train_path=os.path.join(destination, basename),
-                epochs=request.get("epochs", 100),
-                latency=request.get("latency"),
-                architecture=request.get("architecture", "standard"),
-                batch_size=request.get("batch_size", 16),
-                lr=request.get("lr", 0.004),
-                lr_decay=request.get("lr_decay", 0.007),
-                seed=0,
-                save_plot=request.get("save_plot", True),
-                silent=True,  # No matplotlib popups
-                modelname=basename,
-                ignore_checks=request.get("ignore_checks", True),
-                fit_mrstft=request.get("fit_mrstft", True),
-                threshold_esr=request.get("threshold_esr"),
-                user_metadata=user_metadata,
-            )
+            architecture = request.get("architecture", "standard")
+            if request.get("packed", False):
+                architecture = "packed"
+            train_dir = os.path.join(destination, basename)
+            if (
+                request.get("packed", False)
+                and request.get("use_full_config_trainer", False)
+                and supports_full_config_training()
+            ):
+                emit({
+                    "type": "log",
+                    "message": "Using upstream packed full-config trainer path",
+                })
+                exported_model = train_with_full_config(output_path, train_dir)
+            else:
+                trained_model = call_core_train(
+                    input_path=input_path,
+                    output_path=output_path,
+                    train_path=train_dir,
+                    epochs=request.get("epochs", 100),
+                    latency=request.get("latency"),
+                    architecture=architecture,
+                    batch_size=request.get("batch_size", 16),
+                    ny=request.get("num_output_samples_per_datum", 8192),
+                    lr=request.get("lr", 0.004),
+                    lr_decay=request.get("lr_decay", 0.007),
+                    seed=0,
+                    save_plot=request.get("save_plot", True),
+                    silent=True,  # No matplotlib popups
+                    modelname=basename,
+                    ignore_checks=request.get("ignore_checks", False),
+                    fit_mrstft=request.get("fit_mrstft", True),
+                    threshold_esr=request.get("threshold_esr"),
+                    user_metadata=user_metadata,
+                )
+                exported_model = None
 
             # Find the .nam file. core.train() puts it deep inside
             # lightning_logs/version_N/checkpoints/. Search for it and
             # copy to the output directory with a clean name.
-            train_dir = os.path.join(destination, basename)
-            found_nam = None
-            for root, dirs, files in os.walk(train_dir):
-                for f in files:
-                    if f.endswith(".nam"):
-                        found_nam = os.path.join(root, f)
+            found_nam = exported_model
+            if found_nam is None:
+                for root, dirs, files in os.walk(train_dir):
+                    for f in files:
+                        if f.endswith(".nam"):
+                            found_nam = os.path.join(root, f)
+                            break
+                    if found_nam:
                         break
-                if found_nam:
-                    break
 
             if found_nam:
-                import shutil
                 final_path = os.path.join(destination, f"{basename}.nam")
                 shutil.copy2(found_nam, final_path)
                 model_path = final_path

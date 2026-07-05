@@ -16,6 +16,9 @@ pub struct Settings {
     pub latency: Option<i32>,
     pub threshold_esr: Option<f64>,
     pub save_plot: Option<bool>,
+    pub ignore_checks: Option<bool>,
+    pub num_output_samples_per_datum: Option<u32>,
+    pub use_full_config_trainer: Option<bool>,
 
     // Model metadata (persisted across restarts)
     pub meta_name: Option<String>,

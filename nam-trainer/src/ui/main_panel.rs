@@ -34,7 +34,10 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 fn show_header(app: &mut TrainerApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("NAM Trainer").size(20.0).strong());
-        ui.colored_label(DIM, egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.0));
+        ui.colored_label(
+            DIM,
+            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.0),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             show_status_badge(app, ui);
         });
@@ -150,7 +153,7 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
             }
         });
 
-        // Device selector — only show when multiple devices available.
+        // Device selector, only show when multiple devices available.
         // Clone out of python_status first so we can mutate `app` (e.g. to
         // re-run detection from the warning's Re-check button) below.
         let env_info = if let crate::app::PythonStatus::Ok {
@@ -398,8 +401,7 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 if ui.add_enabled(can_train, btn).clicked() || enter_pressed {
                     // Validate audio files before starting
                     if let Some(ref input) = app.input_path {
-                        let issues =
-                            crate::app::validate_audio_files(input, &app.output_paths);
+                        let issues = crate::app::validate_audio_files(input, &app.output_paths);
                         if !issues.is_empty() {
                             for issue in &issues {
                                 app.training_log.push(format!("Warning: {issue}"));
@@ -481,15 +483,14 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                         app.training_log.clear();
                         app.model_path = None;
                     }
-                    if app.destination_dir.is_some() {
-                        if ui
+                    if app.destination_dir.is_some()
+                        && ui
                             .button("Open Output Folder")
                             .on_hover_text("Open the output directory in your file manager")
                             .clicked()
-                        {
-                            if let Some(ref dir) = app.destination_dir {
-                                let _ = open::that(dir);
-                            }
+                    {
+                        if let Some(ref dir) = app.destination_dir {
+                            let _ = open::that(dir);
                         }
                     }
                 });
@@ -560,7 +561,7 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .clicked();
                 ui.colored_label(
                     RED,
-                    format!("Python {version} too old \u{2014} NAM requires {min_maj}.{min_min}+"),
+                    format!("Python {version} too old. NAM requires {min_maj}.{min_min}+"),
                 );
                 if clicked {
                     app.install_python();
@@ -582,7 +583,7 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 if msg.contains("not installed") {
                     let clicked = ui
                         .button("Install NAM")
-                        .on_hover_text("Runs: pip install neural-amp-modeler")
+                        .on_hover_text("Runs: pip install --upgrade neural-amp-modeler")
                         .clicked();
                     ui.colored_label(AMBER, "NAM not installed");
                     if clicked {
