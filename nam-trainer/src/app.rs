@@ -90,6 +90,7 @@ pub struct DetectionResult {
 
 /// Minimum Python version required by neural-amp-modeler.
 pub const NAM_MIN_PYTHON: (u32, u32) = (3, 10);
+pub const DEFAULT_OUTPUT_SAMPLES_PER_DATUM: u32 = 8192;
 
 #[derive(Clone, Debug)]
 pub enum PythonStatus {
@@ -131,6 +132,9 @@ pub struct TrainingConfig {
     pub lr_decay: f64,
     pub save_plot: bool,
     pub fit_mrstft: bool,
+    pub ignore_checks: bool,
+    pub num_output_samples_per_datum: u32,
+    pub use_full_config_trainer: bool,
 }
 
 impl Default for TrainingConfig {
@@ -145,12 +149,16 @@ impl Default for TrainingConfig {
             lr_decay: 0.007,
             save_plot: true,
             fit_mrstft: true,
+            ignore_checks: false,
+            num_output_samples_per_datum: DEFAULT_OUTPUT_SAMPLES_PER_DATUM,
+            use_full_config_trainer: false,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
+    Packed,
     Standard,
     Lite,
     Feather,
@@ -160,6 +168,7 @@ pub enum Architecture {
 impl Architecture {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Packed => "Packed A2",
             Self::Standard => "Standard",
             Self::Lite => "Lite",
             Self::Feather => "Feather",
@@ -168,11 +177,18 @@ impl Architecture {
     }
 
     pub fn all() -> &'static [Architecture] {
-        &[Self::Standard, Self::Lite, Self::Feather, Self::Nano]
+        &[
+            Self::Packed,
+            Self::Standard,
+            Self::Lite,
+            Self::Feather,
+            Self::Nano,
+        ]
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Packed => "packed",
             Self::Standard => "standard",
             Self::Lite => "lite",
             Self::Feather => "feather",
@@ -182,6 +198,7 @@ impl Architecture {
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "packed" | "a2" | "packed_a2" => Self::Packed,
             "lite" => Self::Lite,
             "feather" => Self::Feather,
             "nano" => Self::Nano,
@@ -191,9 +208,16 @@ impl Architecture {
 
     pub fn tooltip(self) -> &'static str {
         match self {
-            Self::Standard => "Best quality, largest model, slowest to train (~30 min for 100 epochs on GPU)",
+            Self::Packed => {
+                "Current upstream A2 packed WaveNet training, exports a SlimmableContainer"
+            }
+            Self::Standard => {
+                "Best quality, largest model, slowest to train (~30 min for 100 epochs on GPU)"
+            }
             Self::Lite => "Good quality with faster training and smaller model size",
-            Self::Feather => "Lightweight model for low-latency use, trades some accuracy for speed",
+            Self::Feather => {
+                "Lightweight model for low-latency use, trades some accuracy for speed"
+            }
             Self::Nano => "Smallest and fastest model, best for quick tests or low-power devices",
         }
     }
@@ -360,6 +384,15 @@ impl TrainerApp {
         if let Some(v) = settings.save_plot {
             config.save_plot = v;
         }
+        if let Some(v) = settings.ignore_checks {
+            config.ignore_checks = v;
+        }
+        if let Some(v) = settings.num_output_samples_per_datum {
+            config.num_output_samples_per_datum = v;
+        }
+        if let Some(v) = settings.use_full_config_trainer {
+            config.use_full_config_trainer = v;
+        }
 
         // Restore metadata from settings
         let metadata = ModelMetadata {
@@ -427,6 +460,9 @@ impl TrainerApp {
         self.settings.latency = self.config.latency;
         self.settings.threshold_esr = self.config.threshold_esr;
         self.settings.save_plot = Some(self.config.save_plot);
+        self.settings.ignore_checks = Some(self.config.ignore_checks);
+        self.settings.num_output_samples_per_datum = Some(self.config.num_output_samples_per_datum);
+        self.settings.use_full_config_trainer = Some(self.config.use_full_config_trainer);
         self.settings.save();
     }
 
@@ -595,11 +631,11 @@ impl TrainerApp {
             }
 
             let _ = tx.send(InstallMessage::Log(
-                "Installing neural-amp-modeler...".into(),
+                "Installing or upgrading neural-amp-modeler...".into(),
             ));
             let success = run_pip(
                 &python,
-                &["-m", "pip", "install", "neural-amp-modeler"],
+                &["-m", "pip", "install", "--upgrade", "neural-amp-modeler"],
                 &tx,
             );
             let _ = tx.send(InstallMessage::Done { success });
@@ -944,12 +980,13 @@ impl TrainerApp {
                 WorkerMessage::Log(text) => {
                     self.training_log.push(text);
                 }
-                WorkerMessage::TrainingStart { ref file, total_epochs } => {
+                WorkerMessage::TrainingStart {
+                    ref file,
+                    total_epochs,
+                } => {
                     self.current_file_index += 1;
-                    self.training_log.push(format!(
-                        "Training {} ({} epochs)...",
-                        file, total_epochs
-                    ));
+                    self.training_log
+                        .push(format!("Training {} ({} epochs)...", file, total_epochs));
                 }
                 WorkerMessage::EpochEnd {
                     epoch,
@@ -981,11 +1018,7 @@ impl TrainerApp {
                     ));
                 }
                 WorkerMessage::TrainingComplete { model_path } => {
-                    let final_esr = self
-                        .epoch_history
-                        .last()
-                        .map(|e| e.esr)
-                        .unwrap_or(0.0);
+                    let final_esr = self.epoch_history.last().map(|e| e.esr).unwrap_or(0.0);
                     self.training_log.push(format!(
                         "Training complete! ESR={:.6} Model: {}",
                         final_esr, model_path
@@ -1026,10 +1059,7 @@ impl TrainerApp {
 
 /// Validate that audio files are suitable for training. Returns a list of
 /// warnings/errors. An empty list means everything looks good.
-pub fn validate_audio_files(
-    input_path: &str,
-    output_paths: &[String],
-) -> Vec<String> {
+pub fn validate_audio_files(input_path: &str, output_paths: &[String]) -> Vec<String> {
     let mut issues = Vec::new();
 
     let input_spec = match hound::WavReader::open(input_path) {
@@ -1089,10 +1119,7 @@ pub fn validate_audio_files(
         }
 
         if output_duration < 1.0 {
-            issues.push(format!(
-                "{basename}: very short ({:.1}s)",
-                output_duration
-            ));
+            issues.push(format!("{basename}: very short ({:.1}s)", output_duration));
         }
 
         let ratio = if input_duration > 0.0 {
@@ -1100,7 +1127,7 @@ pub fn validate_audio_files(
         } else {
             1.0
         };
-        if ratio < 0.5 || ratio > 2.0 {
+        if !(0.5..=2.0).contains(&ratio) {
             issues.push(format!(
                 "{basename}: duration ({:.1}s) differs significantly from input ({:.1}s)",
                 output_duration, input_duration
@@ -1450,9 +1477,7 @@ impl eframe::App for TrainerApp {
                 )));
             }
             _ => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-                    "NAM Trainer".to_string(),
-                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title("NAM Trainer".to_string()));
             }
         }
 
@@ -1477,5 +1502,26 @@ impl eframe::App for TrainerApp {
         if self.show_metadata {
             ui::metadata_panel::show(self, ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Architecture;
+
+    #[test]
+    fn packed_architecture_round_trips() {
+        assert_eq!(Architecture::Packed.as_str(), "packed");
+        assert_eq!(Architecture::from_str("packed"), Architecture::Packed);
+        assert_eq!(Architecture::from_str("a2"), Architecture::Packed);
+        assert_eq!(Architecture::from_str("packed_a2"), Architecture::Packed);
+    }
+
+    #[test]
+    fn packed_architecture_is_available_first() {
+        assert_eq!(
+            Architecture::all().first().copied(),
+            Some(Architecture::Packed)
+        );
     }
 }

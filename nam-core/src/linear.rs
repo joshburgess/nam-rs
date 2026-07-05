@@ -4,6 +4,7 @@ use crate::util::WeightIter;
 
 pub struct Linear {
     weights: Vec<f32>,
+    bias: f32,
     history: Vec<f32>,
     history_pos: usize,
     metadata: DspMetadata,
@@ -19,14 +20,17 @@ impl Linear {
             .as_u64()
             .ok_or_else(|| NamError::MissingField("receptive_field".into()))?
             as usize;
+        let has_bias = config["bias"].as_bool().unwrap_or(false);
 
         let mut iter = WeightIter::new(weights);
         let w = iter.take(receptive_field)?;
         let w = w.to_vec();
+        let bias = if has_bias { iter.take(1)?[0] } else { 0.0 };
         iter.assert_exhausted()?;
 
         Ok(Self {
             weights: w,
+            bias,
             history: vec![0.0; receptive_field],
             history_pos: 0,
             metadata,
@@ -45,6 +49,7 @@ impl Dsp for Linear {
                 let idx = (self.history_pos + len - j) % len;
                 sum += w * self.history[idx];
             }
+            sum += self.bias;
             output[i] = sum as Sample;
 
             self.history_pos = (self.history_pos + 1) % len;
@@ -80,6 +85,29 @@ mod tests {
         model.process(&input, &mut output);
         assert!((output[0] - 0.5).abs() < 1e-6);
         assert!((output[1] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bias() {
+        let config = serde_json::json!({
+            "receptive_field": 1,
+            "bias": true
+        });
+        let mut model = Linear::from_config(&config, &[2.0, 0.25], DspMetadata::default()).unwrap();
+        let input = vec![0.5 as Sample, -0.5 as Sample];
+        let mut output = vec![0.0 as Sample; 2];
+        model.process(&input, &mut output);
+        assert!((output[0] - 1.25).abs() < 1e-6);
+        assert!((output[1] + 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_bias_weight_required_when_enabled() {
+        let config = serde_json::json!({
+            "receptive_field": 1,
+            "bias": true
+        });
+        assert!(Linear::from_config(&config, &[1.0], DspMetadata::default()).is_err());
     }
 
     #[test]

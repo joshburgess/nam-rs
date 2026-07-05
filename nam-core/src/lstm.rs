@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2};
 
 use crate::dsp::{Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::{sigmoid, WeightIter};
+use crate::util::{sigmoid, tanh_auto, WeightIter};
 
 struct LstmCell {
     /// Combined weight matrix [4*hidden, input_size + hidden_size], row-major.
@@ -14,6 +14,8 @@ struct LstmCell {
     xh: Array1<f32>,
     /// Cell state.
     c: Array1<f32>,
+    initial_hidden: Array1<f32>,
+    initial_cell: Array1<f32>,
     /// Scratch for gate pre-activations.
     ifgo: Array1<f32>,
     input_size: usize,
@@ -36,7 +38,9 @@ impl LstmCell {
             w,
             b,
             xh,
-            c: initial_cell,
+            c: initial_cell.clone(),
+            initial_hidden,
+            initial_cell,
             ifgo: Array1::zeros(4 * hidden_size),
             input_size,
             hidden_size,
@@ -61,16 +65,25 @@ impl LstmCell {
         for i in 0..h {
             let ig = sigmoid(self.ifgo[i]); // input gate
             let fg = sigmoid(self.ifgo[i + h]); // forget gate
-            let gg = self.ifgo[i + 2 * h].tanh(); // cell gate
+            let gg = tanh_auto(self.ifgo[i + 2 * h]); // cell gate
             let og = sigmoid(self.ifgo[i + 3 * h]); // output gate
 
             self.c[i] = fg * self.c[i] + ig * gg;
-            self.xh[self.input_size + i] = og * self.c[i].tanh();
+            self.xh[self.input_size + i] = og * tanh_auto(self.c[i]);
         }
     }
 
     fn hidden_state(&self) -> ndarray::ArrayView1<'_, f32> {
         self.xh.slice(ndarray::s![self.input_size..])
+    }
+
+    fn reset(&mut self) {
+        self.xh.slice_mut(ndarray::s![..self.input_size]).fill(0.0);
+        self.xh
+            .slice_mut(ndarray::s![self.input_size..])
+            .assign(&self.initial_hidden);
+        self.c.assign(&self.initial_cell);
+        self.ifgo.fill(0.0);
     }
 }
 
@@ -94,6 +107,11 @@ impl Lstm {
             .as_u64()
             .ok_or_else(|| NamError::MissingField("num_layers".into()))?
             as usize;
+        if num_layers == 0 {
+            return Err(NamError::InvalidConfig(
+                "LSTM num_layers must be greater than zero".into(),
+            ));
+        }
         let input_size = config["input_size"]
             .as_u64()
             .ok_or_else(|| NamError::MissingField("input_size".into()))?
@@ -155,17 +173,19 @@ impl Dsp for Lstm {
                 self.cells[layer].process(&prev_hidden);
             }
 
-            // Head linear layer
-            // cells is always non-empty (populated in from_config)
-            let final_hidden = self.cells.last().expect("LSTM has no cells").hidden_state();
-            let out = self.head_weight.row(0).dot(&final_hidden) + self.head_bias[0];
-            output[i] = out as Sample;
+            if let Some(final_cell) = self.cells.last() {
+                let out =
+                    self.head_weight.row(0).dot(&final_cell.hidden_state()) + self.head_bias[0];
+                output[i] = out as Sample;
+            }
         }
     }
 
     fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {
-        // LSTM state persists (initial state was set at construction).
-        // A full reset would require re-loading the model.
+        for cell in &mut self.cells {
+            cell.reset();
+        }
+        self.input_buf.fill(0.0);
     }
 
     fn prewarm_samples(&self) -> usize {
@@ -207,7 +227,7 @@ mod tests {
 
         let mut model = Lstm::from_config(config, &weights, metadata).unwrap();
 
-        // Process some silence — should not panic
+        // Process some silence, should not panic
         let input = vec![0.0 as Sample; 64];
         let mut output = vec![0.0 as Sample; 64];
         model.process(&input, &mut output);
@@ -301,6 +321,27 @@ mod tests {
     }
 
     #[test]
+    fn test_lstm_reset_restores_initial_state() {
+        let path = Path::new("test_fixtures/models/lstm.nam");
+        if !path.exists() {
+            return;
+        }
+        let mut model = crate::get_dsp(path).unwrap();
+        let input = vec![0.25 as Sample; 32];
+        let mut first = vec![0.0 as Sample; input.len()];
+        model.process(&input, &mut first);
+
+        let drive_state = vec![0.75 as Sample; 16];
+        let mut ignored = vec![0.0 as Sample; drive_state.len()];
+        model.process(&drive_state, &mut ignored);
+        model.reset(48_000.0, 64);
+
+        let mut after_reset = vec![0.0 as Sample; input.len()];
+        model.process(&input, &mut after_reset);
+        assert_eq!(first, after_reset);
+    }
+
+    #[test]
     fn test_lstm_silence_stabilizes() {
         let path = Path::new("test_fixtures/models/lstm.nam");
         if !path.exists() {
@@ -357,7 +398,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 16];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -376,8 +417,19 @@ mod tests {
         let mut output = vec![0.0 as Sample; 8];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
         assert!(output.iter().any(|&x| x != 0.0));
+    }
+
+    #[test]
+    fn test_lstm_rejects_zero_layers() {
+        let config = serde_json::json!({
+            "input_size": 1, "hidden_size": 2, "num_layers": 0
+        });
+        let Err(err) = Lstm::from_config(&config, &[], DspMetadata::default()) else {
+            panic!("zero-layer LSTM should fail");
+        };
+        assert!(format!("{err}").contains("num_layers"));
     }
 
     #[test]
@@ -450,16 +502,13 @@ mod tests {
         let mut output = vec![0.0 as Sample; 32];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
         // Output should not be constant
-        let min = output
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, |a, b| a.min(b as f64));
+        let min = output.iter().copied().fold(f64::INFINITY, |a, b| a.min(b));
         let max = output
             .iter()
             .copied()
-            .fold(f64::NEG_INFINITY, |a, b| a.max(b as f64));
+            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
         assert!(max - min > 1e-6, "LSTM output should vary with sine input");
     }
 
@@ -477,7 +526,7 @@ mod tests {
             let mut output = vec![0.0 as Sample; size];
             model.process(&input, &mut output);
             assert!(
-                output.iter().all(|&x| (x as f64).is_finite()),
+                output.iter().all(|&x| x.is_finite()),
                 "Non-finite output at buffer size {}",
                 size
             );

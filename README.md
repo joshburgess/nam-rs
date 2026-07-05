@@ -1,6 +1,6 @@
 # nam-rs
 
-A Rust reimplementation of [NeuralAmpModelerCore](https://github.com/sdatkinson/NeuralAmpModelerCore) — the real-time DSP inference engine for [Neural Amp Modeler](https://github.com/sdatkinson/neural-amp-modeler).
+A Rust reimplementation of [NeuralAmpModelerCore](https://github.com/sdatkinson/NeuralAmpModelerCore), the real-time DSP inference engine for [Neural Amp Modeler](https://github.com/sdatkinson/neural-amp-modeler).
 
 Loads `.nam` model files produced by the NAM Python trainer and processes audio identically to the C++ implementation.
 
@@ -70,11 +70,11 @@ cargo run --release -p nam-trainer
 ```
 
 **Features:**
-- **One-click environment setup** — auto-discovers Python installations, installs Miniforge and `neural-amp-modeler` with a single button click, detects NVIDIA/Apple GPU hardware
-- **Training workflow** — select input/output audio files, configure model architecture (Standard/Lite/Feather/Nano), epochs, batch size, and advanced parameters, then train with a live loss curve plot and streaming log
-- **Device selection** — automatically detects available training devices (CPU, CUDA GPUs, Apple MPS) and selects the best one
-- **Model metadata** — set model name, gear type, tone type, and other metadata fields embedded in the `.nam` file
-- **Cross-platform** — builds and runs on macOS, Linux, and Windows with platform-specific Python discovery and Miniforge installation
+- **One-click environment setup**: auto-discovers Python installations, installs Miniforge and upgrades `neural-amp-modeler` with a single button click, detects NVIDIA/Apple GPU hardware
+- **Training workflow**: select input/output audio files, configure model architecture (Packed A2/Standard/Lite/Feather/Nano), epochs, batch size, output samples per datum, upstream data checks, and advanced parameters, then train with a live loss curve plot and streaming log
+- **Device selection**: automatically detects available training devices (CPU, CUDA GPUs, Apple MPS) and selects the best one
+- **Model metadata**: set model name, gear type, tone type, and other metadata fields embedded in the `.nam` file
+- **Cross-platform**: builds and runs on macOS, Linux, and Windows with platform-specific Python discovery and Miniforge installation
 
 The trainer drives the upstream [neural-amp-modeler](https://github.com/sdatkinson/neural-amp-modeler) Python package via a JSON-based worker protocol over stdin/stdout. The Rust GUI handles all environment management and progress visualization while the Python process does the actual PyTorch training.
 
@@ -90,7 +90,7 @@ Compared against C++ NeuralAmpModelerCore reference output (2 seconds of audio a
 | wavenet_a1_standard (16/8ch, 20 layers) | 6.42e-07 |
 | wavenet_a2_max (all advanced features) | 7.15e-06 |
 
-All differences are at the f32 precision floor and completely inaudible. The largest divergence (wavenet_a2_max at 7.15e-6) represents approximately -103 dB below the signal — far below the threshold of human hearing for distortion artifacts. These differences arise from floating-point accumulation order between Rust and Eigen's SIMD GEMM microkernels in the C++ implementation.
+All differences are at the f32 precision floor and completely inaudible. The largest divergence (wavenet_a2_max at 7.15e-6) represents approximately -103 dB below the signal, far below the threshold of human hearing for distortion artifacts. These differences arise from floating-point accumulation order between Rust and Eigen's SIMD GEMM microkernels in the C++ implementation.
 
 ## Performance
 
@@ -154,34 +154,34 @@ The pure Rust implementation started at 1.8-2.4x slower than C++ on large models
 
 The remaining gap after algorithmic fixes was caused by Rust's strict IEEE 754 float semantics preventing the compiler from reordering float operations, using FMA instructions freely, or vectorizing loops as aggressively as C with `-ffast-math`. The `fast-kernels` feature compiles a small C file (`csrc/fast_kernels.c`) with `-O3 -ffast-math` via the `cc` crate, providing optimized versions of:
 
-- **Conv1d inner loops** — depthwise multiply-accumulate and small matrix-vector products, processed as one coarse-grained call per Conv1d block to amortize FFI overhead
-- **Conv1x1 GEMM** — generic small matrix multiply with fused bias for all channel configurations
-- **FiLM operations** — scale+shift and scale-only, both out-of-place and in-place variants
-- **Fused add+activate** — combines `z = conv_output + mixin_output` and `z = tanh(z)` into a single pass, eliminating an intermediate buffer read/write
-- **Gated/blended activations** — applies two different activation functions and combines them (multiply for gated, linear blend for blended) in one pass
-- **Element-wise operations** — vector add, vector add-in-place, bias addition, all compiled with fast-math for better vectorization
-- **Full SGEMM** — column-major matrix multiply for the large-matrix path
+- **Conv1d inner loops**: depthwise multiply-accumulate and small matrix-vector products, processed as one coarse-grained call per Conv1d block to amortize FFI overhead
+- **Conv1x1 GEMM**: generic small matrix multiply with fused bias for all channel configurations
+- **FiLM operations**: scale+shift and scale-only, both out-of-place and in-place variants
+- **Fused add+activate**: combines `z = conv_output + mixin_output` and `z = tanh(z)` into a single pass, eliminating an intermediate buffer read/write
+- **Gated/blended activations**: applies two different activation functions and combines them (multiply for gated, linear blend for blended) in one pass
+- **Element-wise operations**: vector add, vector add-in-place, bias addition, all compiled with fast-math for better vectorization
+- **Full SGEMM**: column-major matrix multiply for the large-matrix path
 
-The C code is trivial — the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is under 300 lines. The performance comes from the compiler flag, not the language.
+The C code is trivial: the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is under 300 lines. The performance comes from the compiler flag, not the language.
 
 **What I tried that didn't help:**
 
-- **LLVM `-enable-unsafe-fp-math` flag** — Rust's frontend generates more conservative IR than C's frontend, so the backend flag alone doesn't replicate `-ffast-math`. No measurable improvement.
-- **Apple Accelerate / BLAS** — dispatch overhead for BLAS routines exceeded the compute time for NAM's small matrices (8x16, 4x1). Pure Rust `matrixmultiply` was faster.
-- **Nightly `core::intrinsics::fadd_fast`/`fmul_fast`** — per-operation fast-math intrinsics didn't help because LLVM doesn't propagate them to enable loop-level vectorization the way a global `-ffast-math` flag does.
-- **Hand-written NEON SIMD kernels** — per-element SIMD kernels called per kernel tap had higher overhead than letting the compiler auto-vectorize the scalar loops. A hand-tuned 8x16 GEMM kernel matched `matrixmultiply` but didn't beat it.
-- **Fused Conv1d loop (frame-outer)** — restructuring the Conv1d from tap-outer to frame-outer (to keep accumulators in registers across all taps) hurt cache performance because it accessed multiple tap data arrays per frame instead of streaming through one at a time.
-- **Fused layer pipeline (mixin + add + activation in one pass)** — prevented the compiler from auto-vectorizing each simple pass independently, resulting in slower code than separate passes.
+- **LLVM `-enable-unsafe-fp-math` flag**: Rust's frontend generates more conservative IR than C's frontend, so the backend flag alone doesn't replicate `-ffast-math`. No measurable improvement.
+- **Apple Accelerate / BLAS**: dispatch overhead for BLAS routines exceeded the compute time for NAM's small matrices (8x16, 4x1). Pure Rust `matrixmultiply` was faster.
+- **Nightly `core::intrinsics::fadd_fast`/`fmul_fast`**: per-operation fast-math intrinsics didn't help because LLVM doesn't propagate them to enable loop-level vectorization the way a global `-ffast-math` flag does.
+- **Hand-written NEON SIMD kernels**: per-element SIMD kernels called per kernel tap had higher overhead than letting the compiler auto-vectorize the scalar loops. A hand-tuned 8x16 GEMM kernel matched `matrixmultiply` but didn't beat it.
+- **Fused Conv1d loop (frame-outer)**: restructuring the Conv1d from tap-outer to frame-outer (to keep accumulators in registers across all taps) hurt cache performance because it accessed multiple tap data arrays per frame instead of streaming through one at a time.
+- **Fused layer pipeline (mixin + add + activation in one pass)**: prevented the compiler from auto-vectorizing each simple pass independently, resulting in slower code than separate passes.
 
 ### Where the remaining 5-16% gap comes from
 
 Nearly every float operation in the hot path now goes through C code compiled with `-ffast-math`, so compiler flags are no longer the primary difference. The remaining gap is architectural:
 
-1. **Eigen expression templates eliminate intermediate buffers.** In C++, Eigen can write `z = conv_output + mixin_output` and the compiler sees it as one fused operation — no intermediate buffer is ever materialized. In my code, even with C kernels, I write the Conv1d output to one buffer, write the mixin output to another, then call a C function to combine them into a third. That's three separate buffers and two memory passes where Eigen does one. This applies to every step in the pipeline.
+1. **Eigen expression templates eliminate intermediate buffers.** In C++, Eigen can write `z = conv_output + mixin_output` and the compiler sees it as one fused operation. No intermediate buffer is ever materialized. In my code, even with C kernels, I write the Conv1d output to one buffer, write the mixin output to another, then call a C function to combine them into a third. That's three separate buffers and two memory passes where Eigen does one. This applies to every step in the pipeline.
 
 2. **Monolithic compilation vs. compositional architecture.** My code has separate structs for Conv1d, Conv1x1, and FiLM, with method calls between them. Each method call is a function boundary the optimizer can't see across, especially across the Rust/C FFI boundary. Eigen compiles the entire layer pipeline as one function body where the optimizer sees everything and can keep intermediate values in registers across operations.
 
-3. **FFI call overhead is minor but measurable.** Each C kernel call has a small fixed cost (~5-10ns). For the a2_max model with its nested condition_dsp WaveNet, there are roughly 200+ C kernel calls per 64-sample buffer. However, empirical testing showed that eliminating these calls by fusing the post-convolution pipeline into a single C function produced no measurable improvement — the overhead is only ~0.4% of total runtime.
+3. **FFI call overhead is minor but measurable.** Each C kernel call has a small fixed cost (~5-10ns). For the a2_max model with its nested condition_dsp WaveNet, there are roughly 200+ C kernel calls per 64-sample buffer. However, empirical testing showed that eliminating these calls by fusing the post-convolution pipeline into a single C function produced no measurable improvement. The overhead is only ~0.4% of total runtime.
 
 ### What it would take to close the gap completely
 
@@ -190,7 +190,7 @@ I tested a monolithic C approach that fused the entire post-convolution pipeline
 1. **Monolithic function** with all FiLM/gating/head parameters: **8–11% regression**. The large parameter list and conditional branches caused register pressure, defeating the compiler's ability to optimize each individual loop.
 2. **Focused per-gating-mode functions** (ungated/gated/blended) with no FiLM, minimal parameters, keeping z in stack registers: **0% change** (within noise). The theoretical FFI overhead savings is only ~0.4% of total runtime (~300ns out of ~70µs for the standard model), far too small to measure.
 
-The experiment confirms that the remaining gap is not from FFI overhead or intermediate buffers at the Rust/C boundary — it's from Eigen's expression template fusion happening *inside* the convolution operations (across kernel taps) and GCC/Clang's ability to optimize across function boundaries within a single monolithic compilation unit. These are architectural properties of the C++ approach that can't be replicated by reorganizing the FFI boundary.
+The experiment confirms that the remaining gap is not from FFI overhead or intermediate buffers at the Rust/C boundary. It's from Eigen's expression template fusion happening *inside* the convolution operations (across kernel taps) and GCC/Clang's ability to optimize across function boundaries within a single monolithic compilation unit. These are architectural properties of the C++ approach that can't be replicated by reorganizing the FFI boundary.
 
 A future Rust `#[fast_math]` function attribute (discussed in RFCs but not on the language roadmap) would allow the Rust compiler to apply the same float optimizations that `-ffast-math` enables in C, without needing FFI at all. This would close the gap entirely while keeping everything in pure Rust.
 
@@ -199,17 +199,21 @@ A future Rust `#[fast_math]` function attribute (discussed in RFCs but not on th
 | Feature | Status |
 |---------|--------|
 | WaveNet (standard/lite/feather/nano presets) | Supported |
+| Sequential compositional models | Supported |
 | LSTM (all presets) | Supported |
 | ConvNet | Supported |
-| Linear | Supported |
+| Linear | Supported, including optional bias |
 | FiLM conditioning (all 8 positions) | Supported |
 | Gated/blended activations | Supported |
 | Grouped convolutions | Supported |
 | head1x1 output projection | Supported |
 | Nested condition_dsp | Supported |
-| SlimmableWaveNet | Supported |
+| Top-level WaveNet head | Supported |
+| A2 config aliases (`layers_configs`, `head_1x1_config`, `film_params`) | Supported |
+| SlimmableWaveNet | Supported for standalone channel-width selection via `Dsp::set_slimming` |
 | SlimmableContainer | Supported |
-| All activations (Tanh, ReLU, Sigmoid, SiLU, Softsign, HardSwish, PReLU, etc.) | Supported |
+| All activations (Tanh, ReLU, Sigmoid, SiLU, Softsign, Softsigmoid, HardSwish, PReLU, etc.) | Supported |
+| Upstream metadata | Supported, including raw metadata preservation and common typed fields |
 | Version 0.5-0.7 model files | Supported |
 
 ## Testing

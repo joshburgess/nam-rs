@@ -162,6 +162,16 @@ impl ColMajorMatrix {
     }
 }
 
+fn zero_inactive_rows(data: &mut [f32], rows: usize, active_rows: usize, num_cols: usize) {
+    if active_rows >= rows {
+        return;
+    }
+    for f in 0..num_cols {
+        let off = f * rows;
+        data[off + active_rows..off + rows].fill(0.0);
+    }
+}
+
 // ── Ring Buffer 2D (column-major, matching C++ RingBuffer) ──────────────────
 
 struct RingBuffer2D {
@@ -594,6 +604,26 @@ impl Conv1d {
         groups: usize,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
+        Self::from_weights_with_bias(
+            in_channels,
+            out_channels,
+            kernel_size,
+            dilation,
+            groups,
+            true,
+            iter,
+        )
+    }
+
+    fn from_weights_with_bias(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        dilation: usize,
+        groups: usize,
+        has_bias: bool,
+        iter: &mut WeightIter,
+    ) -> Result<Self, NamError> {
         let is_depthwise = groups == in_channels && in_channels == out_channels;
 
         let weights = if is_depthwise {
@@ -602,7 +632,7 @@ impl Conv1d {
             let mut dw: Vec<Vec<f32>> = (0..kernel_size)
                 .map(|_| vec![0.0f32; in_channels])
                 .collect();
-            // Indexes dw[k][c] and taps[k] simultaneously — can't use iterators
+            // Indexes dw[k][c] and taps[k] simultaneously, can't use iterators
             #[allow(clippy::needless_range_loop)]
             for c in 0..in_channels {
                 let taps = iter.take(kernel_size)?;
@@ -637,7 +667,11 @@ impl Conv1d {
             Conv1dWeights::General(tap_weights_colmajor)
         };
 
-        let bias = iter.take(out_channels)?.to_vec();
+        let bias = if has_bias {
+            iter.take(out_channels)?.to_vec()
+        } else {
+            vec![0.0; out_channels]
+        };
 
         // Build flat weights for C FFI
         #[cfg(feature = "fast-kernels")]
@@ -651,7 +685,7 @@ impl Conv1d {
                 flat
             }
             Conv1dWeights::General(taps) => {
-                // flat_weights[k * (out_ch * in_ch) + ...] — just concatenate
+                // flat_weights[k * (out_ch * in_ch) + ...], just concatenate
                 let mut flat = Vec::with_capacity(kernel_size * out_channels * in_channels);
                 for tap in taps {
                     flat.extend_from_slice(tap);
@@ -768,7 +802,7 @@ impl Conv1d {
         }
 
         // Initialize output with bias (fused: eliminates separate bias-add pass)
-        // (unreachable when fast-kernels feature is enabled — the block above returns early)
+        // (unreachable when fast-kernels feature is enabled, the block above returns early)
         #[allow(unreachable_code)]
         for f in 0..num_frames {
             let off = f * out_ch;
@@ -1362,6 +1396,10 @@ impl WaveNetLayer {
         }
     }
 
+    fn zero_state(&mut self) {
+        self.conv.zero_state();
+    }
+
     /// Block processing matching C++ _Layer::Process.
     /// input: (channels x num_frames), condition: (condition_size x num_frames)
     /// Results stored in self.output_next_layer and self.output_head.
@@ -1370,9 +1408,16 @@ impl WaveNetLayer {
         input: &ColMajorMatrix,
         condition: &ColMajorMatrix,
         num_frames: usize,
+        active_channels: Option<usize>,
     ) {
         let bottleneck = self.bottleneck;
         let z_rows = self.conv.out_channels; // 2*bottleneck when gated, bottleneck when not
+        let active_bottleneck = active_channels.unwrap_or(bottleneck).min(bottleneck);
+        let active_z_rows = if active_channels.is_some() && self.gating_mode != GatingMode::None {
+            (2 * active_bottleneck).min(z_rows)
+        } else {
+            active_bottleneck
+        };
 
         // Step 1: Input convolution
         if let Some(ref mut film) = self.conv_pre_film {
@@ -1454,6 +1499,9 @@ impl WaveNetLayer {
                     self.conv.output_buf.data[i] + self.input_mixin.output_buf.data[i];
             }
         }
+        if active_channels.is_some() {
+            zero_inactive_rows(&mut self.z_buf.data, z_rows, active_z_rows, num_frames);
+        }
 
         // Optional activation_pre_film
         if let Some(ref mut film) = self.activation_pre_film {
@@ -1476,33 +1524,87 @@ impl WaveNetLayer {
                 if let Some(ref mut film) = self.activation_post_film {
                     film.process_block_inplace(&mut self.z_buf.data, z_rows, condition, num_frames);
                 }
+                if active_channels.is_some() {
+                    zero_inactive_rows(&mut self.z_buf.data, z_rows, active_bottleneck, num_frames);
+                }
 
                 // layer1x1
                 if let Some(ref mut l1x1) = self.layer1x1 {
                     l1x1.process_block(&self.z_buf, num_frames);
+                    if active_channels.is_some() {
+                        zero_inactive_rows(
+                            &mut l1x1.output_buf.data,
+                            l1x1.out_channels,
+                            active_channels
+                                .unwrap_or(l1x1.out_channels)
+                                .min(l1x1.out_channels),
+                            num_frames,
+                        );
+                    }
                 }
             }
             GatingMode::Gated => {
                 // Gating: output[c] = primary(z[c]) * secondary(z[bottleneck+c])
-                #[cfg(feature = "fast-kernels")]
-                {
-                    let p_id = self.activation.c_type_id();
-                    let s_id = self.secondary_activation.c_type_id();
-                    if let (Some(p), Some(s)) = (p_id, s_id) {
-                        let use_fast = crate::util::is_fast_tanh_enabled();
-                        unsafe {
-                            crate::fast_kernels::fast_gated_activation(
-                                self.z_buf.data.as_mut_ptr(),
-                                z_rows,
-                                bottleneck,
-                                num_frames,
-                                p,
-                                s,
-                                use_fast as i32,
+                if active_channels.is_some() {
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        for c in 0..active_bottleneck {
+                            let primary = self.activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + c],
+                                c,
+                                use_fast,
                             );
+                            let gate = self.secondary_activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + active_bottleneck + c],
+                                c,
+                                use_fast,
+                            );
+                            self.z_buf.data[z_off + c] = primary * gate;
                         }
-                    } else {
-                        // Fallback for PReLU/LeakyRelu with per-channel params
+                    }
+                    zero_inactive_rows(&mut self.z_buf.data, z_rows, active_bottleneck, num_frames);
+                } else {
+                    #[cfg(feature = "fast-kernels")]
+                    {
+                        let p_id = self.activation.c_type_id();
+                        let s_id = self.secondary_activation.c_type_id();
+                        if let (Some(p), Some(s)) = (p_id, s_id) {
+                            let use_fast = crate::util::is_fast_tanh_enabled();
+                            unsafe {
+                                crate::fast_kernels::fast_gated_activation(
+                                    self.z_buf.data.as_mut_ptr(),
+                                    z_rows,
+                                    bottleneck,
+                                    num_frames,
+                                    p,
+                                    s,
+                                    use_fast as i32,
+                                );
+                            }
+                        } else {
+                            // Fallback for PReLU/LeakyRelu with per-channel params
+                            let use_fast = crate::util::is_fast_tanh_enabled();
+                            for f in 0..num_frames {
+                                let z_off = f * z_rows;
+                                for c in 0..bottleneck {
+                                    let primary = self.activation.apply_scalar_channel_fast(
+                                        self.z_buf.data[z_off + c],
+                                        c,
+                                        use_fast,
+                                    );
+                                    let gate = self.secondary_activation.apply_scalar_channel_fast(
+                                        self.z_buf.data[z_off + bottleneck + c],
+                                        c,
+                                        use_fast,
+                                    );
+                                    self.z_buf.data[z_off + c] = primary * gate;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "fast-kernels"))]
+                    {
                         let use_fast = crate::util::is_fast_tanh_enabled();
                         for f in 0..num_frames {
                             let z_off = f * z_rows;
@@ -1519,26 +1621,6 @@ impl WaveNetLayer {
                                 );
                                 self.z_buf.data[z_off + c] = primary * gate;
                             }
-                        }
-                    }
-                }
-                #[cfg(not(feature = "fast-kernels"))]
-                {
-                    let use_fast = crate::util::is_fast_tanh_enabled();
-                    for f in 0..num_frames {
-                        let z_off = f * z_rows;
-                        for c in 0..bottleneck {
-                            let primary = self.activation.apply_scalar_channel_fast(
-                                self.z_buf.data[z_off + c],
-                                c,
-                                use_fast,
-                            );
-                            let gate = self.secondary_activation.apply_scalar_channel_fast(
-                                self.z_buf.data[z_off + bottleneck + c],
-                                c,
-                                use_fast,
-                            );
-                            self.z_buf.data[z_off + c] = primary * gate;
                         }
                     }
                 }
@@ -1564,24 +1646,66 @@ impl WaveNetLayer {
             }
             GatingMode::Blended => {
                 // Blending: z[c] = alpha * activated(z[c]) + (1-alpha) * z[c]
-                #[cfg(feature = "fast-kernels")]
-                {
-                    let p_id = self.activation.c_type_id();
-                    let s_id = self.secondary_activation.c_type_id();
-                    if let (Some(p), Some(s)) = (p_id, s_id) {
-                        let use_fast = crate::util::is_fast_tanh_enabled();
-                        unsafe {
-                            crate::fast_kernels::fast_blended_activation(
-                                self.z_buf.data.as_mut_ptr(),
-                                z_rows,
-                                bottleneck,
-                                num_frames,
-                                p,
-                                s,
-                                use_fast as i32,
+                if active_channels.is_some() {
+                    let use_fast = crate::util::is_fast_tanh_enabled();
+                    for f in 0..num_frames {
+                        let z_off = f * z_rows;
+                        for c in 0..active_bottleneck {
+                            let pre_act = self.z_buf.data[z_off + c];
+                            let activated = self
+                                .activation
+                                .apply_scalar_channel_fast(pre_act, c, use_fast);
+                            let alpha = self.secondary_activation.apply_scalar_channel_fast(
+                                self.z_buf.data[z_off + active_bottleneck + c],
+                                c,
+                                use_fast,
                             );
+                            self.z_buf.data[z_off + c] =
+                                alpha * activated + (1.0 - alpha) * pre_act;
                         }
-                    } else {
+                    }
+                    zero_inactive_rows(&mut self.z_buf.data, z_rows, active_bottleneck, num_frames);
+                } else {
+                    #[cfg(feature = "fast-kernels")]
+                    {
+                        let p_id = self.activation.c_type_id();
+                        let s_id = self.secondary_activation.c_type_id();
+                        if let (Some(p), Some(s)) = (p_id, s_id) {
+                            let use_fast = crate::util::is_fast_tanh_enabled();
+                            unsafe {
+                                crate::fast_kernels::fast_blended_activation(
+                                    self.z_buf.data.as_mut_ptr(),
+                                    z_rows,
+                                    bottleneck,
+                                    num_frames,
+                                    p,
+                                    s,
+                                    use_fast as i32,
+                                );
+                            }
+                        } else {
+                            let use_fast = crate::util::is_fast_tanh_enabled();
+                            for f in 0..num_frames {
+                                let z_off = f * z_rows;
+                                for c in 0..bottleneck {
+                                    let pre_act = self.z_buf.data[z_off + c];
+                                    let activated = self
+                                        .activation
+                                        .apply_scalar_channel_fast(pre_act, c, use_fast);
+                                    let alpha =
+                                        self.secondary_activation.apply_scalar_channel_fast(
+                                            self.z_buf.data[z_off + bottleneck + c],
+                                            c,
+                                            use_fast,
+                                        );
+                                    self.z_buf.data[z_off + c] =
+                                        alpha * activated + (1.0 - alpha) * pre_act;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "fast-kernels"))]
+                    {
                         let use_fast = crate::util::is_fast_tanh_enabled();
                         for f in 0..num_frames {
                             let z_off = f * z_rows;
@@ -1599,28 +1723,8 @@ impl WaveNetLayer {
                                     alpha * activated + (1.0 - alpha) * pre_act;
                             }
                         }
-                    }
+                    } // end cfg(not(fast-kernels))
                 }
-                #[cfg(not(feature = "fast-kernels"))]
-                {
-                    let use_fast = crate::util::is_fast_tanh_enabled();
-                    for f in 0..num_frames {
-                        let z_off = f * z_rows;
-                        for c in 0..bottleneck {
-                            let pre_act = self.z_buf.data[z_off + c];
-                            let activated = self
-                                .activation
-                                .apply_scalar_channel_fast(pre_act, c, use_fast);
-                            let alpha = self.secondary_activation.apply_scalar_channel_fast(
-                                self.z_buf.data[z_off + bottleneck + c],
-                                c,
-                                use_fast,
-                            );
-                            self.z_buf.data[z_off + c] =
-                                alpha * activated + (1.0 - alpha) * pre_act;
-                        }
-                    }
-                } // end cfg(not(fast-kernels))
 
                 // activation_post_film
                 if let Some(ref mut film) = self.activation_post_film {
@@ -1688,6 +1792,18 @@ impl WaveNetLayer {
                 }
             }
         }
+        if active_channels.is_some() {
+            if self.skip_head_copy {
+                zero_inactive_rows(&mut self.z_buf.data, z_rows, active_bottleneck, num_frames);
+            } else {
+                zero_inactive_rows(
+                    &mut self.output_head.data,
+                    self.output_head.rows,
+                    active_bottleneck.min(self.output_head.rows),
+                    num_frames,
+                );
+            }
+        }
         // If skip_head_copy, output_head is z itself (caller reads from z_buf)
 
         // Step 5: Output to next layer = input + layer1x1_output (or just input)
@@ -1724,6 +1840,14 @@ impl WaveNetLayer {
         } else {
             let total = ch * num_frames;
             self.output_next_layer.data[..total].copy_from_slice(&input.data[..total]);
+        }
+        if let Some(active) = active_channels {
+            zero_inactive_rows(
+                &mut self.output_next_layer.data,
+                ch,
+                active.min(ch),
+                num_frames,
+            );
         }
     }
 
@@ -1768,14 +1892,103 @@ struct LayerFiLMParams {
     head1x1_post: FiLMParams,
 }
 
+impl LayerFiLMParams {
+    fn any_active(&self) -> bool {
+        self.conv_pre.active
+            || self.conv_post.active
+            || self.input_mixin_pre.active
+            || self.input_mixin_post.active
+            || self.activation_pre.active
+            || self.activation_post.active
+            || self.layer1x1_post.active
+            || self.head1x1_post.active
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlimmableConfig {
+    allowed_channels: Vec<usize>,
+    active_channels: usize,
+}
+
+impl SlimmableConfig {
+    fn from_json(
+        value: Option<&serde_json::Value>,
+        channels: usize,
+    ) -> Result<Option<Self>, NamError> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let method = value
+            .get("method")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| NamError::MissingField("slimmable.method".into()))?;
+        if method != "slice_channels_uniform" {
+            return Err(NamError::InvalidConfig(format!(
+                "Unsupported slimmable method: {}",
+                method
+            )));
+        }
+        let allowed = value
+            .get("kwargs")
+            .and_then(|v| v.get("allowed_channels"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| NamError::MissingField("slimmable.kwargs.allowed_channels".into()))?;
+        let allowed_channels = allowed
+            .iter()
+            .map(|v| {
+                let channel = v.as_u64().ok_or_else(|| {
+                    NamError::InvalidConfig(
+                        "slimmable.kwargs.allowed_channels contains non-integer value".into(),
+                    )
+                })? as usize;
+                if channel == 0 || channel > channels {
+                    return Err(NamError::InvalidConfig(format!(
+                        "slimmable allowed channel count {} is outside 1..={}",
+                        channel, channels
+                    )));
+                }
+                Ok(channel)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed_channels.is_empty() {
+            return Err(NamError::InvalidConfig(
+                "slimmable.kwargs.allowed_channels must not be empty".into(),
+            ));
+        }
+        let active_channels = allowed_channels[allowed_channels.len() - 1];
+        Ok(Some(Self {
+            allowed_channels,
+            active_channels,
+        }))
+    }
+
+    fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
+        if !value.is_finite() {
+            return Err(NamError::InvalidConfig(
+                "Slimming value must be finite".into(),
+            ));
+        }
+        let ratio = value.clamp(0.0, 1.0);
+        let idx = ((ratio * self.allowed_channels.len() as f64).floor() as usize)
+            .min(self.allowed_channels.len() - 1);
+        self.active_channels = self.allowed_channels[idx];
+        Ok(())
+    }
+}
+
 // ── WaveNet LayerArray ──────────────────────────────────────────────────────
 
 struct WaveNetLayerArray {
     rechannel: Conv1x1,
     layers: Vec<WaveNetLayer>,
-    head_rechannel: Conv1x1,
+    head_rechannel: Conv1d,
     channels: usize,
     head_output_size: usize, // head1x1.out_channels if active, else bottleneck
+    slimmable: Option<SlimmableConfig>,
 
     // Pre-allocated block buffers
     layer_outputs: ColMajorMatrix,
@@ -1784,7 +1997,11 @@ struct WaveNetLayerArray {
 
 impl WaveNetLayerArray {
     fn receptive_field(&self) -> usize {
-        self.layers.iter().map(|l| l.conv.receptive_field()).sum()
+        self.layers
+            .iter()
+            .map(|l| l.conv.receptive_field())
+            .sum::<usize>()
+            + self.head_rechannel.receptive_field()
     }
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
@@ -1796,6 +2013,18 @@ impl WaveNetLayerArray {
         self.layer_outputs.resize(self.channels, max_buffer_size);
         self.head_inputs
             .resize(self.head_output_size, max_buffer_size);
+    }
+
+    fn set_slimming(&mut self, value: f64) -> Result<bool, NamError> {
+        let Some(ref mut slimmable) = self.slimmable else {
+            return Ok(false);
+        };
+        slimmable.set_slimming(value)?;
+        for layer in &mut self.layers {
+            layer.zero_state();
+        }
+        self.head_rechannel.zero_state();
+        Ok(true)
     }
 
     /// Process without previous head input (first layer array).
@@ -1835,6 +2064,18 @@ impl WaveNetLayerArray {
     ) {
         // Rechannel: project input to layer channels
         self.rechannel.process_block(layer_inputs, num_frames);
+        let active_channels = self
+            .slimmable
+            .as_ref()
+            .map(|slimmable| slimmable.active_channels);
+        if let Some(active) = active_channels {
+            zero_inactive_rows(
+                &mut self.rechannel.output_buf.data,
+                self.rechannel.out_channels,
+                active.min(self.rechannel.out_channels),
+                num_frames,
+            );
+        }
 
         // Process layers
         let num_layers = self.layers.len();
@@ -1853,12 +2094,22 @@ impl WaveNetLayerArray {
                 // First layer uses rechannel output
                 let input_ptr = &self.rechannel.output_buf as *const ColMajorMatrix;
                 let layer = &mut self.layers[i];
-                layer.process_block(unsafe { &*input_ptr }, condition, num_frames);
+                layer.process_block(
+                    unsafe { &*input_ptr },
+                    condition,
+                    num_frames,
+                    active_channels,
+                );
             } else {
                 // Subsequent layers use previous layer's output
                 let prev_output = &self.layers[i - 1].output_next_layer as *const ColMajorMatrix;
                 let layer = &mut self.layers[i];
-                layer.process_block(unsafe { &*prev_output }, condition, num_frames);
+                layer.process_block(
+                    unsafe { &*prev_output },
+                    condition,
+                    num_frames,
+                    active_channels,
+                );
             }
 
             // Accumulate head output from this layer (4-wide unrolled)
@@ -1911,6 +2162,14 @@ impl WaveNetLayerArray {
         let len = ch * num_frames;
         self.layer_outputs.data[..len]
             .copy_from_slice(&self.layers[last].output_next_layer.data[..len]);
+        if let Some(active) = active_channels {
+            zero_inactive_rows(
+                &mut self.head_inputs.data,
+                self.head_inputs.rows,
+                active.min(self.head_inputs.rows),
+                num_frames,
+            );
+        }
 
         // Head rechannel
         self.head_rechannel
@@ -1918,10 +2177,160 @@ impl WaveNetLayerArray {
     }
 }
 
+// ── Top-level WaveNet head ─────────────────────────────────────────────────
+
+struct WaveNetHeadBlock {
+    activation: Activation,
+    conv: Conv1d,
+    activation_buf: ColMajorMatrix,
+}
+
+impl WaveNetHeadBlock {
+    fn from_weights(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        activation: &Activation,
+        iter: &mut WeightIter,
+    ) -> Result<Self, NamError> {
+        Ok(Self {
+            activation: activation.clone(),
+            conv: Conv1d::from_weights(in_channels, out_channels, kernel_size, 1, 1, iter)?,
+            activation_buf: ColMajorMatrix::new(in_channels, 1),
+        })
+    }
+
+    fn receptive_field(&self) -> usize {
+        self.conv.receptive_field()
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.activation_buf
+            .resize(self.conv.in_channels, max_buffer_size);
+        self.conv.set_max_buffer_size(max_buffer_size);
+    }
+
+    fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
+        let rows = self.conv.in_channels;
+        let len = rows * num_frames;
+        self.activation_buf.data[..len].copy_from_slice(&input.data[..len]);
+        self.activation
+            .apply_colmajor_inplace(&mut self.activation_buf.data, rows, num_frames);
+        self.conv.process_block(&self.activation_buf, num_frames);
+    }
+}
+
+struct WaveNetHead {
+    blocks: Vec<WaveNetHeadBlock>,
+    input_buf: ColMajorMatrix,
+}
+
+impl WaveNetHead {
+    fn from_config(
+        config: &serde_json::Value,
+        in_channels: usize,
+        iter: &mut WeightIter,
+    ) -> Result<Self, NamError> {
+        let channels = config["channels"]
+            .as_u64()
+            .ok_or_else(|| NamError::MissingField("head.channels".into()))?
+            as usize;
+        let out_channels = config["out_channels"]
+            .as_u64()
+            .ok_or_else(|| NamError::MissingField("head.out_channels".into()))?
+            as usize;
+        let activation = Activation::from_json(&config["activation"])?;
+        let kernel_sizes = config["kernel_sizes"]
+            .as_array()
+            .ok_or_else(|| NamError::MissingField("head.kernel_sizes".into()))?;
+        if kernel_sizes.is_empty() {
+            return Err(NamError::InvalidConfig(
+                "head.kernel_sizes must be non-empty".into(),
+            ));
+        }
+
+        let mut blocks = Vec::with_capacity(kernel_sizes.len());
+        let mut block_in_channels = in_channels;
+        for (idx, kernel_size) in kernel_sizes.iter().enumerate() {
+            let kernel_size = kernel_size.as_u64().ok_or_else(|| {
+                NamError::InvalidConfig("head.kernel_sizes contains non-integer value".into())
+            })? as usize;
+            let block_out_channels = if idx + 1 == kernel_sizes.len() {
+                out_channels
+            } else {
+                channels
+            };
+            blocks.push(WaveNetHeadBlock::from_weights(
+                block_in_channels,
+                block_out_channels,
+                kernel_size,
+                &activation,
+                iter,
+            )?);
+            block_in_channels = channels;
+        }
+
+        Ok(Self {
+            blocks,
+            input_buf: ColMajorMatrix::new(in_channels, 1),
+        })
+    }
+
+    fn receptive_field(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(WaveNetHeadBlock::receptive_field)
+            .sum()
+    }
+
+    fn out_channels(&self) -> usize {
+        self.blocks
+            .last()
+            .map(|block| block.conv.out_channels)
+            .unwrap_or(1)
+    }
+
+    fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        let rows = self.input_buf.rows;
+        self.input_buf.resize(rows, max_buffer_size);
+        for block in &mut self.blocks {
+            block.set_max_buffer_size(max_buffer_size);
+        }
+    }
+
+    fn process_block(
+        &mut self,
+        input: &ColMajorMatrix,
+        input_rows: usize,
+        scale: f32,
+        num_frames: usize,
+    ) {
+        self.input_buf.resize(input_rows, num_frames);
+        let len = input_rows * num_frames;
+        for (dst, src) in self.input_buf.data[..len]
+            .iter_mut()
+            .zip(input.data[..len].iter())
+        {
+            *dst = scale * *src;
+        }
+
+        let mut current = &self.input_buf as *const ColMajorMatrix;
+        for block in &mut self.blocks {
+            block.process_block(unsafe { &*current }, num_frames);
+            current = &block.conv.output_buf as *const ColMajorMatrix;
+        }
+    }
+
+    fn output(&self) -> Option<&ColMajorMatrix> {
+        self.blocks.last().map(|block| &block.conv.output_buf)
+    }
+}
+
 // ── Top-level WaveNet ───────────────────────────────────────────────────────
 
 pub struct WaveNet {
     layer_arrays: Vec<WaveNetLayerArray>,
+    head: Option<WaveNetHead>,
     head_scale: f32,
     prewarm_samples_count: usize,
     metadata: DspMetadata,
@@ -1934,6 +2343,195 @@ pub struct WaveNet {
     condition_input: ColMajorMatrix,
     condition_output: ColMajorMatrix,
     max_buffer_size: usize,
+}
+
+fn normalize_wavenet_config(config: &serde_json::Value) -> Result<serde_json::Value, NamError> {
+    let mut normalized = config.clone();
+    let Some(root) = normalized.as_object_mut() else {
+        return Err(NamError::InvalidConfig(
+            "WaveNet config must be a JSON object".into(),
+        ));
+    };
+
+    if !root.contains_key("layers") {
+        if let Some(layers_configs) = root.get("layers_configs").cloned() {
+            root.insert("layers".into(), layers_configs);
+        }
+    }
+
+    let Some(layers) = root
+        .get_mut("layers")
+        .and_then(|layers| layers.as_array_mut())
+    else {
+        return Ok(normalized);
+    };
+
+    for layer in layers {
+        normalize_layer_array_config(layer)?;
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_layer_array_config(layer: &mut serde_json::Value) -> Result<(), NamError> {
+    let Some(layer_obj) = layer.as_object_mut() else {
+        return Err(NamError::InvalidConfig(
+            "WaveNet layer array config must be a JSON object".into(),
+        ));
+    };
+
+    if let Some(head) = layer_obj.get("head").and_then(|head| head.as_object()) {
+        let out_channels = head.get("out_channels").cloned();
+        let bias = head.get("bias").cloned();
+        let kernel_size = head.get("kernel_size").cloned();
+        if !layer_obj.contains_key("head_size") {
+            if let Some(out_channels) = out_channels {
+                layer_obj.insert("head_size".into(), out_channels);
+            }
+        }
+        if !layer_obj.contains_key("head_bias") {
+            if let Some(bias) = bias {
+                layer_obj.insert("head_bias".into(), bias);
+            }
+        }
+        if !layer_obj.contains_key("head_kernel_size") {
+            if let Some(kernel_size) = kernel_size {
+                layer_obj.insert("head_kernel_size".into(), kernel_size);
+            }
+        }
+    }
+
+    if !layer_obj.contains_key("head1x1") {
+        if let Some(head1x1) = layer_obj.get("head_1x1_config").cloned() {
+            layer_obj.insert("head1x1".into(), head1x1);
+        }
+    }
+    if !layer_obj.contains_key("layer1x1") {
+        if let Some(layer1x1) = layer_obj.get("layer_1x1_config").cloned() {
+            layer_obj.insert("layer1x1".into(), layer1x1);
+        }
+    }
+
+    if let Some(film_params) = layer_obj.get("film_params").and_then(|v| v.as_object()) {
+        let entries: Vec<(String, serde_json::Value)> = film_params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        for (key, value) in entries {
+            layer_obj.entry(key).or_insert(value);
+        }
+    }
+
+    normalize_pairing_activation_config(layer_obj)?;
+
+    Ok(())
+}
+
+fn normalize_pairing_activation_config(
+    layer_obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), NamError> {
+    if layer_obj.contains_key("gating_mode") {
+        return Ok(());
+    }
+
+    let Some(activation) = layer_obj.get("activation").cloned() else {
+        return Ok(());
+    };
+
+    if let Some(activation_array) = activation.as_array() {
+        let mut primary = Vec::with_capacity(activation_array.len());
+        let mut gating_modes = Vec::with_capacity(activation_array.len());
+        let mut secondary = Vec::with_capacity(activation_array.len());
+        let mut saw_pairing = false;
+
+        for entry in activation_array {
+            let normalized = normalize_one_activation_entry(entry)?;
+            saw_pairing |= normalized.gating_mode != "none";
+            primary.push(normalized.primary);
+            gating_modes.push(serde_json::Value::String(normalized.gating_mode));
+            secondary.push(normalized.secondary.unwrap_or(serde_json::Value::Null));
+        }
+
+        if saw_pairing {
+            layer_obj.insert("activation".into(), serde_json::Value::Array(primary));
+            layer_obj.insert("gating_mode".into(), serde_json::Value::Array(gating_modes));
+            layer_obj.insert(
+                "secondary_activation".into(),
+                serde_json::Value::Array(secondary),
+            );
+        }
+    } else {
+        let normalized = normalize_one_activation_entry(&activation)?;
+        if normalized.gating_mode != "none" {
+            layer_obj.insert("activation".into(), normalized.primary);
+            layer_obj.insert(
+                "gating_mode".into(),
+                serde_json::Value::String(normalized.gating_mode),
+            );
+            if let Some(secondary) = normalized.secondary {
+                layer_obj.insert("secondary_activation".into(), secondary);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct NormalizedActivationEntry {
+    primary: serde_json::Value,
+    gating_mode: String,
+    secondary: Option<serde_json::Value>,
+}
+
+fn normalize_one_activation_entry(
+    activation: &serde_json::Value,
+) -> Result<NormalizedActivationEntry, NamError> {
+    let Some(obj) = activation.as_object() else {
+        return Ok(NormalizedActivationEntry {
+            primary: activation.clone(),
+            gating_mode: "none".into(),
+            secondary: None,
+        });
+    };
+
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("type"))
+        .and_then(|v| v.as_str());
+    let Some(name) = name else {
+        return Ok(NormalizedActivationEntry {
+            primary: activation.clone(),
+            gating_mode: "none".into(),
+            secondary: None,
+        });
+    };
+
+    let gating_mode = match name {
+        "PairMultiply" => "gated",
+        "PairBlend" => "blended",
+        _ => {
+            return Ok(NormalizedActivationEntry {
+                primary: activation.clone(),
+                gating_mode: "none".into(),
+                secondary: None,
+            });
+        }
+    };
+
+    let primary = obj
+        .get("primary")
+        .cloned()
+        .ok_or_else(|| NamError::MissingField("activation.primary".into()))?;
+    let secondary = obj
+        .get("secondary")
+        .cloned()
+        .ok_or_else(|| NamError::MissingField("activation.secondary".into()))?;
+
+    Ok(NormalizedActivationEntry {
+        primary,
+        gating_mode: gating_mode.into(),
+        secondary: Some(secondary),
+    })
 }
 
 impl WaveNet {
@@ -1951,6 +2549,8 @@ impl WaveNet {
         metadata: DspMetadata,
         condition_dsp: Option<Box<dyn Dsp>>,
     ) -> Result<Self, NamError> {
+        let normalized_config = normalize_wavenet_config(config)?;
+        let config = &normalized_config;
         let layers_json = config["layers"]
             .as_array()
             .ok_or_else(|| NamError::MissingField("layers".into()))?;
@@ -2101,6 +2701,11 @@ impl WaveNet {
                 parse_gating_and_secondary(la_json, num_layers)?;
 
             let head_bias = la_json["head_bias"].as_bool().unwrap_or(false);
+            let head_kernel_size = la_json
+                .get("head_kernel_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let slimmable = SlimmableConfig::from_json(la_json.get("slimmable"), channels)?;
 
             // Groups
             let groups_input = la_json
@@ -2181,6 +2786,44 @@ impl WaveNet {
                     .unwrap_or_else(FiLMParams::inactive),
             };
 
+            if slimmable.is_some() {
+                if condition_dsp.is_some() {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet does not support condition_dsp".into(),
+                    ));
+                }
+                if layers_json.len() != 1 {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet supports exactly one layer array".into(),
+                    ));
+                }
+                if groups_input != 1 || groups_input_mixin != 1 {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet does not support grouped convolutions".into(),
+                    ));
+                }
+                if head1x1_params.active {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet does not support head1x1".into(),
+                    ));
+                }
+                if layer1x1_groups != 1 {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet does not support grouped layer1x1".into(),
+                    ));
+                }
+                if film_params.any_active() {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet does not support FiLM".into(),
+                    ));
+                }
+                if head_kernel_size != 1 {
+                    return Err(NamError::InvalidConfig(
+                        "SlimmableWaveNet requires head kernel_size 1".into(),
+                    ));
+                }
+            }
+
             let head_out_size = if head1x1_params.active {
                 head1x1_params.out_channels
             } else {
@@ -2219,8 +2862,15 @@ impl WaveNet {
                 layers.push(layer);
             }
 
-            let head_rechannel =
-                Conv1x1::from_weights(head_out_size, head_size, head_bias, 1, &mut iter)?;
+            let head_rechannel = Conv1d::from_weights_with_bias(
+                head_out_size,
+                head_size,
+                head_kernel_size,
+                1,
+                1,
+                head_bias,
+                &mut iter,
+            )?;
 
             layer_arrays.push(WaveNetLayerArray {
                 rechannel,
@@ -2228,10 +2878,25 @@ impl WaveNet {
                 head_rechannel,
                 channels,
                 head_output_size: head_out_size,
+                slimmable,
                 layer_outputs: ColMajorMatrix::new(channels, 1),
                 head_inputs: ColMajorMatrix::new(head_out_size, 1),
             });
         }
+
+        let head_in_channels = layer_arrays
+            .last()
+            .map(|la| la.head_rechannel.out_channels)
+            .ok_or_else(|| NamError::InvalidConfig("WaveNet requires at least one layer".into()))?;
+        let head = if config.get("head").is_some_and(|head| !head.is_null()) {
+            Some(WaveNetHead::from_config(
+                &config["head"],
+                head_in_channels,
+                &mut iter,
+            )?)
+        } else {
+            None
+        };
 
         let head_scale_from_weights = iter.take(1)?[0];
         let head_scale = head_scale_from_weights;
@@ -2247,7 +2912,8 @@ impl WaveNet {
             + layer_arrays
                 .iter()
                 .map(|la| la.receptive_field())
-                .sum::<usize>();
+                .sum::<usize>()
+            + head.as_ref().map(WaveNetHead::receptive_field).unwrap_or(0);
 
         // Determine condition output channels
         let cond_out_ch = if let Some(ref cdsp) = condition_dsp {
@@ -2258,6 +2924,7 @@ impl WaveNet {
 
         Ok(Self {
             layer_arrays,
+            head,
             head_scale,
             prewarm_samples_count,
             metadata,
@@ -2289,6 +2956,23 @@ impl WaveNet {
 
         for la in &mut self.layer_arrays {
             la.set_max_buffer_size(max_buffer_size);
+        }
+        if let Some(ref mut head) = self.head {
+            head.set_max_buffer_size(max_buffer_size);
+        }
+    }
+
+    pub fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
+        let mut found = false;
+        for la in &mut self.layer_arrays {
+            found |= la.set_slimming(value)?;
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(NamError::InvalidConfig(
+                "WaveNet does not have slimmable layer arrays".into(),
+            ))
         }
     }
 
@@ -2371,14 +3055,34 @@ impl WaveNet {
             }
         }
 
-        // Step 4: Extract output from final head
+        // Step 4: Extract output from final layer-array head or optional top-level head
         let last = num_arrays - 1;
-        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
-        let out_ch = self.layer_arrays[last].head_rechannel.out_channels;
+        let layer_head =
+            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let (final_head, out_ch, output_scale) = if let Some(ref mut head) = self.head {
+            let layer_out_ch = self.layer_arrays[last].head_rechannel.out_channels;
+            head.process_block(
+                unsafe { &*layer_head },
+                layer_out_ch,
+                self.head_scale,
+                num_frames,
+            );
+            let Some(head_output) = head.output() else {
+                output.fill(Sample::default());
+                return;
+            };
+            (head_output, head.out_channels(), 1.0)
+        } else {
+            (
+                unsafe { &*layer_head },
+                self.layer_arrays[last].head_rechannel.out_channels,
+                self.head_scale,
+            )
+        };
 
         // For single-channel output (typical NAM): data is contiguous
         if out_ch == 1 {
-            let scale = self.head_scale;
+            let scale = output_scale;
             for (o, &h) in output
                 .iter_mut()
                 .zip(final_head.data.iter())
@@ -2388,7 +3092,7 @@ impl WaveNet {
             }
         } else {
             // Multi-channel: take first channel
-            let scale = self.head_scale;
+            let scale = output_scale;
             for (s, o) in output.iter_mut().enumerate().take(num_frames) {
                 *o = (scale * final_head.data[s * out_ch]) as Sample;
             }
@@ -2464,19 +3168,39 @@ impl Dsp for WaveNet {
     }
 
     fn num_output_channels(&self) -> usize {
-        self.layer_arrays
-            .last()
-            .map(|la| la.head_rechannel.out_channels)
-            .unwrap_or(1)
+        if let Some(ref head) = self.head {
+            head.out_channels()
+        } else {
+            self.layer_arrays
+                .last()
+                .map(|la| la.head_rechannel.out_channels)
+                .unwrap_or(1)
+        }
     }
 
     fn process_sample_multi_channel(&mut self, input_sample: Sample, out: &mut [f32]) {
         self.process_sample_for_multi_channel(input_sample as f32);
 
         let last = self.layer_arrays.len() - 1;
-        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
-        let out_ch = self.layer_arrays[last].head_rechannel.out_channels;
-        let scale = self.head_scale;
+        let layer_head =
+            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let (final_head, out_ch, scale) = if let Some(ref mut head) = self.head {
+            let layer_out_ch = self.layer_arrays[last].head_rechannel.out_channels;
+            head.process_block(unsafe { &*layer_head }, layer_out_ch, self.head_scale, 1);
+            let Some(head_output) = head.output() else {
+                for o in out {
+                    *o = 0.0;
+                }
+                return;
+            };
+            (head_output, head.out_channels(), 1.0)
+        } else {
+            (
+                unsafe { &*layer_head },
+                self.layer_arrays[last].head_rechannel.out_channels,
+                self.head_scale,
+            )
+        };
 
         for (i, o) in out.iter_mut().enumerate() {
             if i < out_ch {
@@ -2500,9 +3224,21 @@ impl Dsp for WaveNet {
 
         // Extract multi-channel head output from the last layer array
         let last = self.layer_arrays.len() - 1;
-        let final_head = &self.layer_arrays[last].head_rechannel.output_buf;
-        let head_ch = self.layer_arrays[last].head_rechannel.out_channels;
-        let scale = self.head_scale;
+        let layer_head =
+            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let (final_head, head_ch, scale) = if let Some(ref head) = self.head {
+            let Some(head_output) = head.output() else {
+                output_data.fill(0.0);
+                return;
+            };
+            (head_output, head.out_channels(), 1.0)
+        } else {
+            (
+                unsafe { &*layer_head },
+                self.layer_arrays[last].head_rechannel.out_channels,
+                self.head_scale,
+            )
+        };
         let copy_ch = out_channels.min(head_ch);
 
         for f in 0..num_frames {
@@ -2512,6 +3248,10 @@ impl Dsp for WaveNet {
                 output_data[out_off + c] = scale * final_head.data[head_off + c];
             }
         }
+    }
+
+    fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
+        WaveNet::set_slimming(self, value)
     }
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
@@ -2729,6 +3469,60 @@ mod tests {
     }
 
     #[test]
+    fn test_slimmable_wavenet_set_slimming() {
+        let mut model = match load_wavenet("slimmable_wavenet.nam") {
+            Some(m) => m,
+            None => return,
+        };
+        let input = vec![0.1 as Sample; 64];
+        let mut output = vec![0.0 as Sample; 64];
+
+        model.set_slimming(0.0).unwrap();
+        model.reset(48_000.0, 64);
+        model.process(&input, &mut output);
+        assert!(
+            output.iter().all(|&x| x.is_finite()),
+            "SlimmableWaveNet smallest width produced non-finite output"
+        );
+
+        model.set_slimming(1.0).unwrap();
+        model.reset(48_000.0, 64);
+        model.process(&input, &mut output);
+        assert!(
+            output.iter().all(|&x| x.is_finite()),
+            "SlimmableWaveNet largest width produced non-finite output"
+        );
+    }
+
+    #[test]
+    fn test_slimmable_wavenet_set_slimming_changes_output() {
+        let input = vec![0.1 as Sample; 64];
+
+        let mut smallest = match load_wavenet("slimmable_wavenet.nam") {
+            Some(m) => m,
+            None => return,
+        };
+        smallest.set_slimming(0.0).unwrap();
+        smallest.reset(48_000.0, 64);
+        let mut smallest_output = vec![0.0 as Sample; 64];
+        smallest.process(&input, &mut smallest_output);
+
+        let mut largest = match load_wavenet("slimmable_wavenet.nam") {
+            Some(m) => m,
+            None => return,
+        };
+        largest.set_slimming(1.0).unwrap();
+        largest.reset(48_000.0, 64);
+        let mut largest_output = vec![0.0 as Sample; 64];
+        largest.process(&input, &mut largest_output);
+
+        assert_ne!(
+            smallest_output, largest_output,
+            "SlimmableWaveNet width selection should affect the rendered output"
+        );
+    }
+
+    #[test]
     fn test_all_example_models_load() {
         let models = [
             "wavenet.nam",
@@ -2786,11 +3580,120 @@ mod tests {
             model.process(&input, &mut output);
 
             assert!(
-                output.iter().all(|&x| (x as f64).is_finite()),
+                output.iter().all(|&x| x.is_finite()),
                 "Non-finite output from {}",
                 name
             );
         }
+    }
+
+    fn minimal_upstream_layer_config() -> serde_json::Value {
+        serde_json::json!({
+            "condition_size": 1,
+            "input_size": 1,
+            "channels": 1,
+            "head": {"out_channels": 1, "kernel_size": 1, "bias": false},
+            "kernel_size": 1,
+            "dilations": [1],
+            "activation": "Tanh",
+            "layer_1x1_config": {"active": true, "groups": 1},
+            "head_1x1_config": {"active": false, "out_channels": 1, "groups": 1}
+        })
+    }
+
+    fn process_small_config(config: serde_json::Value, weights: Vec<f32>) -> Vec<Sample> {
+        let mut model = WaveNet::from_config(&config, &weights, DspMetadata::default()).unwrap();
+        model.reset(48_000.0, 8);
+        let input = vec![0.1 as Sample; 8];
+        let mut output = vec![0.0 as Sample; 8];
+        model.process(&input, &mut output);
+        output
+    }
+
+    #[test]
+    fn test_upstream_layers_configs_and_head_object_load() {
+        let config = serde_json::json!({
+            "layers_configs": [minimal_upstream_layer_config()],
+            "head": null,
+            "head_scale": 1.0
+        });
+        let weights = vec![1.0, 0.5, 0.0, 0.25, 1.0, 0.0, 1.0, 1.0];
+        let output = process_small_config(config, weights);
+        assert!(output.iter().all(|&sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn test_upstream_layer_aliases_and_film_params_load() {
+        let mut layer = minimal_upstream_layer_config();
+        layer["film_params"] = serde_json::json!({
+            "conv_pre_film": {"active": true, "shift": true, "groups": 1}
+        });
+        let config = serde_json::json!({
+            "layers_configs": [layer],
+            "head": null,
+            "head_scale": 1.0
+        });
+        let weights = vec![
+            1.0, // rechannel
+            0.5, 0.0,  // conv
+            0.25, // input mixin
+            1.0, 0.0, // layer1x1
+            1.0, 0.0, 0.0, 0.0, // conv_pre_film
+            1.0, // head rechannel
+            1.0, // head_scale
+        ];
+        let output = process_small_config(config, weights);
+        assert!(output.iter().all(|&sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn test_upstream_pairmultiply_activation_config_loads() {
+        let mut layer = minimal_upstream_layer_config();
+        layer["activation"] = serde_json::json!({
+            "name": "PairMultiply",
+            "primary": "Tanh",
+            "secondary": "Sigmoid"
+        });
+        let config = serde_json::json!({
+            "layers_configs": [layer],
+            "head": null,
+            "head_scale": 1.0
+        });
+        let weights = vec![
+            1.0, // rechannel
+            0.5, 0.5, 0.0, 0.0, // gated conv
+            0.25, 0.25, // gated input mixin
+            1.0, 0.0, // layer1x1
+            1.0, // head rechannel
+            1.0, // head_scale
+        ];
+        let output = process_small_config(config, weights);
+        assert!(output.iter().all(|&sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn test_top_level_head_loads_and_processes() {
+        let config = serde_json::json!({
+            "layers_configs": [minimal_upstream_layer_config()],
+            "head": {
+                "channels": 1,
+                "activation": {"name": "Softsigmoid"},
+                "out_channels": 1,
+                "kernel_sizes": [1]
+            },
+            "head_scale": 1.0
+        });
+        let weights = vec![
+            1.0, // rechannel
+            0.5, 0.0,  // conv
+            0.25, // input mixin
+            1.0, 0.0, // layer1x1
+            1.0, // layer-array head rechannel
+            1.0, 0.0, // top-level head conv
+            1.0, // head_scale
+        ];
+        let output = process_small_config(config, weights);
+        assert!(output.iter().all(|&sample| sample.is_finite()));
     }
 
     #[test]
@@ -2940,7 +3843,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 256];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
         assert!(output.iter().any(|&x| x != 0.0));
     }
 
@@ -2988,7 +3891,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 32];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -3004,7 +3907,7 @@ mod tests {
             let mut output = vec![0.0 as Sample; size];
             model.process(&input, &mut output);
             assert!(
-                output.iter().all(|&x| (x as f64).is_finite()),
+                output.iter().all(|&x| x.is_finite()),
                 "Non-finite output at buffer size {}",
                 size
             );
@@ -3024,7 +3927,7 @@ mod tests {
             let mut output = vec![0.0 as Sample; 8];
             model.process(&input, &mut output);
             assert!(
-                output.iter().all(|&x| (x as f64).is_finite()),
+                output.iter().all(|&x| x.is_finite()),
                 "Non-finite at call {}",
                 call
             );
@@ -3041,7 +3944,7 @@ mod tests {
         let input = vec![0.1 as Sample; 64];
         let mut output = vec![0.0 as Sample; 64];
         model.process(&input, &mut output);
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -3054,7 +3957,7 @@ mod tests {
         let input = vec![0.1 as Sample; 64];
         let mut output = vec![0.0 as Sample; 64];
         model.process(&input, &mut output);
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     // ── Per-layer kernel_sizes tests ────────────────────────────────────────
@@ -3077,7 +3980,7 @@ mod tests {
             // Scalar form: extract the number
             let num: usize = kernel_field
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap()
                 .trim()
                 .trim_matches('"')

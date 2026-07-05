@@ -3,13 +3,24 @@ pub type Sample = f32;
 #[cfg(not(feature = "float_io"))]
 pub type Sample = f64;
 
+use crate::error::NamError;
+
 /// Metadata parsed from the .nam file.
 #[derive(Debug, Clone, Default)]
 pub struct DspMetadata {
+    pub raw: Option<serde_json::Value>,
     pub loudness: Option<f64>,
+    pub gain: Option<f64>,
     pub expected_sample_rate: Option<f64>,
+    pub name: Option<String>,
+    pub modeled_by: Option<String>,
+    pub gear_type: Option<String>,
+    pub gear_make: Option<String>,
+    pub gear_model: Option<String>,
+    pub tone_type: Option<String>,
     pub input_level_dbu: Option<f64>,
     pub output_level_dbu: Option<f64>,
+    pub validation_esr: Option<f64>,
 }
 
 pub trait Dsp: Send {
@@ -36,6 +47,13 @@ pub trait Dsp: Send {
     }
 
     fn metadata(&self) -> &DspMetadata;
+
+    /// Select a slimmable model width, where 0.0 chooses the smallest width and 1.0 the largest.
+    fn set_slimming(&mut self, _value: f64) -> Result<(), NamError> {
+        Err(NamError::InvalidConfig(
+            "DSP does not support slimmable width selection".into(),
+        ))
+    }
 
     /// Number of output channels. Default is 1 (mono).
     /// Overridden by models that produce multi-channel output (e.g. WaveNet used as condition_dsp).

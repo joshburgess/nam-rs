@@ -41,6 +41,19 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
                     }
                     ui.end_row();
 
+                    ui.label("Samples per datum:")
+                        .on_hover_text("Output samples per training datum passed to upstream NAM");
+                    let mut ny_str = app.config.num_output_samples_per_datum.to_string();
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut ny_str).desired_width(80.0))
+                        .changed()
+                    {
+                        if let Ok(v) = ny_str.parse::<u32>() {
+                            app.config.num_output_samples_per_datum = v.max(1);
+                        }
+                    }
+                    ui.end_row();
+
                     // Latency
                     ui.label("Reamp latency:").on_hover_text(
                         "Sample delay between input and output. Leave blank for auto-detection.",
@@ -119,6 +132,15 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
 
             ui.add_space(6.0);
             ui.checkbox(&mut app.config.save_plot, "Save ESR comparison plot");
+            ui.checkbox(&mut app.config.ignore_checks, "Ignore data checks")
+                .on_hover_text("Skip upstream NAM input/output validation checks");
+            ui.checkbox(
+                &mut app.config.use_full_config_trainer,
+                "Use upstream full-config trainer",
+            )
+            .on_hover_text(
+                "Run packed A2 training through upstream's config_data/config_model/config_learning path. This mirrors full.py but skips GUI metadata export support.",
+            );
 
             // Save config if anything changed
             if app.config.epochs != before.epochs
@@ -128,6 +150,9 @@ pub fn show(app: &mut TrainerApp, ctx: &egui::Context) {
                 || app.config.latency != before.latency
                 || app.config.threshold_esr != before.threshold_esr
                 || app.config.save_plot != before.save_plot
+                || app.config.ignore_checks != before.ignore_checks
+                || app.config.num_output_samples_per_datum != before.num_output_samples_per_datum
+                || app.config.use_full_config_trainer != before.use_full_config_trainer
             {
                 app.save_config();
             }

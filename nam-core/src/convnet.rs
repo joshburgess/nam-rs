@@ -386,7 +386,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 8];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 16];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 8];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
         model.process(&input, &mut output);
 
         // All outputs should be finite (bias-only contribution through ReLU)
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
         let mut output = vec![0.0 as Sample; 8];
         model.process(&input, &mut output);
 
-        assert!(output.iter().all(|&x| (x as f64).is_finite()));
+        assert!(output.iter().all(|&x| x.is_finite()));
     }
 
     #[test]

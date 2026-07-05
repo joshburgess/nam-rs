@@ -47,7 +47,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
                 show_log(app, ui, log_height);
             } else {
-                // No plot — give all remaining space to the log
+                // No plot, give all remaining space to the log
                 let log_height = available.max(100.0);
                 show_log(app, ui, log_height);
             }

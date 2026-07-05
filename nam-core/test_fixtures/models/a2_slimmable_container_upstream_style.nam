@@ -1,0 +1,93 @@
+{
+  "version": "0.7.0",
+  "architecture": "SlimmableContainer",
+  "metadata": {
+    "sample_rate": 48000.0
+  },
+  "config": {
+    "submodels": [
+      {
+        "max_value": 0.5,
+        "model": {
+          "version": "0.7.0",
+          "architecture": "WaveNet",
+          "metadata": {
+            "sample_rate": 48000.0
+          },
+          "config": {
+            "layers_configs": [
+              {
+                "condition_size": 1,
+                "input_size": 1,
+                "channels": 1,
+                "head": {
+                  "out_channels": 1,
+                  "kernel_size": 1,
+                  "bias": false
+                },
+                "kernel_size": 1,
+                "dilations": [1],
+                "activation": "Tanh",
+                "layer_1x1_config": {
+                  "active": true,
+                  "groups": 1
+                },
+                "head_1x1_config": {
+                  "active": false,
+                  "out_channels": 1,
+                  "groups": 1
+                }
+              }
+            ],
+            "head": null,
+            "head_scale": 1.0
+          },
+          "weights": [1.0, 0.5, 0.0, 0.25, 1.0, 0.0, 1.0, 1.0],
+          "sample_rate": 48000
+        }
+      },
+      {
+        "max_value": 1.0,
+        "model": {
+          "version": "0.7.0",
+          "architecture": "WaveNet",
+          "metadata": {
+            "sample_rate": 48000.0
+          },
+          "config": {
+            "layers_configs": [
+              {
+                "condition_size": 1,
+                "input_size": 1,
+                "channels": 1,
+                "head": {
+                  "out_channels": 1,
+                  "kernel_size": 1,
+                  "bias": false
+                },
+                "kernel_size": 1,
+                "dilations": [1],
+                "activation": "Tanh",
+                "layer_1x1_config": {
+                  "active": true,
+                  "groups": 1
+                },
+                "head_1x1_config": {
+                  "active": false,
+                  "out_channels": 1,
+                  "groups": 1
+                }
+              }
+            ],
+            "head": null,
+            "head_scale": 1.0
+          },
+          "weights": [1.5, 0.25, 0.0, -0.1, 0.5, 0.0, 1.0, 0.5],
+          "sample_rate": 48000
+        }
+      }
+    ]
+  },
+  "weights": [],
+  "sample_rate": 48000
+}

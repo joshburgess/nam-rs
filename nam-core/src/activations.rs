@@ -10,6 +10,7 @@ pub enum Activation {
     LeakyRelu(f32),
     Silu,
     Softsign,
+    Softsigmoid,
     HardSwish,
     LeakyHardTanh {
         min_val: f32,
@@ -32,7 +33,7 @@ impl Activation {
             Activation::HardSwish => Some(2),
             Activation::Softsign => Some(3),
             Activation::HardTanh => Some(4),
-            Activation::Sigmoid => Some(0), // use tanh-based sigmoid via SiLU path? No — treat as tanh for now
+            Activation::Sigmoid => Some(0), // use tanh-based sigmoid via SiLU path? No, treat as tanh for now
             Activation::Relu => Some(5),
             _ => None, // PReLU, LeakyRelu, LeakyHardTanh have per-channel params
         }
@@ -80,6 +81,7 @@ impl Activation {
                 x * sig
             }
             Activation::Softsign => x / (1.0 + x.abs()),
+            Activation::Softsigmoid => 0.5 * (1.0 + x / (1.0 + x.abs())),
             Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) * (1.0 / 6.0),
             Activation::LeakyHardTanh {
                 min_val,
@@ -161,6 +163,7 @@ impl Activation {
             "HardTanh" | "Hardtanh" => Ok(Activation::HardTanh),
             "SiLU" => Ok(Activation::Silu),
             "Softsign" => Ok(Activation::Softsign),
+            "Softsigmoid" => Ok(Activation::Softsigmoid),
             "Hardswish" => Ok(Activation::HardSwish),
             "LeakyHardtanh" | "LeakyHardTanh" => Ok(Activation::LeakyHardTanh {
                 min_val: -1.0,
@@ -178,9 +181,13 @@ impl Activation {
             return Self::from_name(name);
         }
         if let Some(obj) = val.as_object() {
-            let type_name = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
-                NamError::InvalidConfig("activation object missing 'type'".into())
-            })?;
+            let type_name = obj
+                .get("type")
+                .or_else(|| obj.get("name"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    NamError::InvalidConfig("activation object missing 'type' or 'name'".into())
+                })?;
 
             match type_name {
                 "LeakyReLU" => {
@@ -203,6 +210,17 @@ impl Activation {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.01) as f32;
                     Ok(Activation::PReLU(vec![slope]))
+                }
+                "Hardtanh" | "HardTanh" => {
+                    let min_val =
+                        obj.get("min_val").and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32;
+                    let max_val = obj.get("max_val").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    Ok(Activation::LeakyHardTanh {
+                        min_val,
+                        max_val,
+                        min_slope: 0.0,
+                        max_slope: 0.0,
+                    })
                 }
                 "LeakyHardtanh" | "LeakyHardTanh" => {
                     let min_val =
@@ -368,6 +386,14 @@ mod tests {
     }
 
     #[test]
+    fn test_softsigmoid() {
+        let act = Activation::Softsigmoid;
+        assert!((act.apply_scalar(0.0) - 0.5).abs() < 1e-7);
+        assert!((act.apply_scalar(1.0) - 0.75).abs() < 1e-7);
+        assert!((act.apply_scalar(-1.0) - 0.25).abs() < 1e-7);
+    }
+
+    #[test]
     fn test_hardswish() {
         let act = Activation::HardSwish;
         // x <= -3: 0
@@ -448,6 +474,22 @@ mod tests {
         let val = serde_json::json!({"type": "Softsign"});
         let act = Activation::from_json(&val).unwrap();
         assert!((act.apply_scalar(1.0) - 0.5).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_from_json_object_name_key() {
+        let val = serde_json::json!({"name": "Softsigmoid"});
+        let act = Activation::from_json(&val).unwrap();
+        assert!((act.apply_scalar(1.0) - 0.75).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_from_json_object_hardtanh_params() {
+        let val = serde_json::json!({"type": "Hardtanh", "min_val": -0.25, "max_val": 0.75});
+        let act = Activation::from_json(&val).unwrap();
+        assert_eq!(act.apply_scalar(-1.0), -0.25);
+        assert_eq!(act.apply_scalar(0.5), 0.5);
+        assert_eq!(act.apply_scalar(1.0), 0.75);
     }
 
     #[test]
