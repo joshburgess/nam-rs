@@ -27,8 +27,9 @@ main!(
         .callgrind_args(["collect-atstart=no"])
         .env(
             "GLIBC_TUNABLES",
-            "glibc.cpu.hwcaps=-SSE4_2,-AVX,-AVX2,-AVX512F",
+            "glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-AVX,-AVX2,-FMA,-AVX512,-AVX512F,-AVX512CD,-AVX512BW,-AVX512DQ,-AVX512VL",
         )
+        .env("LD_HWCAP_MASK", "0")
         .entry_point(EntryPoint::None);
     library_benchmark_groups = callback_group
 );
