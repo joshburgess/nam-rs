@@ -1,10 +1,5 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-mod app;
-mod settings;
-mod ui;
-mod worker;
-
 fn load_icon() -> Option<egui::IconData> {
     let png_bytes = include_bytes!("../resources/icon.png");
     let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
@@ -33,6 +28,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "NAM Trainer",
         options,
-        Box::new(|cc| Ok(Box::new(app::TrainerApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(nam_trainer::TrainerApp::new(cc)))),
     )
 }

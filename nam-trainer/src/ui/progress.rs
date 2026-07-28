@@ -54,7 +54,7 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
         });
 }
 
-fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
+fn show_log(app: &mut TrainerApp, ui: &mut egui::Ui, height: f32) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Log").small());
@@ -66,7 +66,10 @@ fn show_log(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
                     .save_file()
                 {
                     let content = app.training_log.join("\n");
-                    let _ = std::fs::write(path, content);
+                    if let Err(error) = crate::persistence::atomic_write(&path, content.as_bytes())
+                    {
+                        app.report_user_action_error("Save log", error);
+                    }
                 }
             }
         });

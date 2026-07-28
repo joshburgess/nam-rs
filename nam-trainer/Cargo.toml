@@ -1,15 +1,20 @@
 [package]
 name = "nam-trainer"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "GUI trainer for Neural Amp Modeler models"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "nam-trainer"
 path = "src/main.rs"
 
 [dependencies]
-nam-core = { path = "../nam-core" }
+nam-core = { version = "0.1.0", path = "../nam-core" }
 eframe = "0.31"
 egui = "0.31"
 egui_plot = "0.31"
@@ -17,6 +22,15 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
+crossbeam-channel = "0.5"
 open = "5"
 hound = "3.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+parking_lot = "0.12"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

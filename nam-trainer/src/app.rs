@@ -1,62 +1,249 @@
-use std::sync::mpsc;
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Instant;
 
+use crate::background::BackgroundOperation;
+pub(crate) use crate::diagnostics::build_diagnostics_summary;
+#[cfg(test)]
+use crate::environment::remove_managed_miniforge;
+use crate::environment::{default_python_name, managed_miniforge_dir, MANAGED_MINIFORGE_MARKER};
+#[cfg(test)]
+use crate::environment::{miniforge_installer_info, MINIFORGE_VERSION};
+#[cfg(test)]
+use crate::environment_service::parse_environment_report;
+use crate::errors::TrainingErrorKind;
+use crate::install_service::InstallOperation;
+use crate::run_controller::RunFinalization;
+#[cfg(test)]
+pub(crate) use crate::run_manifest::make_run_id;
+#[cfg(test)]
+use crate::run_manifest::save_training_log;
+use crate::run_manifest::{cleanup_run_resources, unix_timestamp_secs, CleanupReport};
+pub(crate) use crate::run_manifest::{prepare_training_run, ActiveTrainingRun};
 use crate::settings::Settings;
 use crate::ui;
-use crate::worker::{TrainingState, WorkerHandle, WorkerMessage};
+pub use crate::validation::{validate_audio_files, ValidationSeverity};
+use crate::worker::{TrainingState, WorkerHandle, WorkerMessage, WorkerMessageReceiver};
 
 /// Top-level application state.
 pub struct TrainerApp {
     // File paths
-    pub input_path: Option<String>,
-    pub output_paths: Vec<String>,
-    pub destination_dir: Option<String>,
+    pub(crate) input_path: Option<PathBuf>,
+    pub(crate) output_paths: Vec<PathBuf>,
+    pub(crate) destination_dir: Option<PathBuf>,
 
     // Training configuration
-    pub config: TrainingConfig,
-    pub metadata: ModelMetadata,
+    pub(crate) config: TrainingConfig,
+    pub(crate) metadata: ModelMetadata,
+    pub(crate) allow_overwrite_outputs: bool,
 
     // Sub-window visibility
-    pub show_advanced: bool,
-    pub show_metadata: bool,
+    pub(crate) show_advanced: bool,
+    pub(crate) show_metadata: bool,
 
     // Training state
-    pub training_state: TrainingState,
-    pub training_log: Vec<String>,
-    pub epoch_history: Vec<EpochStats>,
-    pub worker: Option<WorkerHandle>,
-    pub message_rx: Option<mpsc::Receiver<WorkerMessage>>,
-    pub model_path: Option<String>,
-
-    // Batch training progress (file N of M)
-    pub current_file_index: usize,
-    pub total_files: usize,
-
-    // ETA tracking
-    pub training_start_time: Option<Instant>,
-    pub last_epoch_time: Option<Instant>,
-    pub avg_epoch_secs: Option<f64>,
+    pub(crate) training_log: Vec<String>,
+    pub(crate) epoch_history: Vec<EpochStats>,
+    pub(crate) model_path: Option<PathBuf>,
+    pub(crate) run: TrainingRunContext,
+    pub(crate) user_action_error: Option<String>,
 
     // Persistent settings
-    pub settings: Settings,
+    pub(crate) settings: Settings,
 
     // Python executable path
-    pub python_path: String,
+    pub(crate) python_path: PathBuf,
 
     // Device selection
-    pub selected_device: String, // "cpu", "cuda:0", "mps", etc.
+    pub(crate) selected_device: DeviceId,
 
     // Python discovery and environment status
-    pub discovered_pythons: Option<Vec<crate::ui::main_panel::PythonEntry>>,
-    pub python_discovery_rx: Option<mpsc::Receiver<Vec<crate::ui::main_panel::PythonEntry>>>,
-    pub python_status: PythonStatus,
-    pub cuda_install: Option<CudaInstall>,
-    python_check_rx: Option<mpsc::Receiver<DetectionResult>>,
+    pub(crate) discovered_pythons: Option<Vec<crate::environment_service::PythonEntry>>,
+    pub(crate) python_discovery_rx:
+        Option<BackgroundOperation<Vec<crate::environment_service::PythonEntry>>>,
+    pub(crate) python_status: PythonStatus,
+    pub(crate) cuda_install: Option<CudaInstall>,
+    python_check_rx: Option<BackgroundOperation<DetectionResult>>,
 
     // NAM install state
-    pub install_state: InstallState,
-    pub install_log: Vec<String>,
-    pub install_rx: Option<mpsc::Receiver<InstallMessage>>,
+    pub(crate) install_state: InstallState,
+    pub(crate) install_log: Vec<String>,
+    pub(crate) install_rx: Option<InstallOperation>,
+    pub(crate) pending_destructive_action: Option<InstallAction>,
+}
+
+pub(crate) enum TrainingRunContext {
+    Idle(RunData),
+    Running {
+        data: RunData,
+        worker: Option<WorkerHandle>,
+        messages: WorkerMessageReceiver,
+    },
+    Finishing {
+        data: RunData,
+        worker: Option<WorkerHandle>,
+        messages: WorkerMessageReceiver,
+        result: TrainingRunResult,
+    },
+    Finished {
+        data: RunData,
+        result: TrainingRunResult,
+    },
+}
+
+#[derive(Default)]
+pub(crate) struct RunData {
+    pub(crate) artifacts: Option<ActiveTrainingRun>,
+    pub(crate) completed_models: Vec<PathBuf>,
+    pub(crate) failed_files: Vec<TrainingFileFailure>,
+    pub(crate) current_file_index: usize,
+    pub(crate) total_files: usize,
+    pub(crate) started_at: Option<Instant>,
+    pub(crate) last_epoch_at: Option<Instant>,
+    pub(crate) avg_epoch_secs: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TrainingRunResult {
+    Complete,
+    Error(String),
+    Cancelled,
+}
+
+impl Default for TrainingRunContext {
+    fn default() -> Self {
+        Self::Idle(RunData::default())
+    }
+}
+
+impl TrainingRunContext {
+    pub(crate) fn activate(
+        &mut self,
+        worker: Option<WorkerHandle>,
+        messages: WorkerMessageReceiver,
+    ) {
+        let data = std::mem::take(self.data_mut());
+        *self = Self::Running {
+            data,
+            worker,
+            messages,
+        };
+    }
+
+    pub(crate) fn state(&self) -> TrainingState {
+        match self {
+            Self::Idle(_) => TrainingState::Idle,
+            Self::Running { .. } => TrainingState::Training,
+            Self::Finishing { result, .. } | Self::Finished { result, .. } => {
+                result.as_training_state()
+            }
+        }
+    }
+
+    pub(crate) fn data(&self) -> &RunData {
+        match self {
+            Self::Idle(data)
+            | Self::Running { data, .. }
+            | Self::Finishing { data, .. }
+            | Self::Finished { data, .. } => data,
+        }
+    }
+
+    pub(crate) fn data_mut(&mut self) -> &mut RunData {
+        match self {
+            Self::Idle(data)
+            | Self::Running { data, .. }
+            | Self::Finishing { data, .. }
+            | Self::Finished { data, .. } => data,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, result: TrainingRunResult) {
+        let previous = std::mem::take(self);
+        *self = match previous {
+            Self::Running {
+                data,
+                worker,
+                messages,
+            } => Self::Finishing {
+                data,
+                worker,
+                messages,
+                result,
+            },
+            Self::Finishing {
+                data,
+                worker,
+                messages,
+                ..
+            } => Self::Finishing {
+                data,
+                worker,
+                messages,
+                result,
+            },
+            Self::Idle(data) | Self::Finished { data, .. } => Self::Finished { data, result },
+        };
+    }
+
+    pub(crate) fn finish_error(&mut self, message: impl Into<String>) {
+        self.finish(TrainingRunResult::Error(message.into()));
+    }
+
+    pub(crate) fn messages(&self) -> Option<&WorkerMessageReceiver> {
+        match self {
+            Self::Running { messages, .. } | Self::Finishing { messages, .. } => Some(messages),
+            Self::Idle(_) | Self::Finished { .. } => None,
+        }
+    }
+
+    fn worker_mut(&mut self) -> Option<&mut WorkerHandle> {
+        match self {
+            Self::Running { worker, .. } | Self::Finishing { worker, .. } => worker.as_mut(),
+            Self::Idle(_) | Self::Finished { .. } => None,
+        }
+    }
+
+    pub(crate) fn worker_exited(&mut self) {
+        let previous = std::mem::take(self);
+        *self = match previous {
+            Self::Finishing { data, result, .. } => Self::Finished { data, result },
+            other => other,
+        };
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Finishing { .. })
+    }
+
+    #[cfg(test)]
+    fn set_test_state(&mut self, state: TrainingState) {
+        match state {
+            TrainingState::Idle => self.reset(),
+            TrainingState::Training => {
+                let (_tx, rx) = crate::worker::worker_message_channel(1);
+                self.activate(None, rx);
+            }
+            TrainingState::Complete => self.finish(TrainingRunResult::Complete),
+            TrainingState::Error(message) => self.finish_error(message),
+        }
+    }
+}
+
+impl TrainingRunResult {
+    fn as_training_state(&self) -> TrainingState {
+        match self {
+            Self::Complete => TrainingState::Complete,
+            Self::Error(message) => TrainingState::Error(message.clone()),
+            Self::Cancelled => TrainingState::Idle,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +278,15 @@ pub struct DetectionResult {
 /// Minimum Python version required by neural-amp-modeler.
 pub const NAM_MIN_PYTHON: (u32, u32) = (3, 10);
 pub const DEFAULT_OUTPUT_SAMPLES_PER_DATUM: u32 = 8192;
+const MAX_TRAINING_LOG_LINES: usize = 2_000;
+const MAX_INSTALL_LOG_LINES: usize = 1_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainingFileFailure {
+    pub file: String,
+    pub kind: TrainingErrorKind,
+    pub message: String,
+}
 
 #[derive(Clone, Debug)]
 pub enum PythonStatus {
@@ -99,6 +295,7 @@ pub enum PythonStatus {
         version: String,
         devices: Vec<TrainingDevice>,
         warnings: Vec<String>,
+        report: EnvironmentReport,
     },
     VersionTooOld {
         version: String,
@@ -110,14 +307,59 @@ pub enum PythonStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingDevice {
-    pub id: String,   // "cpu", "cuda:0", "cuda:1", "mps"
+    pub id: DeviceId,
     pub name: String, // "CPU", "CUDA 0: NVIDIA RTX 4090", "Apple GPU (MPS)"
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct DeviceId(String);
+
+impl DeviceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn starts_with(&self, prefix: &str) -> bool {
+        self.0.starts_with(prefix)
+    }
+}
+
+impl From<&str> for DeviceId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for DeviceId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq<&str> for DeviceId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EnvironmentReport {
+    pub nam_version: Option<String>,
+    pub torch_version: Option<String>,
+    pub packed_full_config_supported: bool,
 }
 
 #[derive(Debug)]
 pub enum InstallMessage {
     Log(String),
-    PythonInstalled { python_path: String },
+    PythonInstalled { python_path: PathBuf },
     Done { success: bool },
 }
 
@@ -135,6 +377,8 @@ pub struct TrainingConfig {
     pub ignore_checks: bool,
     pub num_output_samples_per_datum: u32,
     pub use_full_config_trainer: bool,
+    pub output_model_basename: String,
+    pub batch_name_template: String,
 }
 
 impl Default for TrainingConfig {
@@ -152,6 +396,8 @@ impl Default for TrainingConfig {
             ignore_checks: false,
             num_output_samples_per_datum: DEFAULT_OUTPUT_SAMPLES_PER_DATUM,
             use_full_config_trainer: false,
+            output_model_basename: String::new(),
+            batch_name_template: "{stem}".into(),
         }
     }
 }
@@ -196,7 +442,7 @@ impl Architecture {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_lossy(s: &str) -> Self {
         match s {
             "packed" | "a2" | "packed_a2" => Self::Packed,
             "lite" => Self::Lite,
@@ -220,6 +466,14 @@ impl Architecture {
             }
             Self::Nano => "Smallest and fastest model, best for quick tests or low-power devices",
         }
+    }
+}
+
+impl FromStr for Architecture {
+    type Err = Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse_lossy(s))
     }
 }
 
@@ -271,7 +525,7 @@ impl GearType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn parse_known(s: &str) -> Option<Self> {
         match s {
             "amp" => Some(Self::Amp),
             "pedal" => Some(Self::Pedal),
@@ -294,6 +548,14 @@ impl GearType {
             Self::Preamp,
             Self::Studio,
         ]
+    }
+}
+
+impl FromStr for GearType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_known(s).ok_or(())
     }
 }
 
@@ -327,7 +589,7 @@ impl ToneType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn parse_known(s: &str) -> Option<Self> {
         match s {
             "clean" => Some(Self::Clean),
             "overdrive" => Some(Self::Overdrive),
@@ -349,6 +611,14 @@ impl ToneType {
     }
 }
 
+impl FromStr for ToneType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_known(s).ok_or(())
+    }
+}
+
 #[derive(Clone)]
 pub struct EpochStats {
     pub epoch: u32,
@@ -360,12 +630,20 @@ pub struct EpochStats {
 
 impl TrainerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = Settings::load();
+        let (settings, settings_warning) = match Settings::load() {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                Settings::default(),
+                Some(format!(
+                    "Warning: settings could not be loaded and defaults were used: {error}"
+                )),
+            ),
+        };
 
         // Restore training config from settings, falling back to defaults
         let mut config = TrainingConfig::default();
         if let Some(ref arch_str) = settings.architecture {
-            config.architecture = Architecture::from_str(arch_str);
+            config.architecture = Architecture::parse_lossy(arch_str);
         }
         if let Some(v) = settings.epochs {
             config.epochs = v;
@@ -393,6 +671,12 @@ impl TrainerApp {
         if let Some(v) = settings.use_full_config_trainer {
             config.use_full_config_trainer = v;
         }
+        if let Some(ref v) = settings.output_model_basename {
+            config.output_model_basename = v.clone();
+        }
+        if let Some(ref v) = settings.batch_name_template {
+            config.batch_name_template = v.clone();
+        }
 
         // Restore metadata from settings
         let metadata = ModelMetadata {
@@ -403,11 +687,11 @@ impl TrainerApp {
             gear_type: settings
                 .meta_gear_type
                 .as_deref()
-                .and_then(GearType::from_str),
+                .and_then(|value| value.parse().ok()),
             tone_type: settings
                 .meta_tone_type
                 .as_deref()
-                .and_then(ToneType::from_str),
+                .and_then(|value| value.parse().ok()),
             input_level_dbu: settings.meta_input_level_dbu.clone().unwrap_or_default(),
             output_level_dbu: settings.meta_output_level_dbu.clone().unwrap_or_default(),
         };
@@ -418,24 +702,19 @@ impl TrainerApp {
             destination_dir: settings.last_destination.clone(),
             config,
             metadata,
+            allow_overwrite_outputs: settings.allow_overwrite_outputs.unwrap_or(false),
             show_advanced: false,
             show_metadata: false,
-            training_state: TrainingState::Idle,
-            training_log: Vec::new(),
+            training_log: settings_warning.into_iter().collect(),
             epoch_history: Vec::new(),
-            worker: None,
-            message_rx: None,
             model_path: None,
-            current_file_index: 0,
-            total_files: 0,
-            training_start_time: None,
-            last_epoch_time: None,
-            avg_epoch_secs: None,
+            run: TrainingRunContext::default(),
+            user_action_error: None,
             python_path: settings
                 .python_path
                 .clone()
                 .unwrap_or_else(default_python_name),
-            selected_device: "cpu".to_string(),
+            selected_device: "cpu".into(),
             discovered_pythons: None,
             python_discovery_rx: None,
             python_status: PythonStatus::Unknown,
@@ -444,8 +723,10 @@ impl TrainerApp {
             install_state: InstallState::Idle,
             install_log: Vec::new(),
             install_rx: None,
+            pending_destructive_action: None,
             settings,
         };
+        app.restore_interrupted_run();
         app.check_python();
         app
     }
@@ -463,7 +744,10 @@ impl TrainerApp {
         self.settings.ignore_checks = Some(self.config.ignore_checks);
         self.settings.num_output_samples_per_datum = Some(self.config.num_output_samples_per_datum);
         self.settings.use_full_config_trainer = Some(self.config.use_full_config_trainer);
-        self.settings.save();
+        self.settings.allow_overwrite_outputs = Some(self.allow_overwrite_outputs);
+        self.settings.output_model_basename = non_empty_opt(&self.config.output_model_basename);
+        self.settings.batch_name_template = non_empty_opt(&self.config.batch_name_template);
+        self.persist_settings();
     }
 
     /// Save the current metadata fields to persistent settings.
@@ -476,170 +760,33 @@ impl TrainerApp {
         self.settings.meta_tone_type = self.metadata.tone_type.map(|t| t.as_str().to_string());
         self.settings.meta_input_level_dbu = non_empty_opt(&self.metadata.input_level_dbu);
         self.settings.meta_output_level_dbu = non_empty_opt(&self.metadata.output_level_dbu);
-        self.settings.save();
+        self.persist_settings();
+    }
+
+    pub fn persist_settings(&mut self) {
+        #[cfg(not(test))]
+        if let Err(error) = self.settings.save() {
+            self.push_training_log(format!("Warning: failed to save settings: {error}"));
+        }
     }
 
     /// Spawn a background thread to verify Python + NAM are available and detect GPU.
     pub fn check_python(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.python_check_rx = Some(rx);
-        let python = self.python_path.clone();
-
-        std::thread::spawn(move || {
-            let script = include_str!("../python/detect_environment.py");
-            let output = std::process::Command::new(&python)
-                .args(["-c", script])
-                .hide_console()
-                .output();
-
-            let result = match output {
-                Ok(out) if out.status.success() => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
-                        let version = val
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-
-                        let cuda_install = parse_cuda_install(&val);
-
-                        // Check Python version meets minimum
-                        let version_ok = parse_version_tuple(&version)
-                            .map(|(maj, min)| (maj, min) >= NAM_MIN_PYTHON)
-                            .unwrap_or(false);
-
-                        let status = if !version_ok {
-                            PythonStatus::VersionTooOld { version }
-                        } else {
-                            let nam_ok = val.get("nam").and_then(|v| v.as_bool()).unwrap_or(false);
-
-                            // Parse devices list
-                            let devices: Vec<TrainingDevice> = val
-                                .get("devices")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|d| {
-                                            let id = d.get("id")?.as_str()?.to_string();
-                                            let name = d.get("name")?.as_str()?.to_string();
-                                            Some(TrainingDevice { id, name })
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_else(|| {
-                                    vec![TrainingDevice {
-                                        id: "cpu".into(),
-                                        name: "CPU".into(),
-                                    }]
-                                });
-
-                            let warnings: Vec<String> = val
-                                .get("warnings")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|w| w.as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-
-                            if nam_ok {
-                                PythonStatus::Ok {
-                                    version,
-                                    devices,
-                                    warnings,
-                                }
-                            } else {
-                                PythonStatus::Error("NAM not installed".into())
-                            }
-                        };
-                        DetectionResult {
-                            status,
-                            cuda_install,
-                        }
-                    } else {
-                        DetectionResult {
-                            status: PythonStatus::Error("Unexpected Python output".into()),
-                            cuda_install: None,
-                        }
-                    }
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let stderr_lower = stderr.to_lowercase();
-                    // Windows Store alias and similar "not a real Python" cases
-                    let status = if stderr_lower.contains("was not found")
-                        || stderr_lower.contains("not recognized")
-                        || stderr_lower.contains("not found")
-                    {
-                        PythonStatus::NotFound
-                    } else {
-                        PythonStatus::Error(format!(
-                            "Python error: {}",
-                            stderr.lines().next().unwrap_or("unknown")
-                        ))
-                    };
-                    DetectionResult {
-                        status,
-                        cuda_install: None,
-                    }
-                }
-                Err(_) => DetectionResult {
-                    status: PythonStatus::NotFound,
-                    cuda_install: None,
-                },
-            };
-            let _ = tx.send(result);
-        });
+        self.python_check_rx = Some(crate::environment_service::spawn_environment_detection(
+            self.python_path.clone(),
+        ));
     }
 
     /// Install neural-amp-modeler into the selected Python environment.
     /// If an NVIDIA GPU was detected, installs a CUDA-enabled PyTorch wheel
     /// first so the user gets a working GPU setup from a single button click.
     pub fn install_nam(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.install_rx = Some(rx);
+        self.install_rx = Some(crate::install_service::spawn_nam_install(
+            self.python_path.clone(),
+            self.cuda_install.clone(),
+        ));
         self.install_state = InstallState::Installing(InstallAction::InstallingNam);
         self.install_log.clear();
-
-        let python = self.python_path.clone();
-        let cuda_install = self.cuda_install.clone();
-
-        std::thread::spawn(move || {
-            if let Some(ref ci) = cuda_install {
-                let _ = tx.send(InstallMessage::Log(format!(
-                    "NVIDIA GPU detected ({}). Installing PyTorch with CUDA {} first...",
-                    ci.gpu_names.join(", "),
-                    ci.cuda_version,
-                )));
-                let torch_args = [
-                    "-m",
-                    "pip",
-                    "install",
-                    "torch",
-                    "--index-url",
-                    ci.wheel_index.as_str(),
-                ];
-                if !run_pip(&python, &torch_args, &tx) {
-                    let _ = tx.send(InstallMessage::Log(
-                        "PyTorch CUDA install failed. Aborting.".into(),
-                    ));
-                    let _ = tx.send(InstallMessage::Done { success: false });
-                    return;
-                }
-            }
-
-            let _ = tx.send(InstallMessage::Log(
-                "Installing or upgrading neural-amp-modeler...".into(),
-            ));
-            let success = run_pip(
-                &python,
-                &["-m", "pip", "install", "--upgrade", "neural-amp-modeler"],
-                &tx,
-            );
-            let _ = tx.send(InstallMessage::Done { success });
-        });
     }
 
     /// Reinstall PyTorch with CUDA support using the wheel index detected by
@@ -648,8 +795,10 @@ impl TrainerApp {
         let Some(ci) = self.cuda_install.clone() else {
             return;
         };
-        let (tx, rx) = mpsc::channel();
-        self.install_rx = Some(rx);
+        self.install_rx = Some(crate::install_service::spawn_cuda_install(
+            self.python_path.clone(),
+            ci.clone(),
+        ));
         self.install_state = InstallState::Installing(InstallAction::InstallingCudaTorch);
         self.install_log.clear();
         self.install_log.push(format!(
@@ -657,135 +806,22 @@ impl TrainerApp {
             ci.cuda_version,
             ci.gpu_names.join(", "),
         ));
-
-        let python = self.python_path.clone();
-        std::thread::spawn(move || {
-            let args = [
-                "-m",
-                "pip",
-                "install",
-                "--upgrade",
-                "--force-reinstall",
-                "torch",
-                "--index-url",
-                ci.wheel_index.as_str(),
-            ];
-            let success = run_pip(&python, &args, &tx);
-            let _ = tx.send(InstallMessage::Done { success });
-        });
     }
 
     /// Install Python via Miniforge into ~/miniforge3.
     pub fn install_python(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.install_rx = Some(rx);
         self.install_state = InstallState::Installing(InstallAction::InstallingPython);
         self.install_log.clear();
         self.install_log
             .push("Installing Python via Miniforge...".into());
 
-        let home = home_dir_string();
-        let install_dir = std::path::PathBuf::from(&home)
-            .join("miniforge3")
-            .to_string_lossy()
-            .into_owned();
-
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-
-            // Platform-specific installer URL and file extension
-            let (installer_url, installer_ext) = miniforge_installer_info();
-            let installer_url = match installer_url {
-                Some(url) => url,
-                None => {
-                    let _ = tx.send(InstallMessage::Log(
-                        "Automatic Python install is not supported on this platform.".into(),
-                    ));
-                    let _ = tx.send(InstallMessage::Done { success: false });
-                    return;
-                }
-            };
-
-            let installer_path = format!(
-                "{}/miniforge_installer{}",
-                std::env::temp_dir().display(),
-                installer_ext
-            );
-
-            // Step 1: Download
-            let _ = tx.send(InstallMessage::Log(format!(
-                "Downloading Miniforge from {installer_url}..."
-            )));
-
-            let dl = download_file(installer_url, &installer_path);
-            let mut dl_child = match dl {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!(
-                        "Failed to start download: {e}"
-                    )));
-                    let _ = tx.send(InstallMessage::Done { success: false });
-                    return;
-                }
-            };
-
-            if let Some(stderr) = dl_child.stderr.take() {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(InstallMessage::Log(line));
-                }
-            }
-
-            let dl_status = dl_child.wait();
-            if !dl_status.map(|s| s.success()).unwrap_or(false) {
-                let _ = tx.send(InstallMessage::Log("Download failed.".into()));
-                let _ = tx.send(InstallMessage::Done { success: false });
-                return;
-            }
-            let _ = tx.send(InstallMessage::Log("Download complete.".into()));
-
-            // Step 2: Run installer in batch mode
-            let _ = tx.send(InstallMessage::Log(format!(
-                "Installing to {install_dir}..."
-            )));
-            let install = run_miniforge_installer(&installer_path, &install_dir);
-
-            let mut inst_child = match install {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!("Failed to run installer: {e}")));
-                    let _ = tx.send(InstallMessage::Done { success: false });
-                    return;
-                }
-            };
-
-            // Stream stdout
-            if let Some(stdout) = inst_child.stdout.take() {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(InstallMessage::Log(line));
-                }
-            }
-
-            let inst_status = inst_child.wait();
-            if !inst_status.map(|s| s.success()).unwrap_or(false) {
-                let _ = tx.send(InstallMessage::Log("Miniforge installation failed.".into()));
-                let _ = tx.send(InstallMessage::Done { success: false });
-                return;
-            }
-
-            // Clean up installer
-            let _ = std::fs::remove_file(&installer_path);
-
-            let python_path = miniforge_python_path(&install_dir);
-            let _ = tx.send(InstallMessage::Log(format!(
-                "Python installed at {python_path}"
-            )));
-
-            // Send special done message with the new python path
-            let _ = tx.send(InstallMessage::PythonInstalled { python_path });
-            let _ = tx.send(InstallMessage::Done { success: true });
-        });
+        let Some(install_dir) = managed_miniforge_dir() else {
+            self.install_state = InstallState::Failed;
+            self.install_log
+                .push("Could not determine the user home directory.".into());
+            return;
+        };
+        self.install_rx = Some(crate::install_service::spawn_miniforge_install(install_dir));
     }
 
     pub fn poll_install(&mut self) {
@@ -798,13 +834,13 @@ impl TrainerApp {
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 InstallMessage::Log(line) => {
-                    self.install_log.push(line);
+                    self.push_install_log(line);
                 }
                 InstallMessage::PythonInstalled { python_path } => {
                     // Auto-select the newly installed Python
                     self.python_path = python_path.clone();
                     self.settings.python_path = Some(python_path);
-                    self.settings.save();
+                    self.persist_settings();
                     // Refresh the discovery list
                     self.discovered_pythons = None;
                     self.python_discovery_rx = None;
@@ -812,16 +848,23 @@ impl TrainerApp {
                 InstallMessage::Done { success } => {
                     if success {
                         self.install_state = InstallState::Done;
-                        self.install_log.push("Installation complete!".into());
+                        self.push_install_log("Installation complete!");
                         self.python_status = PythonStatus::Unknown;
                         self.check_python();
                     } else {
                         self.install_state = InstallState::Failed;
-                        self.install_log.push("Installation failed.".into());
+                        self.push_install_log("Installation failed.");
                     }
                     done = true;
                 }
             }
+        }
+
+        let dropped = rx.take_dropped_progress();
+        if dropped > 0 {
+            self.push_install_log(format!(
+                "{dropped} additional installer log lines were suppressed."
+            ));
         }
 
         if !done {
@@ -830,114 +873,89 @@ impl TrainerApp {
         }
     }
 
+    fn push_install_log(&mut self, line: impl Into<String>) {
+        self.install_log.push(line.into());
+        let excess = self.install_log.len().saturating_sub(MAX_INSTALL_LOG_LINES);
+        if excess > 0 {
+            self.install_log.drain(..excess);
+        }
+    }
+
     /// Remove ~/miniforge3 in a background thread with progress feedback.
     pub fn uninstall_miniforge(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.install_rx = Some(rx);
+        self.install_rx = Some(crate::install_service::spawn_miniforge_uninstall(
+            managed_miniforge_dir(),
+        ));
         self.install_state = InstallState::Installing(InstallAction::UninstallingMiniforge);
         self.install_log.clear();
         self.install_log
             .push("Removing ~/miniforge3 (includes NAM if installed there)...".into());
 
-        std::thread::spawn(move || {
-            let home = home_dir_string();
-            let miniforge_dir = std::path::PathBuf::from(&home).join("miniforge3");
-
-            if miniforge_dir.exists() {
-                let _ = tx.send(InstallMessage::Log(format!(
-                    "Deleting {}...",
-                    miniforge_dir.display()
-                )));
-                match std::fs::remove_dir_all(&miniforge_dir) {
-                    Ok(_) => {
-                        let _ = tx.send(InstallMessage::Log(
-                            "Miniforge removed successfully.".into(),
-                        ));
-                        let _ = tx.send(InstallMessage::Done { success: true });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(InstallMessage::Log(format!("Failed to remove: {e}")));
-                        let _ = tx.send(InstallMessage::Done { success: false });
-                    }
-                }
-            } else {
-                let _ = tx.send(InstallMessage::Log("~/miniforge3 does not exist.".into()));
-                let _ = tx.send(InstallMessage::Done { success: true });
-            }
-        });
-
         // Reset to system python immediately so the UI updates
         let default_python = default_python_name();
         self.python_path = default_python.clone();
         self.settings.python_path = Some(default_python);
-        self.settings.save();
+        self.persist_settings();
         self.discovered_pythons = None;
         self.python_status = PythonStatus::Unknown;
         self.check_python();
     }
 
+    pub fn managed_miniforge_path() -> Option<std::path::PathBuf> {
+        managed_miniforge_dir()
+    }
+
+    pub fn is_managed_miniforge_install() -> bool {
+        managed_miniforge_dir()
+            .map(|path| path.join(MANAGED_MINIFORGE_MARKER).is_file())
+            .unwrap_or(false)
+    }
+
     /// Uninstall neural-amp-modeler from the selected Python environment.
     pub fn uninstall_nam(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.install_rx = Some(rx);
+        self.install_rx = Some(crate::install_service::spawn_nam_uninstall(
+            self.python_path.clone(),
+        ));
         self.install_state = InstallState::Installing(InstallAction::UninstallingNam);
         self.install_log.clear();
         self.install_log
             .push("Uninstalling neural-amp-modeler...".into());
-
-        let python = self.python_path.clone();
-
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-
-            let result = std::process::Command::new(&python)
-                .args(["-m", "pip", "uninstall", "-y", "neural-amp-modeler"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .hide_console()
-                .spawn();
-
-            let mut child = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
-                    let _ = tx.send(InstallMessage::Done { success: false });
-                    return;
-                }
-            };
-
-            if let Some(stderr) = child.stderr.take() {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(InstallMessage::Log(line));
-                }
-            }
-
-            let status = child.wait();
-            let success = status.map(|s| s.success()).unwrap_or(false);
-            if success {
-                let _ = tx.send(InstallMessage::Log("NAM uninstalled successfully.".into()));
-            }
-            let _ = tx.send(InstallMessage::Done { success });
-        });
     }
 
     /// Start a demo training simulation (for testing the progress UI).
     pub fn start_demo_training(&mut self) {
-        use crate::worker::{TrainingState, WorkerMessage};
+        use crate::worker::{event_to_message, protocol};
 
-        self.training_state = TrainingState::Training;
         self.training_log.clear();
         self.epoch_history.clear();
-        self.training_log.push("Demo training started...".into());
+        let data = self.run.data_mut();
+        data.completed_models.clear();
+        data.failed_files.clear();
+        data.current_file_index = 0;
+        data.total_files = 1;
+        data.started_at = Some(Instant::now());
+        data.last_epoch_at = None;
+        data.avg_epoch_secs = None;
+        self.push_training_log("Demo training started...");
 
-        let (tx, rx) = mpsc::channel();
-        self.message_rx = Some(rx);
-
+        let (tx, rx) = crate::worker::worker_message_channel(64);
         let epochs = self.config.epochs;
-        std::thread::spawn(move || {
+        let cancelled = tx.cancellation_flag();
+        let demo_cancelled = std::sync::Arc::clone(&cancelled);
+        let join = std::thread::spawn(move || {
+            let _ = tx.send(event_to_message(protocol::WorkerEvent::TrainingStart {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                run_id: "demo".into(),
+                file_index: Some(0),
+                sequence: 1,
+                file: "demo_output.wav".into(),
+                total_epochs: epochs,
+            }));
             for epoch in 1..=epochs {
                 std::thread::sleep(std::time::Duration::from_millis(200));
+                if demo_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 // Simulate decreasing loss with some noise
                 let progress = epoch as f64 / epochs as f64;
                 let noise = ((epoch as f64 * 7.3).sin() * 0.02).abs();
@@ -945,229 +963,260 @@ impl TrainerApp {
                 let val_loss = 0.55 * (-2.8 * progress).exp() + noise * 1.2;
                 let esr = 0.4 * (-2.5 * progress).exp() + noise * 0.5;
 
-                let _ = tx.send(WorkerMessage::EpochEnd {
+                let _ = tx.send(event_to_message(protocol::WorkerEvent::EpochEnd {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    run_id: "demo".into(),
+                    file_index: Some(0),
+                    sequence: u64::from(epoch) + 1,
                     epoch,
                     train_loss,
                     val_loss,
                     esr,
-                });
-                let _ = tx.send(WorkerMessage::Log(format!(
-                    "Epoch {epoch}/{epochs}: train={train_loss:.6} val={val_loss:.6} ESR={esr:.6}"
-                )));
+                }));
+                let _ = tx.send(event_to_message(protocol::WorkerEvent::Log {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    run_id: "demo".into(),
+                    file_index: Some(0),
+                    sequence: u64::from(epoch) + u64::from(epochs) + 1,
+                    message: format!(
+                        "Epoch {epoch}/{epochs}: train={train_loss:.6} val={val_loss:.6} ESR={esr:.6}"
+                    ),
+                }));
             }
-            let _ = tx.send(WorkerMessage::TrainingComplete {
+            let _ = tx.send(event_to_message(protocol::WorkerEvent::TrainingComplete {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                run_id: "demo".into(),
+                file_index: Some(0),
+                sequence: u64::from(epochs) * 2 + 2,
+                file: "demo_output.wav".into(),
+                validation_esr: 0.0,
                 model_path: "/tmp/demo_model.nam".into(),
-            });
+            }));
+            let _ = tx.send(event_to_message(protocol::WorkerEvent::AllComplete {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                run_id: "demo".into(),
+                file_index: None,
+                sequence: u64::from(epochs) * 2 + 3,
+            }));
+            let _ = tx.send(WorkerMessage::WorkerExited { exit_code: Some(0) });
         });
+        let worker = WorkerHandle::from_join(cancelled, join);
+        self.run.activate(Some(worker), rx);
     }
 
     pub fn can_train(&self) -> bool {
         self.input_path.is_some()
             && !self.output_paths.is_empty()
             && self.destination_dir.is_some()
-            && self.training_state == TrainingState::Idle
+            && self.run.state() == TrainingState::Idle
     }
 
-    /// Drain worker messages and update state.
-    pub fn poll_worker(&mut self) {
-        let rx = match self.message_rx.as_ref() {
-            Some(rx) => rx,
-            None => return,
-        };
-
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                WorkerMessage::Log(text) => {
-                    self.training_log.push(text);
-                }
-                WorkerMessage::TrainingStart {
-                    ref file,
-                    total_epochs,
-                } => {
-                    self.current_file_index += 1;
-                    self.training_log
-                        .push(format!("Training {} ({} epochs)...", file, total_epochs));
-                }
-                WorkerMessage::EpochEnd {
-                    epoch,
-                    train_loss,
-                    val_loss,
-                    esr,
-                } => {
-                    // Update ETA tracking
-                    let now = Instant::now();
-                    if let Some(last) = self.last_epoch_time {
-                        let elapsed = now.duration_since(last).as_secs_f64();
-                        // Exponential moving average for smoother estimates
-                        self.avg_epoch_secs = Some(match self.avg_epoch_secs {
-                            Some(avg) => avg * 0.7 + elapsed * 0.3,
-                            None => elapsed,
-                        });
-                    }
-                    self.last_epoch_time = Some(now);
-
-                    self.epoch_history.push(EpochStats {
-                        epoch,
-                        train_loss,
-                        val_loss,
-                        esr,
-                    });
-                    self.training_log.push(format!(
-                        "Epoch {}: loss={:.6} val_loss={:.6} ESR={:.6}",
-                        epoch, train_loss, val_loss, esr
-                    ));
-                }
-                WorkerMessage::TrainingComplete { model_path } => {
-                    let final_esr = self.epoch_history.last().map(|e| e.esr).unwrap_or(0.0);
-                    self.training_log.push(format!(
-                        "Training complete! ESR={:.6} Model: {}",
-                        final_esr, model_path
-                    ));
-                    self.model_path = Some(model_path);
-                    self.training_state = TrainingState::Complete;
-                    self.worker = None;
-
-                    // Send desktop notification
-                    send_notification(
-                        "NAM Trainer",
-                        &format!("Training complete! (ESR: {:.6})", final_esr),
-                    );
-                }
-                WorkerMessage::Error(err) => {
-                    self.training_log.push(format!("Error: {}", err));
-                    self.training_state = TrainingState::Error(err);
-                    self.worker = None;
-                }
-                WorkerMessage::WorkerExited { exit_code } => {
-                    if self.training_state == TrainingState::Training {
-                        let msg = match exit_code {
-                            Some(code) => {
-                                format!("Worker process exited unexpectedly (exit code {code})")
-                            }
-                            None => "Worker process exited unexpectedly".into(),
-                        };
-                        self.training_state = TrainingState::Error(msg);
-                    }
-                    self.worker = None;
-                }
-            }
+    pub fn cancel_training(&mut self) {
+        if let Some(worker) = self.run.worker_mut() {
+            worker.cancel();
         }
+        self.push_training_log("Training cancelled.");
+        self.finalize_run(RunFinalization::Cancelled);
     }
-}
 
-// ── Audio validation ───────────────────────────────────────────────────
+    pub fn set_allow_overwrite_outputs(&mut self, allow: bool) {
+        self.allow_overwrite_outputs = allow;
+        self.save_config();
+    }
 
-/// Validate that audio files are suitable for training. Returns a list of
-/// warnings/errors. An empty list means everything looks good.
-pub fn validate_audio_files(input_path: &str, output_paths: &[String]) -> Vec<String> {
-    let mut issues = Vec::new();
-
-    let input_spec = match hound::WavReader::open(input_path) {
-        Ok(r) => r.spec(),
-        Err(e) => {
-            issues.push(format!("Cannot read input file: {e}"));
-            return issues;
+    pub fn reset_after_error(&mut self) {
+        let report = cleanup_run_resources(self.run.data().artifacts.as_ref());
+        if !report.is_complete() {
+            self.report_cleanup_failures(&report);
+            return;
         }
-    };
+        self.clear_active_run_settings();
+        self.run.reset();
+        self.epoch_history.clear();
+        self.training_log.clear();
+    }
 
-    let input_duration = match hound::WavReader::open(input_path) {
-        Ok(r) => {
-            let samples = r.len() as f64;
-            let channels = input_spec.channels as f64;
-            let rate = input_spec.sample_rate as f64;
-            samples / channels / rate
+    pub fn prepare_train_again(&mut self) {
+        let report = cleanup_run_resources(self.run.data().artifacts.as_ref());
+        if !report.is_complete() {
+            self.report_cleanup_failures(&report);
+            return;
         }
-        Err(_) => 0.0,
-    };
+        self.clear_active_run_settings();
+        self.run.reset();
+        self.epoch_history.clear();
+        self.training_log.clear();
+        self.model_path = None;
+    }
 
-    if input_duration < 1.0 {
-        issues.push(format!(
-            "Input file is very short ({:.1}s). Training needs at least a few seconds of audio.",
-            input_duration
+    pub fn diagnostics_text(&self) -> String {
+        build_diagnostics_summary(self)
+    }
+
+    pub(crate) fn report_user_action_error(&mut self, action: &str, error: impl std::fmt::Display) {
+        let message = format!("{action} failed: {error}");
+        self.push_training_log(format!("Error: {message}"));
+        self.user_action_error = Some(message);
+    }
+
+    pub(crate) fn report_cleanup_failures(&mut self, report: &CleanupReport) {
+        for failure in &report.failures {
+            self.push_training_log(format!(
+                "Cleanup failed while attempting to {} {}: {}",
+                failure.operation,
+                failure.path.display(),
+                failure.message
+            ));
+        }
+        self.user_action_error = Some(format!(
+            "Cleanup is incomplete for {} path(s). Recovery information was retained so cleanup can be retried.",
+            report.failures.len()
         ));
     }
 
-    for output_path in output_paths {
-        let basename = std::path::Path::new(output_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| output_path.clone());
-
-        let output_spec = match hound::WavReader::open(output_path) {
-            Ok(r) => r.spec(),
-            Err(e) => {
-                issues.push(format!("{basename}: cannot read file: {e}"));
-                continue;
+    pub fn push_training_log(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        if let Some(ref run) = self.run.data().artifacts {
+            if let Err(error) = run.append_log(&line) {
+                if self.user_action_error.is_none() {
+                    self.user_action_error = Some(format!("Training log write failed: {error}"));
+                }
             }
-        };
-
-        let output_duration = match hound::WavReader::open(output_path) {
-            Ok(r) => {
-                let samples = r.len() as f64;
-                let channels = output_spec.channels as f64;
-                let rate = output_spec.sample_rate as f64;
-                samples / channels / rate
-            }
-            Err(_) => 0.0,
-        };
-
-        if output_spec.sample_rate != input_spec.sample_rate {
-            issues.push(format!(
-                "{basename}: sample rate {}Hz does not match input ({}Hz)",
-                output_spec.sample_rate, input_spec.sample_rate
-            ));
         }
-
-        if output_duration < 1.0 {
-            issues.push(format!("{basename}: very short ({:.1}s)", output_duration));
-        }
-
-        let ratio = if input_duration > 0.0 {
-            output_duration / input_duration
-        } else {
-            1.0
-        };
-        if !(0.5..=2.0).contains(&ratio) {
-            issues.push(format!(
-                "{basename}: duration ({:.1}s) differs significantly from input ({:.1}s)",
-                output_duration, input_duration
-            ));
+        self.training_log.push(line);
+        if self.training_log.len() > MAX_TRAINING_LOG_LINES {
+            let excess = self.training_log.len() - MAX_TRAINING_LOG_LINES;
+            self.training_log.drain(0..excess);
         }
     }
 
-    issues
+    pub fn record_active_run_settings(&mut self) {
+        if let Some(ref run) = self.run.data().artifacts {
+            self.settings.active_run_id = Some(run.id.to_string());
+            self.settings.active_run_log_path = Some(run.log_path.clone());
+            self.settings.active_run_manifest_path = Some(run.manifest_path.clone());
+            self.settings.active_run_staging_dir = Some(run.staging_dir().to_path_buf());
+            self.settings.active_run_reserved_paths = run.reserved_paths().to_vec();
+            self.persist_settings();
+        }
+    }
+
+    pub fn clear_active_run_settings(&mut self) {
+        self.settings.active_run_id = None;
+        self.settings.active_run_log_path = None;
+        self.settings.active_run_manifest_path = None;
+        self.settings.active_run_staging_dir = None;
+        self.settings.active_run_reserved_paths.clear();
+        #[cfg(not(test))]
+        self.persist_settings();
+    }
+
+    pub(crate) fn record_recent_successful_run(
+        &mut self,
+        model_path: &Path,
+        manifest_path: PathBuf,
+        final_esr: f64,
+    ) {
+        self.settings.recent_runs.insert(
+            0,
+            crate::settings::RecentRun {
+                model_path: model_path.to_path_buf(),
+                manifest_path,
+                esr: Some(final_esr),
+                architecture: self.config.architecture.as_str().to_string(),
+                device: self.selected_device.to_string(),
+                completed_unix_seconds: unix_timestamp_secs(),
+            },
+        );
+        self.settings.recent_runs.truncate(20);
+        #[cfg(not(test))]
+        self.persist_settings();
+    }
+}
+
+impl Drop for TrainerApp {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.data().artifacts.as_ref() {
+            let _ = run.flush_log();
+        }
+    }
 }
 
 // ── Desktop notifications ──────────────────────────────────────────────
 
-fn send_notification(title: &str, body: &str) {
+pub(crate) fn send_notification(title: &str, body: &str) {
     let title = title.to_string();
     let body = body.to_string();
     // Run in background thread so it never blocks the UI
     std::thread::spawn(move || {
-        let _ = send_notification_sync(&title, &body);
+        let _ = SystemNotifier.notify(&title, &body);
     });
 }
 
-fn send_notification_sync(title: &str, body: &str) -> Result<(), std::io::Error> {
-    if cfg!(target_os = "macos") {
-        std::process::Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
+trait Notifier {
+    fn notify(&self, title: &str, body: &str) -> Result<(), std::io::Error>;
+}
+
+struct SystemNotifier;
+
+impl Notifier for SystemNotifier {
+    fn notify(&self, title: &str, body: &str) -> Result<(), std::io::Error> {
+        let spec = notification_command(NotificationPlatform::current(), title, body);
+        std::process::Command::new(spec.program)
+            .args(&spec.args)
+            .hide_console()
+            .output()?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NotificationPlatform {
+    MacOs,
+    Windows,
+    Linux,
+}
+
+impl NotificationPlatform {
+    fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+struct NotificationCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+fn notification_command(
+    platform: NotificationPlatform,
+    title: &str,
+    body: &str,
+) -> NotificationCommand {
+    match platform {
+        NotificationPlatform::MacOs => NotificationCommand {
+            program: "osascript",
+            args: vec![
+                "-e".into(),
+                format!(
                     "display notification \"{}\" with title \"{}\"",
                     body.replace('\"', "\\\""),
                     title.replace('\"', "\\\"")
                 ),
-            ])
-            .hide_console()
-            .output()?;
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
+            ],
+        },
+        NotificationPlatform::Windows => NotificationCommand {
+            program: "powershell",
+            args: vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
                     "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); \
                      $n = New-Object System.Windows.Forms.NotifyIcon; \
                      $n.Icon = [System.Drawing.SystemIcons]::Information; \
@@ -1180,127 +1229,16 @@ fn send_notification_sync(title: &str, body: &str) -> Result<(), std::io::Error>
                     title.replace('\'', "''"),
                     body.replace('\'', "''")
                 ),
-            ])
-            .hide_console()
-            .output()?;
-    } else {
-        // Linux: notify-send
-        std::process::Command::new("notify-send")
-            .args([title, body])
-            .hide_console()
-            .output()?;
+            ],
+        },
+        NotificationPlatform::Linux => NotificationCommand {
+            program: "notify-send",
+            args: vec![title.to_string(), body.to_string()],
+        },
     }
-    Ok(())
 }
 
 // ── Platform helpers ────────────────────────────────────────────────────
-
-fn home_dir_string() -> String {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".into())
-}
-
-fn default_python_name() -> String {
-    if cfg!(target_os = "windows") {
-        "python".to_string()
-    } else {
-        "python3".to_string()
-    }
-}
-
-/// Returns (Option<url>, file_extension) for the Miniforge installer.
-fn miniforge_installer_info() -> (Option<&'static str>, &'static str) {
-    if cfg!(target_os = "macos") {
-        let url = if cfg!(target_arch = "aarch64") {
-            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
-        } else {
-            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh"
-        };
-        (Some(url), ".sh")
-    } else if cfg!(target_os = "linux") {
-        let url = if cfg!(target_arch = "aarch64") {
-            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh"
-        } else {
-            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"
-        };
-        (Some(url), ".sh")
-    } else if cfg!(target_os = "windows") {
-        (
-            Some("https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Windows-x86_64.exe"),
-            ".exe",
-        )
-    } else {
-        (None, "")
-    }
-}
-
-/// Download a file using curl (macOS/Linux) or PowerShell (Windows).
-fn download_file(url: &str, dest: &str) -> Result<std::process::Child, std::io::Error> {
-    if cfg!(target_os = "windows") {
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
-                    url, dest
-                ),
-            ])
-            .stderr(std::process::Stdio::piped())
-            .hide_console()
-            .spawn()
-    } else {
-        std::process::Command::new("curl")
-            .args(["-fSL", "-o", dest, url])
-            .stderr(std::process::Stdio::piped())
-            .hide_console()
-            .spawn()
-    }
-}
-
-/// Run the Miniforge installer in silent/batch mode.
-fn run_miniforge_installer(
-    installer_path: &str,
-    install_dir: &str,
-) -> Result<std::process::Child, std::io::Error> {
-    if cfg!(target_os = "windows") {
-        // Run the NSIS installer through PowerShell with -WindowStyle Hidden
-        // so any sub-process console windows the installer spawns stay hidden.
-        // Direct invocation with CREATE_NO_WINDOW only hides the parent.
-        std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &format!(
-                    "Start-Process -FilePath '{}' -ArgumentList '/S /InstallationType=JustMe /RegisterPython=0 /AddToPath=0 /D={}' -Wait -WindowStyle Hidden",
-                    installer_path, install_dir
-                ),
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .hide_console()
-            .spawn()
-    } else {
-        std::process::Command::new("bash")
-            .args([installer_path, "-b", "-u", "-p", install_dir])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .hide_console()
-            .spawn()
-    }
-}
-
-/// Returns the path to the python executable inside a miniforge install.
-fn miniforge_python_path(install_dir: &str) -> String {
-    if cfg!(target_os = "windows") {
-        format!("{install_dir}\\python.exe")
-    } else {
-        format!("{install_dir}/bin/python")
-    }
-}
 
 /// Chainable helper that suppresses the child console window on Windows.
 /// No-op on other platforms so call sites can be unconditional.
@@ -1332,17 +1270,6 @@ fn non_empty_opt(s: &str) -> Option<String> {
     }
 }
 
-fn parse_version_tuple(version: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = version.split('.').collect();
-    if parts.len() >= 2 {
-        let major = parts[0].parse::<u32>().ok()?;
-        let minor = parts[1].parse::<u32>().ok()?;
-        Some((major, minor))
-    } else {
-        None
-    }
-}
-
 impl TrainerApp {
     fn poll_python_check(&mut self) {
         if let Some(ref rx) = self.python_check_rx {
@@ -1366,69 +1293,16 @@ impl TrainerApp {
     }
 }
 
-/// Run `python <args>` with stderr streamed to `tx` as install log lines.
-/// Returns true on exit-zero, false otherwise. Used by install_nam and
-/// install_cuda_torch to share streaming + error handling.
-fn run_pip(python: &str, args: &[&str], tx: &mpsc::Sender<InstallMessage>) -> bool {
-    let spawn_result = std::process::Command::new(python)
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .hide_console()
-        .spawn();
-
-    let mut child = match spawn_result {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(InstallMessage::Log(format!("Failed to run pip: {e}")));
-            return false;
-        }
-    };
-
-    if let Some(stderr) = child.stderr.take() {
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = tx.send(InstallMessage::Log(line));
-        }
-    }
-
-    child.wait().map(|s| s.success()).unwrap_or(false)
-}
-
-fn parse_cuda_install(val: &serde_json::Value) -> Option<CudaInstall> {
-    let ci = val.get("cuda_install")?;
-    if ci.is_null() {
-        return None;
-    }
-    let cuda_version = ci.get("cuda_version")?.as_str()?.to_string();
-    let wheel_index = ci.get("wheel_index")?.as_str()?.to_string();
-    let gpu_names = ci
-        .get("gpu_names")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|n| n.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(CudaInstall {
-        cuda_version,
-        wheel_index,
-        gpu_names,
-    })
-}
-
 impl eframe::App for TrainerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_worker();
+        let worker_messages_pending = self.poll_worker();
         self.poll_python_check();
         self.poll_install();
 
         // Handle drag-and-drop of WAV files
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
-                let wav_files: Vec<String> = i
+                let wav_files: Vec<PathBuf> = i
                     .raw
                     .dropped_files
                     .iter()
@@ -1438,14 +1312,14 @@ impl eframe::App for TrainerApp {
                             .map(|e| e.eq_ignore_ascii_case("wav"))
                             .unwrap_or(false)
                     })
-                    .map(|p| p.display().to_string())
+                    .cloned()
                     .collect();
 
                 if wav_files.len() == 1 && self.input_path.is_none() {
                     // Single WAV dropped with no input set: use as input
                     let p = wav_files[0].clone();
                     self.settings.last_input_path = Some(p.clone());
-                    self.settings.save();
+                    self.persist_settings();
                     self.input_path = Some(p);
                 } else if !wav_files.is_empty() {
                     // Multiple WAVs or input already set: use as output
@@ -1455,7 +1329,7 @@ impl eframe::App for TrainerApp {
         });
 
         // Update window title with training progress
-        match &self.training_state {
+        match self.run.state() {
             TrainingState::Training => {
                 if let Some(last) = self.epoch_history.last() {
                     let pct = (last.epoch as f32 / self.config.epochs.max(1) as f32 * 100.0) as u32;
@@ -1482,7 +1356,8 @@ impl eframe::App for TrainerApp {
         }
 
         // Request continuous repaints while training or installing
-        let needs_repaint = self.training_state == TrainingState::Training
+        let needs_repaint = self.run.state() == TrainingState::Training
+            || worker_messages_pending
             || matches!(self.install_state, InstallState::Installing(_))
             || matches!(self.python_status, PythonStatus::Unknown)
             || self.python_discovery_rx.is_some();
@@ -1506,22 +1381,13 @@ impl eframe::App for TrainerApp {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Architecture;
+#[path = "app_validation_tests.rs"]
+mod validation_tests;
 
-    #[test]
-    fn packed_architecture_round_trips() {
-        assert_eq!(Architecture::Packed.as_str(), "packed");
-        assert_eq!(Architecture::from_str("packed"), Architecture::Packed);
-        assert_eq!(Architecture::from_str("a2"), Architecture::Packed);
-        assert_eq!(Architecture::from_str("packed_a2"), Architecture::Packed);
-    }
+#[cfg(test)]
+#[path = "app_run_tests.rs"]
+mod run_tests;
 
-    #[test]
-    fn packed_architecture_is_available_first() {
-        assert_eq!(
-            Architecture::all().first().copied(),
-            Some(Architecture::Packed)
-        );
-    }
-}
+#[cfg(test)]
+#[path = "app_ui_tests.rs"]
+mod ui_tests;

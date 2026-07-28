@@ -1,0 +1,11 @@
+{
+  "type": "epoch_end",
+  "protocol_version": 3,
+  "run_id": "run-test",
+  "file_index": 0,
+  "sequence": 2,
+  "epoch": 3,
+  "train_loss": 0.125,
+  "val_loss": 0.25,
+  "esr": 0.375
+}

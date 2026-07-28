@@ -1,7 +1,12 @@
+import importlib.metadata
 import json, sys, subprocess, shutil, re
 
 result = {
     "nam": False,
+    "nam_version": None,
+    "torch": False,
+    "torch_version": None,
+    "packed_full_config_supported": False,
     "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
     "devices": [{"id": "cpu", "name": "CPU"}],
     "warnings": [],
@@ -54,13 +59,30 @@ def pick_wheel_index(cuda_version):
 
 try:
     from nam.train import core
+    from nam.train import full as nam_full
     result["nam"] = True
+    try:
+        result["nam_version"] = importlib.metadata.version("neural-amp-modeler")
+    except importlib.metadata.PackageNotFoundError:
+        result["nam_version"] = "editable/unknown"
+    result["packed_full_config_supported"] = all(
+        hasattr(core, name)
+        for name in (
+            "_detect_input_version",
+            "_analyze_latency",
+            "_get_final_latency",
+            "_check_data",
+            "_get_configs",
+        )
+    ) and hasattr(nam_full, "main")
 except ImportError:
     pass
 
 has_cuda_torch = False
 try:
     import torch
+    result["torch"] = True
+    result["torch_version"] = getattr(torch, "__version__", "unknown")
     has_cuda_torch = torch.cuda.is_available()
     if has_cuda_torch:
         for i in range(torch.cuda.device_count()):

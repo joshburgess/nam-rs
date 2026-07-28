@@ -1,5 +1,9 @@
 use crate::app::{HideConsoleExt, TrainerApp};
+use crate::environment_service::home_dir;
 use crate::worker::{self, TrainingState};
+use std::path::Path;
+
+mod run_history;
 
 // ── Color palette ───────────────────────────────────────────────────────
 const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 200, 120);
@@ -11,9 +15,24 @@ const BUTTON_WIDTH: f32 = 130.0;
 const SECTION_GAP: f32 = 6.0;
 
 pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
+    show_destructive_confirmation(app, ui.ctx());
     ui.add_space(2.0);
 
     show_header(app, ui);
+    if let Some(error) = app.user_action_error.clone() {
+        egui::Frame::group(ui.style())
+            .inner_margin(8.0)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(RED, error);
+                    if ui.small_button("Dismiss").clicked() {
+                        app.user_action_error = None;
+                    }
+                });
+            });
+    }
+    ui.add_space(SECTION_GAP);
+    show_readiness_summary(app, ui);
     ui.add_space(SECTION_GAP);
     show_audio_files(app, ui);
     ui.add_space(SECTION_GAP);
@@ -22,11 +41,196 @@ pub fn show(app: &mut TrainerApp, ui: &mut egui::Ui) {
     show_python_environment(app, ui);
     show_install_log(app, ui);
     show_train_controls(app, ui);
+    ui.add_space(SECTION_GAP);
+    show_output_conflicts(app, ui);
+    ui.add_space(SECTION_GAP);
+    egui::CollapsingHeader::new("History And Diagnostics")
+        .default_open(false)
+        .show(ui, |ui| {
+            run_history::show(app, ui);
+            ui.add_space(SECTION_GAP);
+            show_diagnostics_panel(app, ui);
+        });
 
     if !app.training_log.is_empty() {
         ui.add_space(4.0);
         super::progress::show(app, ui);
     }
+}
+
+fn show_readiness_summary(app: &TrainerApp, ui: &mut egui::Ui) {
+    let audio_ready = app.input_path.is_some() && !app.output_paths.is_empty();
+    let destination_ready = app.destination_dir.is_some();
+    let environment_ready = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
+    let ready = audio_ready && destination_ready && environment_ready;
+
+    egui::Frame::group(ui.style())
+        .inner_margin(SECTION_MARGIN)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let (summary, color) = if ready {
+                    ("Ready to train", GREEN)
+                } else {
+                    ("Setup incomplete", AMBER)
+                };
+                ui.strong(egui::RichText::new(summary).color(color));
+                readiness_item(ui, "Audio", audio_ready);
+                readiness_item(ui, "Output folder", destination_ready);
+                readiness_item(ui, "Python and NAM", environment_ready);
+            });
+        });
+}
+
+fn readiness_item(ui: &mut egui::Ui, label: &str, ready: bool) {
+    let (symbol, color) = if ready {
+        ("Ready", GREEN)
+    } else {
+        ("Needed", AMBER)
+    };
+    ui.separator();
+    ui.colored_label(color, format!("{label}: {symbol}"));
+}
+
+fn show_destructive_confirmation(app: &mut TrainerApp, ctx: &egui::Context) {
+    let Some(action) = app.pending_destructive_action.clone() else {
+        return;
+    };
+
+    let (title, description, confirm_label) = match action {
+        crate::app::InstallAction::UninstallingMiniforge => {
+            let path = crate::app::TrainerApp::managed_miniforge_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "the managed Miniforge directory".into());
+            (
+                "Remove managed Miniforge?",
+                format!(
+                    "This permanently removes {path}, including every environment and package stored there."
+                ),
+                "Remove Miniforge",
+            )
+        }
+        crate::app::InstallAction::UninstallingNam => (
+            "Uninstall NAM?",
+            format!(
+                "This removes neural-amp-modeler from the selected Python environment:\n{}",
+                app.python_path.display()
+            ),
+            "Uninstall NAM",
+        ),
+        _ => return,
+    };
+
+    let mut open = true;
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(description);
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+                if ui
+                    .button(egui::RichText::new(confirm_label).color(RED))
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+            });
+        });
+
+    if confirmed {
+        app.pending_destructive_action = None;
+        match action {
+            crate::app::InstallAction::UninstallingMiniforge => app.uninstall_miniforge(),
+            crate::app::InstallAction::UninstallingNam => app.uninstall_nam(),
+            _ => {}
+        }
+    } else if cancelled || !open {
+        app.pending_destructive_action = None;
+    }
+}
+
+fn show_output_conflicts(app: &mut TrainerApp, ui: &mut egui::Ui) {
+    let Some(destination) = app.destination_dir.as_deref() else {
+        return;
+    };
+    if app.allow_overwrite_outputs || app.output_paths.is_empty() {
+        return;
+    }
+
+    let conflicts = crate::training_validation::output_artifact_conflicts(
+        destination,
+        &app.output_paths,
+        non_empty_str(&app.config.output_model_basename),
+        non_empty_str(&app.config.batch_name_template),
+    );
+    if conflicts.is_empty() {
+        return;
+    }
+
+    section(ui, "Output Conflicts", |ui| {
+        ui.colored_label(AMBER, "Existing files will block training.");
+        egui::ScrollArea::vertical()
+            .max_height(96.0)
+            .show(ui, |ui| {
+                for conflict in &conflicts {
+                    ui.label(egui::RichText::new(conflict.display().to_string()).monospace());
+                }
+            });
+        ui.horizontal(|ui| {
+            if ui.button("Allow Overwrite").clicked() {
+                app.set_allow_overwrite_outputs(true);
+            }
+            if ui.button("Choose Folder").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    app.settings.last_destination = Some(dir.clone());
+                    app.persist_settings();
+                    app.destination_dir = Some(dir);
+                }
+            }
+            if ui.button("Rename Outputs").clicked() {
+                app.config.batch_name_template = "{index}-{stem}".into();
+                app.save_config();
+            }
+        });
+    });
+}
+
+fn show_diagnostics_panel(app: &mut TrainerApp, ui: &mut egui::Ui) {
+    section(ui, "Diagnostics", |ui| {
+        egui::CollapsingHeader::new("Environment And Request")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut diagnostics = app.diagnostics_text();
+                ui.horizontal(|ui| {
+                    if ui.button("Copy Diagnostics").clicked() {
+                        ui.ctx().copy_text(diagnostics.clone());
+                    }
+                    if let Some(ref run) = app.run.data().artifacts {
+                        if ui.button("Open Active Log").clicked() {
+                            let log_path = run.log_path.clone();
+                            if let Err(error) = open::that(log_path) {
+                                app.report_user_action_error("Open active log", error);
+                            }
+                        }
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut diagnostics)
+                        .desired_rows(10)
+                        .desired_width(ui.available_width())
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            });
+    });
 }
 
 // ── Header ─────────────────────────────────────────────────────────────
@@ -57,10 +261,9 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .add_filter("WAV files", &["wav"])
                     .pick_file()
                 {
-                    let p = path.display().to_string();
-                    app.settings.last_input_path = Some(p.clone());
-                    app.settings.save();
-                    app.input_path = Some(p);
+                    app.settings.last_input_path = Some(path.clone());
+                    app.persist_settings();
+                    app.input_path = Some(path);
                 }
             }
             if let Some(ref p) = app.input_path {
@@ -78,9 +281,11 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .on_hover_text("Opens the NAM input files on Google Drive")
                     .clicked()
                 {
-                    let _ = open::that(
+                    if let Err(error) = open::that(
                         "https://drive.google.com/file/d/1Pgf8PdE0rKB1TD4TRPKbpNo1ByR3IOm9/view?usp=drive_link",
-                    );
+                    ) {
+                        app.report_user_action_error("Open standard input download", error);
+                    }
                 }
             });
         });
@@ -93,7 +298,7 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .add_filter("WAV files", &["wav"])
                     .pick_files()
                 {
-                    app.output_paths = paths.iter().map(|p| p.display().to_string()).collect();
+                    app.output_paths = paths;
                 }
             }
             match app.output_paths.len() {
@@ -120,10 +325,9 @@ fn show_audio_files(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 egui::Button::new("Output Directory...").min_size(egui::vec2(BUTTON_WIDTH, 0.0));
             if ui.add(btn).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    let p = path.display().to_string();
-                    app.settings.last_destination = Some(p.clone());
-                    app.settings.save();
-                    app.destination_dir = Some(p);
+                    app.settings.last_destination = Some(path.clone());
+                    app.persist_settings();
+                    app.destination_dir = Some(path);
                 }
             }
             if let Some(ref p) = app.destination_dir {
@@ -226,7 +430,62 @@ fn show_configuration(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 }
             });
         });
+
+        egui::CollapsingHeader::new("Output Naming")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Single model name:");
+                    let changed = ui
+                        .text_edit_singleline(&mut app.config.output_model_basename)
+                        .on_hover_text("Optional basename for single-output training")
+                        .changed();
+                    if changed {
+                        app.save_config();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Batch template:");
+                    let changed = ui
+                        .text_edit_singleline(&mut app.config.batch_name_template)
+                        .on_hover_text(
+                            "Use {stem} for the output WAV name and {index} for file number",
+                        )
+                        .changed();
+                    if changed {
+                        app.save_config();
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new("Training Request")
+            .default_open(false)
+            .show(ui, |ui| {
+                let request = worker::build_train_request(app);
+                let mut json = match request {
+                    Ok(request) => serde_json::to_string_pretty(&request).unwrap_or_else(|error| {
+                        format!("Failed to serialize request summary: {error}")
+                    }),
+                    Err(error) => format!("Failed to build request summary: {error}"),
+                };
+                ui.add(
+                    egui::TextEdit::multiline(&mut json)
+                        .desired_rows(12)
+                        .desired_width(ui.available_width())
+                        .font(egui::TextStyle::Monospace)
+                        .interactive(false),
+                );
+            });
     });
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 // ── Python Environment ─────────────────────────────────────────────────
@@ -235,11 +494,7 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
     section(ui, "Python Environment", |ui| {
         // Auto-discover on first frame (async to avoid blocking UI)
         if app.discovered_pythons.is_none() && app.python_discovery_rx.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            app.python_discovery_rx = Some(rx);
-            std::thread::spawn(move || {
-                let _ = tx.send(discover_pythons());
-            });
+            app.python_discovery_rx = Some(crate::environment_service::spawn_python_discovery());
         }
         // Check if discovery completed
         if let Some(ref rx) = app.python_discovery_rx {
@@ -253,7 +508,7 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
         let mut changed = false;
         let discovered = app.discovered_pythons.as_ref().cloned().unwrap_or_default();
 
-        let current_label = if app.python_path.is_empty() {
+        let current_label = if app.python_path.as_os_str().is_empty() {
             "(select Python)".to_string()
         } else {
             truncate_path(&app.python_path, 55)
@@ -264,7 +519,7 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
             .width(full_width)
             .show_ui(ui, |ui| {
                 for entry in &discovered {
-                    let label = format!("{} ({})", entry.label, entry.path);
+                    let label = format!("{} ({})", entry.label, entry.path.display());
                     if ui
                         .selectable_value(&mut app.python_path, entry.path.clone(), label)
                         .changed()
@@ -278,7 +533,7 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .clicked()
                 {
                     if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        app.python_path = path.display().to_string();
+                        app.python_path = path;
                         changed = true;
                     }
                 }
@@ -286,9 +541,40 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
 
         if changed {
             app.settings.python_path = Some(app.python_path.clone());
-            app.settings.save();
+            app.persist_settings();
             app.python_status = crate::app::PythonStatus::Unknown;
             app.check_python();
+        }
+
+        if let crate::app::PythonStatus::Ok {
+            version,
+            devices,
+            report,
+            ..
+        } = &app.python_status
+        {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(DIM, format!("Python {version}"));
+                if let Some(nam_version) = &report.nam_version {
+                    ui.colored_label(DIM, format!("NAM {nam_version}"));
+                }
+                if let Some(torch_version) = &report.torch_version {
+                    ui.colored_label(DIM, format!("Torch {torch_version}"));
+                }
+                let device_summary = devices
+                    .iter()
+                    .map(|device| device.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.colored_label(DIM, format!("Devices: {device_summary}"));
+                let packed_status = if report.packed_full_config_supported {
+                    "Packed full-config: available"
+                } else {
+                    "Packed full-config: unavailable"
+                };
+                ui.colored_label(DIM, packed_status);
+            });
         }
 
         // Management buttons
@@ -296,19 +582,46 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
         if not_installing {
             let miniforge_dir = home_dir().map(|h| h.join("miniforge3")).unwrap_or_default();
             let has_miniforge = miniforge_dir.exists();
+            let has_managed_miniforge = crate::app::TrainerApp::is_managed_miniforge_install();
             let has_nam = matches!(app.python_status, crate::app::PythonStatus::Ok { .. });
 
-            if has_miniforge || has_nam {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Refresh Python List")
+                        .on_hover_text("Re-scan available Python interpreters")
+                        .clicked()
+                    {
+                        app.discovered_pythons = None;
+                        if app.python_discovery_rx.is_none() {
+                            app.python_discovery_rx =
+                                Some(crate::environment_service::spawn_python_discovery());
+                        }
+                    }
+                });
+            });
+
+            if has_miniforge && !has_managed_miniforge {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    AMBER,
+                    "This Miniforge installation was not created by NAM Trainer and will not be removed.",
+                );
+            }
+
+            if has_managed_miniforge || has_nam {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if has_miniforge
+                        if has_managed_miniforge
                             && ui
                                 .small_button("Uninstall Miniforge")
                                 .on_hover_text(format!("Removes {}", miniforge_dir.display()))
                                 .clicked()
                         {
-                            app.uninstall_miniforge();
+                            app.pending_destructive_action =
+                                Some(crate::app::InstallAction::UninstallingMiniforge);
                         }
                         if has_nam
                             && ui
@@ -316,7 +629,8 @@ fn show_python_environment(app: &mut TrainerApp, ui: &mut egui::Ui) {
                                 .on_hover_text("Runs: pip uninstall neural-amp-modeler")
                                 .clicked()
                         {
-                            app.uninstall_nam();
+                            app.pending_destructive_action =
+                                Some(crate::app::InstallAction::UninstallingNam);
                         }
                     });
                 });
@@ -387,7 +701,7 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
     if env_ready && no_active_install {
         ui.add_space(SECTION_GAP + 2.0);
 
-        match &app.training_state {
+        match app.run.state() {
             TrainingState::Idle => {
                 let can_train = app.can_train();
                 let btn_text = egui::RichText::new("Train").size(16.0).strong();
@@ -399,16 +713,77 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.any());
 
                 if ui.add_enabled(can_train, btn).clicked() || enter_pressed {
+                    if let Some(ref destination) = app.destination_dir {
+                        let destination_issues =
+                            crate::training_validation::validate_training_artifacts(
+                                destination,
+                                app.input_path.as_deref(),
+                                &app.output_paths,
+                                app.config.epochs,
+                                app.allow_overwrite_outputs,
+                                non_empty_str(&app.config.output_model_basename),
+                                non_empty_str(&app.config.batch_name_template),
+                            );
+                        if !destination_issues.is_empty() {
+                            for issue in destination_issues {
+                                app.push_training_log(format!("Error: {issue}"));
+                            }
+                            app.run
+                                .finish_error("Fix output directory settings before training.");
+                            return;
+                        }
+                    }
+
+                    let metadata_issues = crate::training_validation::validate_training_metadata(
+                        &app.config,
+                        &app.metadata,
+                    );
+                    if !metadata_issues.is_empty() {
+                        for issue in metadata_issues {
+                            app.push_training_log(format!("Error: {issue}"));
+                        }
+                        app.run
+                            .finish_error("Fix metadata settings before training.");
+                        return;
+                    }
+
+                    if let Some(message) =
+                        crate::training_validation::reconcile_selected_device(app)
+                    {
+                        app.push_training_log(format!("Warning: {message}"));
+                    }
+
                     // Validate audio files before starting
                     if let Some(ref input) = app.input_path {
                         let issues = crate::app::validate_audio_files(input, &app.output_paths);
-                        if !issues.is_empty() {
-                            for issue in &issues {
-                                app.training_log.push(format!("Warning: {issue}"));
-                            }
+                        let has_blocking_error = issues.iter().any(|issue| issue.is_error());
+                        for issue in issues {
+                            let label = match issue.severity {
+                                crate::app::ValidationSeverity::Error => "Error",
+                                crate::app::ValidationSeverity::Warning => "Warning",
+                            };
+                            app.push_training_log(format!("{label}: {}", issue.message));
+                        }
+                        if has_blocking_error {
+                            app.run
+                                .finish_error("Fix audio file errors before training.");
+                            return;
                         }
                     }
-                    start_training(app);
+                    app.start_training();
+                }
+                ui.add_space(4.0);
+                let overwrite_changed = ui
+                    .checkbox(
+                        &mut app.allow_overwrite_outputs,
+                        "Allow overwriting outputs",
+                    )
+                    .on_hover_text(
+                        "Permit training to replace existing model, log, and manifest files",
+                    )
+                    .changed();
+                if overwrite_changed {
+                    app.set_allow_overwrite_outputs(app.allow_overwrite_outputs);
                 }
                 if !can_train {
                     let mut missing = Vec::new();
@@ -435,32 +810,36 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     let cancel_btn = egui::Button::new(egui::RichText::new("Cancel").color(RED))
                         .min_size(egui::vec2(100.0, 32.0));
                     if ui.add(cancel_btn).clicked() || escape_pressed {
-                        if let Some(ref mut w) = app.worker {
-                            w.cancel();
-                        }
-                        app.training_state = TrainingState::Idle;
-                        app.worker = None;
-                        app.message_rx = None;
-                        app.training_log.push("Training cancelled.".into());
+                        app.cancel_training();
                     }
                     // Batch progress indicator
-                    if app.total_files > 1 {
+                    if app.run.data().total_files > 1 {
+                        let current_name = app
+                            .run
+                            .data()
+                            .current_file_index
+                            .checked_sub(1)
+                            .and_then(|idx| app.output_paths.get(idx))
+                            .map(|path| file_name(path))
+                            .unwrap_or_else(|| "pending".into());
                         ui.label(format!(
-                            "File {}/{}",
-                            app.current_file_index, app.total_files
+                            "File {}/{}: {}",
+                            app.run.data().current_file_index,
+                            app.run.data().total_files,
+                            current_name
                         ));
                         ui.separator();
                     }
                     if let Some(last) = app.epoch_history.last() {
                         let mut status = format!(
-                            "Epoch {}/{} \u{2014} ESR: {:.6}",
+                            "Epoch {}/{} - ESR: {:.6}",
                             last.epoch, app.config.epochs, last.esr
                         );
                         // Show ETA if we have enough data
-                        if let Some(avg) = app.avg_epoch_secs {
+                        if let Some(avg) = app.run.data().avg_epoch_secs {
                             let remaining = app.config.epochs.saturating_sub(last.epoch);
                             let eta_secs = avg * remaining as f64;
-                            status.push_str(&format!(" \u{2014} {}", format_eta(eta_secs)));
+                            status.push_str(&format!(" - {}", format_eta(eta_secs)));
                         }
                         ui.label(status);
                     }
@@ -478,10 +857,7 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Train Again").clicked() {
-                        app.training_state = TrainingState::Idle;
-                        app.epoch_history.clear();
-                        app.training_log.clear();
-                        app.model_path = None;
+                        app.prepare_train_again();
                     }
                     if app.destination_dir.is_some()
                         && ui
@@ -490,24 +866,54 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                             .clicked()
                     {
                         if let Some(ref dir) = app.destination_dir {
-                            let _ = open::that(dir);
+                            let dir = dir.clone();
+                            if let Err(error) = open::that(dir) {
+                                app.report_user_action_error("Open output folder", error);
+                            }
                         }
+                    }
+                    if app.model_path.is_some()
+                        && ui
+                            .button("Reveal Model")
+                            .on_hover_text("Show the generated model in your file manager")
+                            .clicked()
+                    {
+                        if let Some(ref model_path) = app.model_path {
+                            let model_path = model_path.clone();
+                            if let Err(error) = reveal_path(&model_path) {
+                                app.report_user_action_error("Reveal model", error);
+                            }
+                        }
+                    }
+                    if ui
+                        .button("Copy Diagnostics")
+                        .on_hover_text("Copy environment, request, and recent log details")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(app.diagnostics_text());
                     }
                 });
             }
             TrainingState::Error(msg) => {
                 ui.colored_label(RED, format!("Error: {}", msg));
-                if ui.button("Reset").clicked() {
-                    app.training_state = TrainingState::Idle;
-                    app.epoch_history.clear();
-                    app.training_log.clear();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Reset").clicked() {
+                        app.reset_after_error();
+                    }
+                    if ui
+                        .button("Copy Diagnostics")
+                        .on_hover_text("Copy environment, request, and recent log details")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(app.diagnostics_text());
+                    }
+                });
             }
         }
     }
 
     // Hidden demo mode: Ctrl+Shift+D triggers a simulated training run
-    if app.training_state == TrainingState::Idle
+    if app.run.state() == TrainingState::Idle
         && ui.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::D))
     {
         app.start_demo_training();
@@ -547,10 +953,7 @@ fn show_status_badge(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     .find(|d| d.id.starts_with("cuda") || d.id == "mps")
                     .or(devices.first());
                 let device_label = best.map(|d| d.name.as_str()).unwrap_or("CPU");
-                ui.colored_label(
-                    GREEN,
-                    format!("Ready \u{2014} Python {version}, {device_label}"),
-                );
+                ui.colored_label(GREEN, format!("Ready - Python {version}, {device_label}"));
             }
             crate::app::PythonStatus::VersionTooOld { version } => {
                 let clicked = ui
@@ -611,145 +1014,61 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
         });
 }
 
-// ── Training ────────────────────────────────────────────────────────────
-
-fn start_training(app: &mut TrainerApp) {
-    app.training_state = TrainingState::Training;
-    app.training_log.clear();
-    app.epoch_history.clear();
-    app.model_path = None;
-    app.current_file_index = 0;
-    app.total_files = app.output_paths.len();
-    app.training_start_time = Some(std::time::Instant::now());
-    app.last_epoch_time = None;
-    app.avg_epoch_secs = None;
-    app.training_log.push("Starting training...".into());
-
-    let (handle, rx) = worker::spawn(app);
-    app.worker = Some(handle);
-    app.message_rx = Some(rx);
-}
-
-// ── Python discovery ────────────────────────────────────────────────────
-
-#[derive(Clone)]
-pub struct PythonEntry {
-    pub label: String,
-    pub path: String,
-}
-
-fn discover_pythons() -> Vec<PythonEntry> {
-    let mut found: Vec<PythonEntry> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    // Platform-specific: which command and candidate names
-    #[cfg(not(target_os = "windows"))]
-    let (which_cmd, candidates) = ("which", vec!["python3", "python"]);
-    #[cfg(target_os = "windows")]
-    let (which_cmd, candidates) = ("where", vec!["python", "python3"]);
-
-    for name in &candidates {
-        if let Ok(output) = std::process::Command::new(which_cmd)
-            .arg(name)
-            .hide_console()
-            .output()
-        {
-            if output.status.success() {
-                // `where` on Windows can return multiple lines; take each one
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let path = line.trim().to_string();
-                    if path.is_empty() {
-                        continue;
-                    }
-                    let resolved = std::fs::canonicalize(&path)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| path.clone());
-                    if seen.insert(resolved) {
-                        let version = std::process::Command::new(&path)
-                            .args(["--version"])
-                            .hide_console()
-                            .output()
-                            .ok()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                            .unwrap_or_default();
-                        found.push(PythonEntry {
-                            label: if version.is_empty() {
-                                name.to_string()
-                            } else {
-                                version
-                            },
-                            path,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Conda environments
-    if let Some(home) = home_dir() {
-        for base in &["miniconda3", "anaconda3", "miniforge3", ".conda"] {
-            let envs_dir = home.join(base).join("envs");
-            if let Ok(entries) = std::fs::read_dir(&envs_dir) {
-                for entry in entries.flatten() {
-                    let env_python = conda_python_path(&entry.path());
-                    if env_python.exists() {
-                        let path = env_python.display().to_string();
-                        let resolved = std::fs::canonicalize(&path)
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| path.clone());
-                        if seen.insert(resolved) {
-                            let env_name = entry.file_name().to_string_lossy().to_string();
-                            found.push(PythonEntry {
-                                label: format!("conda: {env_name}"),
-                                path,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    found
-}
-
-/// Returns the path to the python executable inside a conda environment.
-fn conda_python_path(env_dir: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(not(target_os = "windows"))]
-    {
-        env_dir.join("bin").join("python")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        env_dir.join("python.exe")
-    }
-}
-
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(std::path::PathBuf::from)
-}
-
-fn file_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
+fn file_name(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        path.to_string()
+fn format_unix_timestamp(timestamp: u64) -> String {
+    format!("unix {timestamp}")
+}
+
+fn truncate_path(path: &Path, max_len: usize) -> String {
+    let display = path.display().to_string();
+    if display.chars().count() <= max_len {
+        display
     } else {
-        format!("...{}", &path[path.len() - max_len + 3..])
+        let suffix: String = display
+            .chars()
+            .rev()
+            .take(max_len.saturating_sub(3))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("...{suffix}")
     }
 }
 
-fn wav_info(path: &str) -> Option<String> {
+fn reveal_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .hide_console()
+            .status()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .hide_console()
+            .status()
+            .map(|_| ())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let target = path.parent().unwrap_or(path);
+        open::that(target)
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    }
+}
+
+fn wav_info(path: &Path) -> Option<String> {
     let reader = hound::WavReader::open(path).ok()?;
     let spec = reader.spec();
     let samples = reader.len() as f64;

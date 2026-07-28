@@ -18,7 +18,14 @@ import sys
 import traceback
 import inspect
 import shutil
+import threading
 from pathlib import Path
+
+PROTOCOL_VERSION = 3
+RUN_ID = "uninitialized"
+EVENT_SEQUENCE = 0
+CURRENT_FILE_INDEX = None
+CANCEL_REQUESTED = threading.Event()
 
 # Force matplotlib to use the non-interactive Agg backend BEFORE anything
 # imports it. The worker runs as a headless child process (CREATE_NO_WINDOW
@@ -30,6 +37,12 @@ os.environ["MPLBACKEND"] = "Agg"
 
 def emit(event: dict):
     """Write a JSON event to stdout and flush immediately."""
+    global EVENT_SEQUENCE
+    EVENT_SEQUENCE += 1
+    event.setdefault("protocol_version", PROTOCOL_VERSION)
+    event.setdefault("run_id", RUN_ID)
+    event.setdefault("file_index", CURRENT_FILE_INDEX)
+    event.setdefault("sequence", EVENT_SEQUENCE)
     try:
         print(json.dumps(event), flush=True)
     except OSError:
@@ -39,17 +52,83 @@ def emit(event: dict):
         print(json.dumps(event), file=sys.stderr, flush=True)
 
 
+def classify_error(error):
+    """Map Python failures to stable protocol error categories."""
+    message = str(error).lower()
+    if (
+        "no module named" in message
+        or "missing dependency" in message
+        or "not installed" in message
+    ):
+        return "dependency"
+    if (
+        "data checks failed" in message
+        or "sample rate" in message
+        or "audio" in message
+        or "metadata" in message
+    ):
+        return "data_validation"
+    if (
+        "cuda" in message
+        or "cudnn" in message
+        or "mps" in message
+        or "out of memory" in message
+    ):
+        return "device"
+    if "cancel" in message or "keyboardinterrupt" in message:
+        return "user_cancel"
+    return "training"
+
+
+def listen_for_commands():
+    """Receive control commands without blocking the training thread."""
+    for line in sys.stdin:
+        try:
+            command = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if command.get("command") == "cancel":
+            CANCEL_REQUESTED.set()
+            return
+
+
 def main():
+    global RUN_ID
+    global CURRENT_FILE_INDEX
+
     # Read the training request from stdin
     try:
         raw = sys.stdin.readline()
         if not raw.strip():
-            emit({"type": "error", "message": "No input received on stdin"})
+            emit({
+                "type": "error",
+                "error_kind": "protocol",
+                "message": "No input received on stdin",
+            })
             sys.exit(1)
         request = json.loads(raw)
     except json.JSONDecodeError as e:
-        emit({"type": "error", "message": f"Invalid JSON input: {e}"})
+        emit({
+            "type": "error",
+            "error_kind": "protocol",
+            "message": f"Invalid JSON input: {e}",
+        })
         sys.exit(1)
+
+    RUN_ID = request.get("run_id", "missing")
+    request_protocol_version = request.get("protocol_version")
+    if request_protocol_version != PROTOCOL_VERSION:
+        emit({
+            "type": "error",
+            "error_kind": "protocol",
+            "message": (
+                f"Worker protocol {PROTOCOL_VERSION} cannot process "
+                f"request protocol {request_protocol_version!r}"
+            ),
+        })
+        sys.exit(2)
+
+    threading.Thread(target=listen_for_commands, daemon=True).start()
 
     # Import NAM after reading stdin so startup errors are caught
     try:
@@ -58,8 +137,14 @@ def main():
         from nam.train import full as nam_full
         from nam.models.metadata import UserMetadata
     except ImportError as e:
-        emit({"type": "error", "message": f"Missing dependency: {e}. "
-              "Install with: pip install --upgrade neural-amp-modeler"})
+        emit({
+            "type": "error",
+            "error_kind": "dependency",
+            "message": (
+                f"Missing dependency: {e}. "
+                "Install with: pip install --upgrade neural-amp-modeler"
+            ),
+        })
         sys.exit(1)
 
     # Custom callback for JSON progress reporting. We use
@@ -73,6 +158,8 @@ def main():
             self._logged_keys = False
 
         def on_validation_epoch_end(self, trainer, pl_module):
+            if CANCEL_REQUESTED.is_set():
+                raise KeyboardInterrupt("Training cancelled by user")
             metrics = trainer.callback_metrics
 
             # Log available metric keys on the first epoch to aid debugging
@@ -238,8 +325,30 @@ def main():
             raise RuntimeError(f"Packed full training did not export {model_path}")
         return str(model_path)
 
-    for output_path in output_paths:
-        basename = os.path.splitext(os.path.basename(output_path))[0]
+    def sanitize_model_basename(value):
+        sanitized = "".join(
+            "_" if ch in '/\\:*?"<>|' or ord(ch) < 32 else ch
+            for ch in str(value).strip()
+        ).strip(". ")
+        return sanitized or "model"
+
+    def output_stem(output_path):
+        return os.path.splitext(os.path.basename(output_path))[0] or "model"
+
+    def model_basename(index, output_path):
+        stem = output_stem(output_path)
+        custom_name = request.get("output_model_basename")
+        if len(output_paths) == 1 and custom_name and str(custom_name).strip():
+            return sanitize_model_basename(custom_name)
+        template = request.get("batch_name_template") or "{stem}"
+        rendered = str(template).replace("{stem}", stem).replace("{index}", str(index + 1))
+        return sanitize_model_basename(rendered)
+
+    for index, output_path in enumerate(output_paths):
+        if CANCEL_REQUESTED.is_set():
+            break
+        CURRENT_FILE_INDEX = index
+        basename = model_basename(index, output_path)
 
         emit({
             "type": "training_start",
@@ -313,15 +422,17 @@ def main():
             })
 
         except BaseException as e:
+            emit({"type": "log", "message": traceback.format_exc()})
             emit({
                 "type": "training_failed",
                 "file": output_path,
+                "error_kind": classify_error(e),
                 "error": str(e),
             })
-            emit({"type": "log", "message": traceback.format_exc()})
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 break
 
+    CURRENT_FILE_INDEX = None
     emit({"type": "all_complete"})
 
 

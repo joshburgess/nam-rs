@@ -1,0 +1,35 @@
+{
+  "protocol_version": 3,
+  "run_id": "run-test",
+  "input_path": "input.wav",
+  "output_paths": [
+    "output.wav"
+  ],
+  "destination": "models",
+  "output_model_basename": null,
+  "batch_name_template": null,
+  "architecture": "packed",
+  "packed": true,
+  "epochs": 1,
+  "batch_size": 2,
+  "lr": 0.004,
+  "lr_decay": 0.007,
+  "latency": null,
+  "threshold_esr": null,
+  "save_plot": true,
+  "fit_mrstft": true,
+  "ignore_checks": false,
+  "num_output_samples_per_datum": 8192,
+  "use_full_config_trainer": false,
+  "device": "cpu",
+  "metadata": {
+    "name": null,
+    "modeled_by": null,
+    "gear_make": null,
+    "gear_model": null,
+    "gear_type": null,
+    "tone_type": null,
+    "input_level_dbu": null,
+    "output_level_dbu": null
+  }
+}
