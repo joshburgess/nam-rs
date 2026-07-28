@@ -2,6 +2,7 @@ use nam_trainer::{
     classify_training_error, sanitize_model_basename, TrainingErrorKind, TrainingRunArtifacts,
     PROTOCOL_VERSION,
 };
+use std::path::PathBuf;
 
 #[test]
 fn library_exports_core_trainer_gui_helpers() {
@@ -12,8 +13,8 @@ fn library_exports_core_trainer_gui_helpers() {
     assert_eq!(PROTOCOL_VERSION, 3);
     assert_eq!(sanitize_model_basename("Amp:Lead"), "Amp_Lead");
     assert_eq!(
-        artifacts.predicted_model_paths()[0].to_string_lossy(),
-        "/tmp/models/Amp_Lead.nam"
+        artifacts.predicted_model_paths()[0],
+        PathBuf::from("/tmp/models").join("Amp_Lead.nam")
     );
     assert_eq!(
         classify_training_error("CUDA out of memory").kind,
