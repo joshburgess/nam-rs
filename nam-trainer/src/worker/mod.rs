@@ -260,6 +260,7 @@ struct ProtocolDispatcher {
     validator: ProtocolSequenceValidator,
     pending: BTreeMap<u64, protocol::WorkerEvent>,
     next_sequence: u64,
+    failed: bool,
     stderr_log_lines: usize,
     stderr_suppression_sent: bool,
 }
@@ -270,6 +271,7 @@ impl ProtocolDispatcher {
             validator: ProtocolSequenceValidator::new(run_id),
             pending: BTreeMap::new(),
             next_sequence: 1,
+            failed: false,
             stderr_log_lines: 0,
             stderr_suppression_sent: false,
         }
@@ -286,6 +288,9 @@ impl ProtocolDispatcher {
     }
 
     fn finish(&mut self) -> Vec<WorkerMessage> {
+        if self.failed {
+            return Vec::new();
+        }
         let Some(next) = self
             .pending
             .first_key_value()
@@ -303,36 +308,51 @@ impl ProtocolDispatcher {
     }
 
     fn accept_event(&mut self, event: protocol::WorkerEvent) -> Vec<WorkerMessage> {
+        if self.failed {
+            return Vec::new();
+        }
         let sequence = event.sequence();
         if sequence < self.next_sequence || self.pending.contains_key(&sequence) {
             let previous = self.next_sequence.saturating_sub(1);
-            return vec![WorkerMessage::Error {
-                kind: WorkerFailureKind::ProtocolSequence,
-                message: ProtocolSequenceError::NonIncreasingSequence {
-                    actual: sequence,
-                    previous,
-                }
-                .to_string(),
-            }];
+            return self.fail(ProtocolSequenceError::NonIncreasingSequence {
+                actual: sequence,
+                previous,
+            });
         }
         let maximum = self
             .next_sequence
             .saturating_add(MAX_PROTOCOL_REORDER_WINDOW);
         if sequence > maximum {
-            return vec![Self::sequence_error(ProtocolSequenceError::SequenceJump {
+            return self.fail(ProtocolSequenceError::SequenceJump {
                 actual: sequence,
                 expected: self.next_sequence,
                 maximum,
-            })];
+            });
         }
         self.pending.insert(sequence, event);
 
         let mut messages = Vec::new();
         while let Some(event) = self.pending.remove(&self.next_sequence) {
-            messages.push(self.validate_event(event));
-            self.next_sequence = self.next_sequence.saturating_add(1);
+            match self.validator.validate(&event) {
+                Ok(()) => {
+                    messages.push(event_to_message(event));
+                    self.next_sequence = self.next_sequence.saturating_add(1);
+                }
+                Err(error) => {
+                    self.failed = true;
+                    self.pending.clear();
+                    messages.push(Self::sequence_error(error));
+                    break;
+                }
+            }
         }
         messages
+    }
+
+    fn fail(&mut self, error: ProtocolSequenceError) -> Vec<WorkerMessage> {
+        self.failed = true;
+        self.pending.clear();
+        vec![Self::sequence_error(error)]
     }
 
     fn sequence_error(error: ProtocolSequenceError) -> WorkerMessage {
@@ -354,16 +374,6 @@ impl ProtocolDispatcher {
             ))];
         }
         Vec::new()
-    }
-
-    fn validate_event(&mut self, event: protocol::WorkerEvent) -> WorkerMessage {
-        if let Err(error) = self.validator.validate(&event) {
-            return WorkerMessage::Error {
-                kind: WorkerFailureKind::ProtocolSequence,
-                message: error.to_string(),
-            };
-        }
-        event_to_message(event)
     }
 }
 
@@ -636,7 +646,11 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, WorkerMessageReceiver) {
 
         // This thread is the sole owner of Child. Cancellation is queued,
         // including when it arrives before process startup completes.
-        let exit_code = wait_for_child(&mut child, &worker_cancelled, child_stdin);
+        let mut worker_process = SystemWorkerProcess {
+            child,
+            stdin: child_stdin,
+        };
+        let exit_code = wait_for_child(&mut worker_process, &worker_cancelled, &SystemClock);
 
         if let Some(thread) = stdout_thread {
             let _ = thread.join();
@@ -671,36 +685,86 @@ pub fn spawn(app: &TrainerApp) -> (WorkerHandle, WorkerMessageReceiver) {
     (WorkerHandle::from_join(cancelled, join), rx)
 }
 
+trait WorkerProcess {
+    fn request_cancel(&mut self) -> std::io::Result<()>;
+    fn try_wait(&mut self) -> std::io::Result<Option<Option<i32>>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<Option<i32>>;
+}
+
+struct SystemWorkerProcess {
+    child: Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+impl WorkerProcess for SystemWorkerProcess {
+    fn request_cancel(&mut self) -> std::io::Result<()> {
+        let Some(mut stdin) = self.stdin.take() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "worker stdin is unavailable",
+            ));
+        };
+        writeln!(stdin, r#"{{"command":"cancel"}}"#)?;
+        stdin.flush()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<Option<i32>>> {
+        self.child
+            .try_wait()
+            .map(|status| status.map(|status| status.code()))
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        self.child.wait().map(|status| status.code())
+    }
+}
+
+trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
 fn wait_for_child(
-    child: &mut Child,
+    child: &mut dyn WorkerProcess,
     cancelled: &AtomicBool,
-    mut child_stdin: Option<std::process::ChildStdin>,
+    clock: &dyn Clock,
 ) -> Option<i32> {
     let mut force_cancel_at = None;
     loop {
         if cancelled.load(Ordering::Acquire) && force_cancel_at.is_none() {
-            if let Some(mut stdin) = child_stdin.take() {
-                let cooperative_request =
-                    writeln!(stdin, r#"{{"command":"cancel"}}"#).and_then(|_| stdin.flush());
-                if cooperative_request.is_ok() {
-                    force_cancel_at = Some(Instant::now() + COOPERATIVE_CANCEL_GRACE);
-                } else {
-                    force_cancel_at = Some(Instant::now());
-                }
+            if child.request_cancel().is_ok() {
+                force_cancel_at = Some(clock.now() + COOPERATIVE_CANCEL_GRACE);
             } else {
-                force_cancel_at = Some(Instant::now());
+                force_cancel_at = Some(clock.now());
             }
         }
         match child.try_wait() {
-            Ok(Some(status)) => return status.code(),
+            Ok(Some(exit_code)) => return exit_code,
             Ok(None) => {
-                if force_cancel_at.is_some_and(|deadline| Instant::now() >= deadline) {
+                if force_cancel_at.is_some_and(|deadline| clock.now() >= deadline) {
                     let _ = child.kill();
-                    return child.wait().ok().and_then(|status| status.code());
+                    return child.wait().ok().flatten();
                 }
-                thread::sleep(Duration::from_millis(20));
+                clock.sleep(Duration::from_millis(20));
             }
-            Err(_) => return child.wait().ok().and_then(|status| status.code()),
+            Err(_) => return child.wait().ok().flatten(),
         }
     }
 }
@@ -883,18 +947,21 @@ fn create_worker_script() -> Result<tempfile::TempPath, (PathBuf, std::io::Error
 mod tests {
     use super::{
         create_worker_script, event_to_message, parse_worker_line, protocol, send_worker_message,
-        wait_for_child, worker_message_channel, ProtocolDispatcher, ProtocolInput,
-        ProtocolSequenceError, ProtocolSequenceValidator, WorkerFailureKind, WorkerHandle,
-        WorkerMessage, WorkerStartupError, MAX_PROTOCOL_REORDER_WINDOW,
+        wait_for_child, worker_message_channel, Clock, ProtocolDispatcher, ProtocolInput,
+        ProtocolSequenceError, ProtocolSequenceValidator, SystemClock, SystemWorkerProcess,
+        WorkerFailureKind, WorkerHandle, WorkerMessage, WorkerProcess, WorkerStartupError,
+        MAX_PROTOCOL_REORDER_WINDOW,
     };
     #[cfg(unix)]
     use super::{encode_worker_path, WorkerRequestError};
     use proptest::prelude::*;
     use serde_json::json;
-    use std::io::Write;
+    use std::cell::Cell;
+    use std::io::{self, Write};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn worker_script_paths_are_unique() {
@@ -1207,7 +1274,39 @@ mod tests {
             );
             prop_assert!(is_sequence_error);
             prop_assert_eq!(dispatcher.pending.len(), 0);
+            prop_assert!(dispatcher.failed);
+            prop_assert!(dispatcher
+                .accept(ProtocolInput::StdoutEvent(log_event(1)))
+                .is_empty());
+            prop_assert!(dispatcher.finish().is_empty());
         }
+    }
+
+    #[test]
+    fn protocol_dispatcher_rejects_all_domain_events_after_state_failure() {
+        let mut dispatcher = ProtocolDispatcher::new("run".into());
+        let failed = dispatcher.accept(ProtocolInput::StdoutEvent(complete_event(0, 1)));
+        assert!(matches!(
+            failed.as_slice(),
+            [WorkerMessage::Error {
+                kind: WorkerFailureKind::ProtocolSequence,
+                ..
+            }]
+        ));
+        assert!(dispatcher.failed);
+
+        assert!(dispatcher
+            .accept(ProtocolInput::StdoutEvent(start_event(0, 2)))
+            .is_empty());
+        assert!(dispatcher
+            .accept(ProtocolInput::StderrEvent(log_event(3)))
+            .is_empty());
+        assert!(dispatcher.finish().is_empty());
+
+        assert_eq!(
+            dispatcher.accept(ProtocolInput::StdoutLog("diagnostic".into())),
+            vec![WorkerMessage::Log("diagnostic".into())]
+        );
     }
 
     fn start_event(file_index: usize, sequence: u64) -> protocol::WorkerEvent {
@@ -1279,14 +1378,15 @@ mod tests {
         let Some(python) = python_for_tests() else {
             return;
         };
-        let mut child = Command::new(python)
+        let child = Command::new(python)
             .args(["-c", "import time; time.sleep(30)"])
             .spawn()
             .unwrap();
         let cancelled = AtomicBool::new(true);
         let started = std::time::Instant::now();
 
-        let _ = wait_for_child(&mut child, &cancelled, None);
+        let mut process = SystemWorkerProcess { child, stdin: None };
+        let _ = wait_for_child(&mut process, &cancelled, &SystemClock);
 
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
@@ -1306,10 +1406,164 @@ mod tests {
             .unwrap();
         let child_stdin = child.stdin.take();
         let cancelled = AtomicBool::new(true);
+        let mut process = SystemWorkerProcess {
+            child,
+            stdin: child_stdin,
+        };
 
-        let exit_code = wait_for_child(&mut child, &cancelled, child_stdin);
+        let exit_code = wait_for_child(&mut process, &cancelled, &SystemClock);
 
         assert_eq!(exit_code, Some(0));
+    }
+
+    struct FakeClock {
+        now: Cell<Instant>,
+        sleeps: Cell<usize>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: Cell::new(Instant::now()),
+                sleeps: Cell::new(0),
+            }
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.now.set(self.now.get() + duration);
+            self.sleeps.set(self.sleeps.get() + 1);
+        }
+    }
+
+    struct FakeWorkerProcess {
+        cancel_succeeds: bool,
+        polls_before_exit: Option<usize>,
+        poll_error: bool,
+        exit_code: Option<i32>,
+        cancel_requests: usize,
+        polls: usize,
+        kills: usize,
+        waits: usize,
+    }
+
+    impl FakeWorkerProcess {
+        fn running() -> Self {
+            Self {
+                cancel_succeeds: true,
+                polls_before_exit: None,
+                poll_error: false,
+                exit_code: Some(9),
+                cancel_requests: 0,
+                polls: 0,
+                kills: 0,
+                waits: 0,
+            }
+        }
+    }
+
+    impl WorkerProcess for FakeWorkerProcess {
+        fn request_cancel(&mut self) -> io::Result<()> {
+            self.cancel_requests += 1;
+            if self.cancel_succeeds {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected cancellation failure",
+                ))
+            }
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<Option<i32>>> {
+            self.polls += 1;
+            if self.poll_error {
+                return Err(io::Error::other("injected poll failure"));
+            }
+            Ok(self
+                .polls_before_exit
+                .filter(|polls| self.polls > *polls)
+                .map(|_| self.exit_code))
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.kills += 1;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> io::Result<Option<i32>> {
+            self.waits += 1;
+            Ok(self.exit_code)
+        }
+    }
+
+    #[test]
+    fn fake_worker_exits_cooperatively_before_the_kill_deadline() {
+        let mut process = FakeWorkerProcess {
+            polls_before_exit: Some(2),
+            exit_code: Some(0),
+            ..FakeWorkerProcess::running()
+        };
+        let clock = FakeClock::new();
+        let cancelled = AtomicBool::new(true);
+
+        assert_eq!(wait_for_child(&mut process, &cancelled, &clock), Some(0));
+        assert_eq!(process.cancel_requests, 1);
+        assert_eq!(process.kills, 0);
+        assert_eq!(process.waits, 0);
+        assert_eq!(clock.sleeps.get(), 2);
+    }
+
+    #[test]
+    fn fake_worker_is_killed_exactly_at_the_cancellation_deadline() {
+        let mut process = FakeWorkerProcess::running();
+        let clock = FakeClock::new();
+        let cancelled = AtomicBool::new(true);
+
+        assert_eq!(wait_for_child(&mut process, &cancelled, &clock), Some(9));
+        assert_eq!(process.cancel_requests, 1);
+        assert_eq!(process.kills, 1);
+        assert_eq!(process.waits, 1);
+        assert_eq!(
+            clock.sleeps.get(),
+            super::COOPERATIVE_CANCEL_GRACE.as_millis() as usize / 20
+        );
+    }
+
+    #[test]
+    fn failed_cooperative_request_forces_immediate_termination() {
+        let mut process = FakeWorkerProcess {
+            cancel_succeeds: false,
+            ..FakeWorkerProcess::running()
+        };
+        let clock = FakeClock::new();
+        let cancelled = AtomicBool::new(true);
+
+        assert_eq!(wait_for_child(&mut process, &cancelled, &clock), Some(9));
+        assert_eq!(process.kills, 1);
+        assert_eq!(process.waits, 1);
+        assert_eq!(clock.sleeps.get(), 0);
+    }
+
+    #[test]
+    fn poll_failure_falls_back_to_waiting_for_exit() {
+        let mut process = FakeWorkerProcess {
+            poll_error: true,
+            exit_code: Some(7),
+            ..FakeWorkerProcess::running()
+        };
+        let clock = FakeClock::new();
+        let cancelled = AtomicBool::new(false);
+
+        assert_eq!(wait_for_child(&mut process, &cancelled, &clock), Some(7));
+        assert_eq!(process.kills, 0);
+        assert_eq!(process.waits, 1);
+        assert_eq!(clock.sleeps.get(), 0);
     }
 
     proptest! {

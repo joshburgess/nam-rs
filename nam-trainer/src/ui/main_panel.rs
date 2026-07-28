@@ -1,7 +1,8 @@
 use crate::app::{HideConsoleExt, TrainerApp};
 use crate::environment_service::home_dir;
 use crate::worker::{self, TrainingState};
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 mod run_history;
 
@@ -1041,31 +1042,77 @@ fn truncate_path(path: &Path, max_len: usize) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevealPlatform {
+    Macos,
+    Windows,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RevealAction {
+    Command {
+        program: &'static str,
+        args: Vec<OsString>,
+    },
+    Open(PathBuf),
+}
+
+trait PathRevealer {
+    fn reveal(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct SystemPathRevealer;
+
+impl PathRevealer for SystemPathRevealer {
+    fn reveal(&self, path: &Path) -> std::io::Result<()> {
+        match reveal_action(current_reveal_platform(), path) {
+            RevealAction::Command { program, args } => std::process::Command::new(program)
+                .args(args)
+                .hide_console()
+                .status()
+                .map(|_| ()),
+            RevealAction::Open(target) => open::that(target)
+                .map(|_| ())
+                .map_err(std::io::Error::other),
+        }
+    }
+}
+
+const fn current_reveal_platform() -> RevealPlatform {
+    if cfg!(target_os = "macos") {
+        RevealPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        RevealPlatform::Windows
+    } else {
+        RevealPlatform::Other
+    }
+}
+
+fn reveal_action(platform: RevealPlatform, path: &Path) -> RevealAction {
+    match platform {
+        RevealPlatform::Macos => RevealAction::Command {
+            program: "open",
+            args: vec![OsString::from("-R"), path.as_os_str().to_owned()],
+        },
+        RevealPlatform::Windows => {
+            let mut selection = OsString::from("/select,");
+            selection.push(path);
+            RevealAction::Command {
+                program: "explorer",
+                args: vec![selection],
+            }
+        }
+        RevealPlatform::Other => RevealAction::Open(path.parent().unwrap_or(path).to_path_buf()),
+    }
+}
+
+fn reveal_path_with(revealer: &dyn PathRevealer, path: &Path) -> std::io::Result<()> {
+    revealer.reveal(path)
+}
+
 fn reveal_path(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(path)
-            .hide_console()
-            .status()
-            .map(|_| ())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .hide_console()
-            .status()
-            .map(|_| ())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let target = path.parent().unwrap_or(path);
-        open::that(target)
-            .map(|_| ())
-            .map_err(std::io::Error::other)
-    }
+    reveal_path_with(&SystemPathRevealer, path)
 }
 
 fn wav_info(path: &Path) -> Option<String> {
@@ -1108,5 +1155,62 @@ fn format_eta(secs: f64) -> String {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
         format!("~{h}h {m}m remaining")
+    }
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::{reveal_action, reveal_path_with, PathRevealer, RevealAction, RevealPlatform};
+    use std::cell::RefCell;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    struct RecordingRevealer {
+        path: RefCell<Option<PathBuf>>,
+    }
+
+    impl PathRevealer for RecordingRevealer {
+        fn reveal(&self, path: &Path) -> std::io::Result<()> {
+            self.path.replace(Some(path.to_path_buf()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn path_revealer_boundary_is_injectable() {
+        let revealer = RecordingRevealer {
+            path: RefCell::new(None),
+        };
+        let path = Path::new("/models/amp model.nam");
+
+        reveal_path_with(&revealer, path).unwrap();
+
+        assert_eq!(revealer.path.into_inner(), Some(path.to_path_buf()));
+    }
+
+    #[test]
+    fn reveal_actions_preserve_platform_path_arguments() {
+        let path = Path::new("/models/amp model.nam");
+        assert_eq!(
+            reveal_action(RevealPlatform::Macos, path),
+            RevealAction::Command {
+                program: "open",
+                args: vec![OsString::from("-R"), path.as_os_str().to_owned()],
+            }
+        );
+
+        let mut windows_selection = OsString::from("/select,");
+        windows_selection.push(path);
+        assert_eq!(
+            reveal_action(RevealPlatform::Windows, path),
+            RevealAction::Command {
+                program: "explorer",
+                args: vec![windows_selection],
+            }
+        );
+        assert_eq!(
+            reveal_action(RevealPlatform::Other, path),
+            RevealAction::Open(PathBuf::from("/models"))
+        );
     }
 }

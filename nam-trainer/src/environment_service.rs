@@ -306,11 +306,11 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 mod tests {
     use std::io;
     use std::path::Path;
-    use std::process::{Child, Command};
+    use std::process::Command;
 
     use super::detect_environment;
     use crate::app::PythonStatus;
-    use crate::background::{CancellationToken, CommandOutput, ProcessRunner};
+    use crate::background::{CancellationToken, ChildProcess, CommandOutput, ProcessRunner};
 
     struct FakeProcessRunner {
         output: io::Result<Option<CommandOutput>>,
@@ -335,7 +335,7 @@ mod tests {
             }
         }
 
-        fn spawn(&self, _command: &mut Command) -> io::Result<Child> {
+        fn spawn(&self, _command: &mut Command) -> io::Result<Box<dyn ChildProcess>> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "fake runner does not spawn",

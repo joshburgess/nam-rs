@@ -22,6 +22,60 @@ pub(crate) struct CommandOutput {
     pub(crate) stderr_truncated_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ChildExit {
+    pub(crate) success: bool,
+    pub(crate) code: Option<i32>,
+}
+
+pub(crate) trait ChildProcess: Send {
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>>;
+    fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>>;
+    fn try_wait(&mut self) -> io::Result<Option<ChildExit>>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<ChildExit>;
+}
+
+struct SystemChildProcess {
+    child: Child,
+}
+
+impl ChildProcess for SystemChildProcess {
+    fn take_stdout(&mut self) -> Option<Box<dyn Read + Send>> {
+        self.child
+            .stdout
+            .take()
+            .map(|stdout| Box::new(stdout) as Box<dyn Read + Send>)
+    }
+
+    fn take_stderr(&mut self) -> Option<Box<dyn Read + Send>> {
+        self.child
+            .stderr
+            .take()
+            .map(|stderr| Box::new(stderr) as Box<dyn Read + Send>)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ChildExit>> {
+        self.child.try_wait().map(|status| {
+            status.map(|status| ChildExit {
+                success: status.success(),
+                code: status.code(),
+            })
+        })
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<ChildExit> {
+        self.child.wait().map(|status| ChildExit {
+            success: status.success(),
+            code: status.code(),
+        })
+    }
+}
+
 pub(crate) trait ProcessRunner: Send + Sync {
     fn output(
         &self,
@@ -29,7 +83,7 @@ pub(crate) trait ProcessRunner: Send + Sync {
         cancel: &CancellationToken,
     ) -> io::Result<Option<CommandOutput>>;
 
-    fn spawn(&self, command: &mut Command) -> io::Result<Child>;
+    fn spawn(&self, command: &mut Command) -> io::Result<Box<dyn ChildProcess>>;
 }
 
 pub(crate) struct SystemProcessRunner;
@@ -43,8 +97,10 @@ impl ProcessRunner for SystemProcessRunner {
         command_output_impl(command, cancel)
     }
 
-    fn spawn(&self, command: &mut Command) -> io::Result<Child> {
-        command.spawn()
+    fn spawn(&self, command: &mut Command) -> io::Result<Box<dyn ChildProcess>> {
+        command
+            .spawn()
+            .map(|child| Box::new(SystemChildProcess { child }) as Box<dyn ChildProcess>)
     }
 }
 
@@ -226,6 +282,11 @@ pub(crate) struct BackgroundOperation<T> {
 }
 
 impl<T> BackgroundOperation<T> {
+    #[cfg(test)]
+    pub(crate) fn cancel(&self) {
+        self._task.cancel();
+    }
+
     pub(crate) fn try_recv(&self) -> Result<T, mpsc::TryRecvError> {
         let critical = self.critical.try_recv();
         if let Ok(message) = critical {
