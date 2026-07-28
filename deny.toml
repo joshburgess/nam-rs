@@ -1,0 +1,50 @@
+[graph]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+# These versions are pulled in by winit's Wayland and accessibility build
+# tooling. The trainer does not parse untrusted XML, and no compatible upstream
+# release currently permits quick-xml 0.41.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "BlueOak-1.0.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/BillyDM/egui-baseview.git",
+    "https://github.com/RustAudio/baseview.git",
+    "https://github.com/micahrj/clap-sys.git",
+    "https://github.com/nicokoch/reflink.git",
+    "https://github.com/robbert-vdh/nih-plug.git",
+    "https://github.com/robbert-vdh/vst3-sys.git",
+]

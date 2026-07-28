@@ -1,0 +1,1 @@
+{"version":"0.5.4","architecture":"WaveNet","config":{"layers":[{"input_size":0,"condition_size":18446744073709551615,"channels":-1,"kernel_size":[0,999999999],"dilations":[]}]},"weights":[0,null,"NaN"]}

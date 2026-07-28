@@ -1,0 +1,1 @@
+{"version":"0.5.4","architecture":"WaveNet","config":{"condition_dsp":{"version":"0.5.4","architecture":"Sequential","config":{"models":[]},"weights":[]},"layers":[]},"weights":[]}

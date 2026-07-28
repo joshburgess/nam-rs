@@ -1,0 +1,57 @@
+[package]
+name = "nam-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+nam-trainer = { path = "../nam-trainer" }
+nam-core = { path = "../nam-core" }
+serde_json = "1"
+
+[[bin]]
+name = "worker_decode"
+path = "fuzz_targets/worker_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings_migration"
+path = "fuzz_targets/settings_migration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "artifact_naming"
+path = "fuzz_targets/artifact_naming.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_parsing"
+path = "fuzz_targets/manifest_parsing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unicode_paths"
+path = "fuzz_targets/unicode_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_json"
+path = "fuzz_targets/model_json.rs"
+test = false
+doc = false
+bench = false

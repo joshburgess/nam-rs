@@ -1,0 +1,1 @@
+{"type":"training_complete","protocol_version":3,"run_id":"seed-run","file_index":0,"sequence":3,"file":"output.wav","validation_esr":0.125,"model_path":"models/output.nam"}

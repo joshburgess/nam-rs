@@ -1,7 +1,12 @@
 [package]
 name = "xtask"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_xtask = { version = "0.1.0", git = "https://github.com/robbert-vdh/nih-plug.git", rev = "28b149ec4d62757d0b448809148a0c3ca6e09a95" }

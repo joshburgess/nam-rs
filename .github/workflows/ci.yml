@@ -19,7 +19,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -27,10 +27,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -48,19 +48,19 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -72,7 +72,278 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: MSRV 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.88"
+
+      - name: Check workspace with the minimum supported Rust version
+        run: cargo check --workspace --all-targets
+
+  feature-matrix:
+    name: Features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: default
+            args: --no-default-features
+          - name: float-io
+            args: --no-default-features --features nam-core/float_io
+          - name: faer
+            args: --no-default-features --features nam-core/faer
+          - name: fast-kernels
+            args: --no-default-features --features nam-core/fast-kernels
+          - name: float-io-faer
+            args: --no-default-features --features nam-core/float_io,nam-core/faer
+          - name: float-io-fast-kernels
+            args: --no-default-features --features nam-core/float_io,nam-core/fast-kernels
+          - name: faer-fast-kernels
+            args: --no-default-features --features nam-core/faer,nam-core/fast-kernels
+          - name: all
+            args: --all-features
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Check feature combination
+        run: cargo check --workspace --all-targets ${{ matrix.args }}
+
+      - name: Test numerical regression fixtures
+        run: cargo test -p nam-core --lib get_dsp::tests::test_regression_ ${{ matrix.args }}
+
+      - name: Test randomized backend equivalence
+        run: cargo test -p nam-core --lib backend_equivalence ${{ matrix.args }}
+
+  fuzz-targets:
+    name: Fuzz Target Smoke Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+
+      - name: Execute bounded fuzz campaigns
+        run: |
+          for target in worker_decode settings_migration artifact_naming manifest_parsing unicode_paths model_json; do
+            cargo +nightly fuzz run "$target" --fuzz-dir fuzz -- \
+              -runs=1000 -max_len=65536 -timeout=10 -rss_limit_mb=4096
+          done
+
+  wavenet-address-sanitizer:
+    name: WaveNet Address Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Test WaveNet memory boundaries
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: cargo +nightly test -p nam-core --lib wavenet --target x86_64-unknown-linux-gnu
+
+  wavenet-miri:
+    name: WaveNet Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Test safe layer and head borrowing
+        run: |
+          cargo +nightly miri test -p nam-core --lib wavenet::tests::test_upstream_layers_configs_and_head_object_load
+          cargo +nightly miri test -p nam-core --lib wavenet::tests::test_top_level_head_loads_and_processes
+
+      - name: Test DSP state and activation memory behavior
+        run: |
+          cargo +nightly miri test -p nam-core --lib linear::tests
+          cargo +nightly miri test -p nam-core --lib activations::tests::test_apply_slice
+          cargo +nightly miri test -p nam-core --lib wavenet::tests::test_conv1d_depthwise_multi_tap
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install coverage runner
+        run: cargo install cargo-llvm-cov --version 0.6.16 --locked
+
+      - name: Generate workspace coverage
+        run: >-
+          cargo llvm-cov --workspace --all-features
+          --fail-under-lines 70
+          --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workspace-coverage
+          path: lcov.info
+
+  inference-instruction-baseline:
+    name: Inference Instructions (${{ matrix.name }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - name: default
+            args: --no-default-features
+          - name: faer
+            args: --no-default-features --features faer
+          - name: fast-kernels
+            args: --no-default-features --features fast-kernels
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install Callgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          cargo install iai-callgrind-runner --version 0.14.2 --locked
+
+      - name: Measure A1 and A2 inference
+        run: >-
+          cargo bench -p nam-core --bench inference_callgrind ${{ matrix.args }}
+          -- --save-summary=json --allow-aslr=yes
+
+      - name: Enforce instruction budget
+        run: >-
+          python3 scripts/check_instruction_budget.py
+          ${{ matrix.name }}
+          target/iai
+          .github/performance/inference_instructions.json
+
+      - name: Upload instruction profiles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inference-instructions-${{ matrix.name }}
+          path: target/iai
+
+  plugin-callback-instruction-budget:
+    name: Plugin Callback Instructions
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux and Callgrind dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install Callgrind runner
+        run: cargo install iai-callgrind-runner --version 0.14.2 --locked
+
+      - name: Measure complete callback and resampling
+        run: >-
+          cargo bench -p nam-plugin --features benchmark-internals
+          --bench callback_callgrind
+          -- --save-summary=json --allow-aslr=yes
+
+      - name: Enforce callback instruction budget
+        run: >-
+          python3 scripts/check_instruction_budget.py
+          plugin
+          target/iai
+          .github/performance/plugin_callback_instructions.json
+
+  dependency-policy:
+    name: Dependency Policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check advisories bans licenses sources
+
+  trainer-gui:
+    name: Trainer GUI Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-trainer-gui-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check trainer formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test trainer GUI
+        run: cargo test -p nam-trainer
+
+      - name: Clippy trainer GUI
+        run: cargo clippy -p nam-trainer --all-targets -- -D warnings
+
+      - name: Check trainer Python scripts
+        run: python3 -m py_compile nam-trainer/python/detect_environment.py nam-trainer/python/nam_worker.py
+
+      - name: Test CI helper scripts
+        run: PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_*.py'
 
   build-artifacts:
     name: Build Artifacts (${{ matrix.os }})
@@ -87,7 +358,7 @@ jobs:
           - os: ubuntu-latest
             artifact_suffix: linux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -95,10 +366,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -113,21 +384,21 @@ jobs:
         run: cargo build --release -p nam-trainer
 
       - name: Upload plugin artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nam-plugin-${{ matrix.artifact_suffix }}
           path: target/bundled/
 
       - name: Upload trainer artifact (Unix)
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nam-trainer-${{ matrix.artifact_suffix }}
           path: target/release/nam-trainer
 
       - name: Upload trainer artifact (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nam-trainer-${{ matrix.artifact_suffix }}
           path: target/release/nam-trainer.exe
