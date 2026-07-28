@@ -8,10 +8,6 @@
     "faer": {
       "a1_standard": 3477453,
       "a2_max": 2061221
-    },
-    "fast-kernels": {
-      "a1_standard": 2722569,
-      "a2_max": 1559426
     }
   },
   "scaling_envelopes": [
