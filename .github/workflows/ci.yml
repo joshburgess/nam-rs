@@ -228,6 +228,8 @@ jobs:
   inference-instruction-baseline:
     name: Inference Instructions (${{ matrix.name }})
     runs-on: ubuntu-22.04
+    env:
+      IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
     strategy:
       fail-fast: false
       matrix:
@@ -279,6 +281,8 @@ jobs:
   plugin-callback-instruction-budget:
     name: Plugin Callback Instructions
     runs-on: ubuntu-latest
+    env:
+      IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
