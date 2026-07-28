@@ -61,7 +61,10 @@ fn write_and_replace(
 }
 
 pub(crate) fn atomic_promote(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::File::open(source)?.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(source)?
+        .sync_all()?;
     replace_file(source, destination)?;
     sync_parent_directory(destination)
 }

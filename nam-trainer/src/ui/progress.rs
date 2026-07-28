@@ -78,7 +78,10 @@ fn show_log(app: &mut TrainerApp, ui: &mut egui::Ui, height: f32) {
         .fill(egui::Color32::from_rgb(20, 20, 25))
         .corner_radius(4.0)
         .inner_margin(8.0)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 60)))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgb(50, 50, 60),
+        ))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
@@ -108,8 +111,11 @@ fn show_loss_plot(app: &TrainerApp, ui: &mut egui::Ui, height: f32) {
     let train_line = Line::new(train_points)
         .name("Train loss")
         .color(CYAN)
-        .width(1.5);
-    let esr_line = Line::new(esr_points).name("ESR").color(AMBER).width(2.0);
+        .width(1.5_f32);
+    let esr_line = Line::new(esr_points)
+        .name("ESR")
+        .color(AMBER)
+        .width(2.0_f32);
 
     Plot::new("loss_plot")
         .height(height)

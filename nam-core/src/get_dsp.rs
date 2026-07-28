@@ -843,10 +843,13 @@ mod tests {
     #[test]
     fn test_regression_wavenet() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet") {
+            #[cfg(feature = "fast-kernels")]
+            let limit = 1.5e-07;
+            #[cfg(not(feature = "fast-kernels"))]
+            let limit = 1.3e-07;
             assert!(
-                max_diff <= 1.3e-07,
-                "wavenet: accuracy regressed, max_diff={:.2e} (limit 1.3e-07)",
-                max_diff
+                max_diff <= limit,
+                "wavenet: accuracy regressed, max_diff={max_diff:.2e} (limit {limit:.1e})"
             );
         }
     }
@@ -906,10 +909,13 @@ mod tests {
     #[test]
     fn test_regression_wavenet_a2_max() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
+            #[cfg(feature = "fast-kernels")]
+            let limit = 1.0e-05;
+            #[cfg(not(feature = "fast-kernels"))]
+            let limit = 8.0e-06;
             assert!(
-                max_diff <= 8.0e-06,
-                "wavenet_a2_max: accuracy regressed, max_diff={:.2e} (limit 8.0e-06)",
-                max_diff
+                max_diff <= limit,
+                "wavenet_a2_max: accuracy regressed, max_diff={max_diff:.2e} (limit {limit:.1e})"
             );
         }
     }

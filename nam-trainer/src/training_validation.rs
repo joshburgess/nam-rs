@@ -211,7 +211,11 @@ fn available_space_bytes(path: &Path) -> std::io::Result<Option<u64>> {
     }
     // SAFETY: `statvfs` returned success and initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    Ok(Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize)))
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let available_blocks = u64::from(stat.f_bavail);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let available_blocks = stat.f_bavail;
+    Ok(Some(available_blocks.saturating_mul(stat.f_frsize)))
 }
 
 #[cfg(not(unix))]

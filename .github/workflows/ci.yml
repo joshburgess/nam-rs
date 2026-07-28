@@ -146,7 +146,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-03-28
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.1 --locked
@@ -154,7 +154,7 @@ jobs:
       - name: Execute bounded fuzz campaigns
         run: |
           for target in worker_decode settings_migration artifact_naming manifest_parsing unicode_paths model_json; do
-            cargo +nightly fuzz run "$target" --fuzz-dir fuzz -- \
+            cargo fuzz run "$target" --fuzz-dir fuzz -- \
               -runs=1000 -max_len=65536 -timeout=10 -rss_limit_mb=4096
           done
 
@@ -241,6 +241,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
 
       - name: Install Callgrind
         run: |
@@ -278,6 +280,8 @@ jobs:
           sudo apt-get install -y valgrind libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
 
       - name: Install Callgrind runner
         run: cargo install iai-callgrind-runner --version 0.14.2 --locked
