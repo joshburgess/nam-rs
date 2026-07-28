@@ -246,7 +246,16 @@ jobs:
       - name: Install Callgrind
         run: |
           sudo apt-get update
-          sudo apt-get install -y valgrind
+          sudo apt-get install -y build-essential
+          curl --fail --location --silent --show-error \
+            --output /tmp/valgrind-3.27.1.tar.bz2 \
+            https://sourceware.org/pub/valgrind/valgrind-3.27.1.tar.bz2
+          echo "0b113f5c80d34743195b78651c2520901ba630cf  /tmp/valgrind-3.27.1.tar.bz2" | sha1sum --check
+          tar -xf /tmp/valgrind-3.27.1.tar.bz2 -C /tmp
+          cd /tmp/valgrind-3.27.1
+          ./configure --prefix=/usr/local
+          make -j2
+          sudo make install
           cargo install iai-callgrind-runner --version 0.14.2 --locked
 
       - name: Measure A1 and A2 inference
@@ -276,7 +285,16 @@ jobs:
       - name: Install Linux and Callgrind dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y valgrind libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+          sudo apt-get install -y build-essential libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+          curl --fail --location --silent --show-error \
+            --output /tmp/valgrind-3.27.1.tar.bz2 \
+            https://sourceware.org/pub/valgrind/valgrind-3.27.1.tar.bz2
+          echo "0b113f5c80d34743195b78651c2520901ba630cf  /tmp/valgrind-3.27.1.tar.bz2" | sha1sum --check
+          tar -xf /tmp/valgrind-3.27.1.tar.bz2 -C /tmp
+          cd /tmp/valgrind-3.27.1
+          ./configure --prefix=/usr/local
+          make -j2
+          sudo make install
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
