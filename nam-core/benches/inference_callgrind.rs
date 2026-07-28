@@ -44,6 +44,10 @@ library_benchmark_group!(name = inference_group; benchmarks = inference);
 main!(
     config = LibraryBenchmarkConfig::default()
         .callgrind_args(["collect-atstart=no"])
+        .env(
+            "GLIBC_TUNABLES",
+            "glibc.cpu.hwcaps=-SSE4_2,-AVX,-AVX2,-AVX512F",
+        )
         .entry_point(EntryPoint::None);
     library_benchmark_groups = inference_group
 );
