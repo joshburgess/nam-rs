@@ -11,6 +11,7 @@ pub(super) enum AudioProcessError {
     OutputCapacity = 3,
     ToModel = 4,
     ToHost = 5,
+    NonFiniteOutput = 6,
 }
 
 impl AudioProcessError {
@@ -22,6 +23,9 @@ impl AudioProcessError {
             Self::OutputCapacity => "Host output exceeded the preallocated resampler capacity",
             Self::ToModel => "Host-to-model resampling failed",
             Self::ToHost => "Model-to-host resampling failed",
+            Self::NonFiniteOutput => {
+                "The loaded model produced non-finite audio; affected samples were muted"
+            }
         }
     }
 
@@ -32,6 +36,7 @@ impl AudioProcessError {
             3 => Self::OutputCapacity,
             4 => Self::ToModel,
             5 => Self::ToHost,
+            6 => Self::NonFiniteOutput,
             _ => Self::None,
         }
     }
@@ -95,6 +100,8 @@ impl ResamplerState {
     }
 
     pub(super) fn reset(&mut self) {
+        self.to_model.reset();
+        self.to_host.reset();
         self.input_pending.clear();
         self.model_rate_pending.clear();
         self.output_pending.clear();
@@ -111,74 +118,65 @@ impl ResamplerState {
             return Err(AudioProcessError::InputCapacity);
         }
 
-        for &sample in input {
+        for (output_sample, &input_sample) in output.iter_mut().zip(input) {
             self.input_pending
-                .push_back(nam_core::dsp::sample_to_f64(sample));
-        }
+                .push_back(nam_core::dsp::sample_to_f64(input_sample));
 
-        while self.input_pending.len() >= self.to_model_chunk {
-            for sample in &mut self.to_model_input[0][..self.to_model_chunk] {
-                *sample = self.input_pending.pop_front().unwrap_or(0.0);
-            }
-            let (_, output_frames) = self
-                .to_model
-                .process_into_buffer(&self.to_model_input, &mut self.to_model_output, None)
-                .map_err(|_| AudioProcessError::ToModel)?;
-            if self.model_rate_pending.len().saturating_add(output_frames)
-                > self.model_rate_pending.capacity()
-            {
-                return Err(AudioProcessError::ModelCapacity);
-            }
-            for &sample in &self.to_model_output[0][..output_frames] {
-                self.model_rate_pending.push_back(sample);
-            }
-        }
-
-        let model_samples = self.model_rate_pending.len();
-        if model_samples > 0 {
-            if model_samples > self.model_input.len() {
-                return Err(AudioProcessError::ModelCapacity);
-            }
-            for sample in &mut self.model_input[..model_samples] {
-                *sample = nam_core::dsp::sample_from_f64(
-                    self.model_rate_pending.pop_front().unwrap_or(0.0),
+            if self.input_pending.len() >= self.to_model_chunk {
+                for sample in &mut self.to_model_input[0][..self.to_model_chunk] {
+                    *sample = self.input_pending.pop_front().unwrap_or(0.0);
+                }
+                let (_, model_samples) = self
+                    .to_model
+                    .process_into_buffer(&self.to_model_input, &mut self.to_model_output, None)
+                    .map_err(|_| AudioProcessError::ToModel)?;
+                if model_samples > self.model_input.len()
+                    || self.model_rate_pending.len().saturating_add(model_samples)
+                        > self.model_rate_pending.capacity()
+                {
+                    return Err(AudioProcessError::ModelCapacity);
+                }
+                for (destination, &sample) in self.model_input[..model_samples]
+                    .iter_mut()
+                    .zip(&self.to_model_output[0][..model_samples])
+                {
+                    *destination = nam_core::dsp::sample_from_f64(sample);
+                }
+                model.process(
+                    &self.model_input[..model_samples],
+                    &mut self.model_output[..model_samples],
                 );
+                if self.model_output[..model_samples]
+                    .iter()
+                    .any(|sample| !sample.is_finite())
+                {
+                    return Err(AudioProcessError::NonFiniteOutput);
+                }
+                for &sample in &self.model_output[..model_samples] {
+                    self.model_rate_pending
+                        .push_back(nam_core::dsp::sample_to_f64(sample));
+                }
+
+                while self.model_rate_pending.len() >= self.to_host_chunk {
+                    for sample in &mut self.to_host_input[0][..self.to_host_chunk] {
+                        *sample = self.model_rate_pending.pop_front().unwrap_or(0.0);
+                    }
+                    let (_, output_frames) = self
+                        .to_host
+                        .process_into_buffer(&self.to_host_input, &mut self.to_host_output, None)
+                        .map_err(|_| AudioProcessError::ToHost)?;
+                    if self.output_pending.len().saturating_add(output_frames)
+                        > self.output_pending.capacity()
+                    {
+                        return Err(AudioProcessError::OutputCapacity);
+                    }
+                    for &sample in &self.to_host_output[0][..output_frames] {
+                        self.output_pending.push_back(sample);
+                    }
+                }
             }
 
-            model.process(
-                &self.model_input[..model_samples],
-                &mut self.model_output[..model_samples],
-            );
-
-            if model_samples > self.model_rate_pending.capacity() {
-                return Err(AudioProcessError::ModelCapacity);
-            }
-            for &sample in &self.model_output[..model_samples] {
-                self.model_rate_pending
-                    .push_back(nam_core::dsp::sample_to_f64(sample));
-            }
-        }
-
-        while self.model_rate_pending.len() >= self.to_host_chunk {
-            for sample in &mut self.to_host_input[0][..self.to_host_chunk] {
-                *sample = self.model_rate_pending.pop_front().unwrap_or(0.0);
-            }
-            let (_, output_frames) = self
-                .to_host
-                .process_into_buffer(&self.to_host_input, &mut self.to_host_output, None)
-                .map_err(|_| AudioProcessError::ToHost)?;
-            if self.output_pending.len().saturating_add(output_frames)
-                > self.output_pending.capacity()
-            {
-                return Err(AudioProcessError::OutputCapacity);
-            }
-            for &sample in &self.to_host_output[0][..output_frames] {
-                self.output_pending.push_back(sample);
-            }
-        }
-
-        for sample in output.iter_mut().take(num_samples) {
-            *sample =
+            *output_sample =
                 nam_core::dsp::sample_from_f64(self.output_pending.pop_front().unwrap_or(0.0));
         }
         Ok(())

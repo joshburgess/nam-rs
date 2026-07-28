@@ -126,27 +126,22 @@ mod ffi {
     }
 }
 
-fn product(left: usize, right: usize, label: &str) -> usize {
-    left.checked_mul(right)
-        .unwrap_or_else(|| panic!("{label} dimensions overflow usize"))
+fn product(left: usize, right: usize) -> usize {
+    left.saturating_mul(right)
 }
 
-fn strided_len(stride: usize, width: usize, frames: usize, label: &str) -> usize {
-    assert!(stride >= width, "{label} stride is smaller than its width");
+fn strided_len(stride: usize, width: usize, frames: usize) -> usize {
+    if stride < width {
+        return usize::MAX;
+    }
     if frames == 0 {
         return 0;
     }
-    product(frames - 1, stride, label)
-        .checked_add(width)
-        .unwrap_or_else(|| panic!("{label} dimensions overflow usize"))
+    product(frames - 1, stride).saturating_add(width)
 }
 
-fn require_len<T>(slice: &[T], required: usize, label: &str) {
-    assert!(
-        slice.len() >= required,
-        "{label} requires {required} elements, received {}",
-        slice.len()
-    );
+fn has_len<T>(slice: &[T], required: usize) -> bool {
+    slice.len() >= required
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,23 +155,12 @@ pub(crate) fn conv1x1_small(
     input_stride: usize,
     num_frames: usize,
 ) {
-    require_len(
-        output,
-        product(out_channels, num_frames, "conv1x1 output"),
-        "conv1x1 output",
-    );
-    require_len(
-        weights,
-        product(out_channels, in_channels, "conv1x1 weights"),
-        "conv1x1 weights",
-    );
-    require_len(
-        input,
-        strided_len(input_stride, in_channels, num_frames, "conv1x1 input"),
-        "conv1x1 input",
-    );
-    if let Some(bias) = bias {
-        require_len(bias, out_channels, "conv1x1 bias");
+    if !has_len(output, product(out_channels, num_frames))
+        || !has_len(weights, product(out_channels, in_channels))
+        || !has_len(input, strided_len(input_stride, in_channels, num_frames))
+        || bias.is_some_and(|bias| !has_len(bias, out_channels))
+    {
+        return;
     }
     let bias = bias.map_or(core::ptr::null(), <[f32]>::as_ptr);
     // SAFETY: All pointer ranges were validated above, and mutable output is
@@ -204,17 +188,14 @@ pub(crate) fn conv1d_depthwise(
     num_frames: usize,
 ) {
     let kernel_size = taps.len();
-    let frame_elements = product(channels, num_frames, "depthwise input");
-    for tap in taps {
-        require_len(tap, frame_elements, "depthwise input tap");
+    let frame_elements = product(channels, num_frames);
+    if taps.iter().any(|tap| !has_len(tap, frame_elements))
+        || !has_len(output, frame_elements)
+        || !has_len(weights, product(channels, kernel_size))
+        || !has_len(bias, channels)
+    {
+        return;
     }
-    require_len(output, frame_elements, "depthwise output");
-    require_len(
-        weights,
-        product(channels, kernel_size, "depthwise weights"),
-        "depthwise weights",
-    );
-    require_len(bias, channels, "depthwise bias");
     let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
     // SAFETY: Every tap and all dense buffers were validated above. The pointer
     // array remains alive and immutable for the duration of the call.
@@ -241,25 +222,15 @@ pub(crate) fn conv1d_small_gemv(
     num_frames: usize,
 ) {
     let kernel_size = taps.len();
-    for tap in taps {
-        require_len(
-            tap,
-            product(in_channels, num_frames, "conv1d input"),
-            "conv1d input tap",
-        );
+    let input_elements = product(in_channels, num_frames);
+    let matrix_elements = product(out_channels, in_channels);
+    if taps.iter().any(|tap| !has_len(tap, input_elements))
+        || !has_len(output, product(out_channels, num_frames))
+        || !has_len(weights, product(matrix_elements, kernel_size))
+        || !has_len(bias, out_channels)
+    {
+        return;
     }
-    require_len(
-        output,
-        product(out_channels, num_frames, "conv1d output"),
-        "conv1d output",
-    );
-    let matrix_elements = product(out_channels, in_channels, "conv1d weights");
-    require_len(
-        weights,
-        product(matrix_elements, kernel_size, "conv1d weights"),
-        "conv1d weights",
-    );
-    require_len(bias, out_channels, "conv1d bias");
     let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
     // SAFETY: Every pointer range and matrix dimension was validated above.
     unsafe {
@@ -283,9 +254,9 @@ pub(crate) fn add_activate(
     len: usize,
     use_fast_tanh: bool,
 ) {
-    require_len(output, len, "activation output");
-    require_len(left, len, "activation left input");
-    require_len(right, len, "activation right input");
+    if !has_len(output, len) || !has_len(left, len) || !has_len(right, len) {
+        return;
+    }
     // SAFETY: The three disjoint borrows cover `len` elements.
     unsafe {
         ffi::add_activate(
@@ -299,28 +270,26 @@ pub(crate) fn add_activate(
 }
 
 pub(crate) fn vec_add(output: &mut [f32], left: &[f32], right: &[f32], len: usize) {
-    require_len(output, len, "vector output");
-    require_len(left, len, "vector left input");
-    require_len(right, len, "vector right input");
+    if !has_len(output, len) || !has_len(left, len) || !has_len(right, len) {
+        return;
+    }
     // SAFETY: The three disjoint borrows cover `len` elements.
     unsafe { ffi::vec_add(output.as_mut_ptr(), left.as_ptr(), right.as_ptr(), len) }
 }
 
 pub(crate) fn vec_add_inplace(left: &mut [f32], right: &[f32], len: usize) {
-    require_len(left, len, "vector destination");
-    require_len(right, len, "vector input");
+    if !has_len(left, len) || !has_len(right, len) {
+        return;
+    }
     // SAFETY: Both disjoint borrows cover `len` elements.
     unsafe { ffi::vec_add_inplace(left.as_mut_ptr(), right.as_ptr(), len) }
 }
 
 #[allow(dead_code)]
 pub(crate) fn add_bias(output: &mut [f32], bias: &[f32], channels: usize, num_frames: usize) {
-    require_len(
-        output,
-        product(channels, num_frames, "bias output"),
-        "bias output",
-    );
-    require_len(bias, channels, "bias");
+    if !has_len(output, product(channels, num_frames)) || !has_len(bias, channels) {
+        return;
+    }
     // SAFETY: Both buffers cover the validated matrix dimensions.
     unsafe { ffi::add_bias(output.as_mut_ptr(), bias.as_ptr(), channels, num_frames) }
 }
@@ -333,17 +302,9 @@ fn film_lengths(
     dim: usize,
     scale_width: usize,
     num_frames: usize,
-) {
-    require_len(
-        data,
-        strided_len(data_stride, dim, num_frames, "FiLM data"),
-        "FiLM data",
-    );
-    require_len(
-        scale,
-        strided_len(scale_rows, scale_width, num_frames, "FiLM scale"),
-        "FiLM scale",
-    );
+) -> bool {
+    has_len(data, strided_len(data_stride, dim, num_frames))
+        && has_len(scale, strided_len(scale_rows, scale_width, num_frames))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,20 +318,18 @@ pub(crate) fn film_scale_shift(
     scale_shift_rows: usize,
     num_frames: usize,
 ) {
-    film_lengths(
+    if !film_lengths(
         input,
         input_stride,
         scale_shift,
         scale_shift_rows,
         dim,
-        product(dim, 2, "FiLM scale and shift"),
+        product(dim, 2),
         num_frames,
-    );
-    require_len(
-        output,
-        strided_len(output_stride, dim, num_frames, "FiLM output"),
-        "FiLM output",
-    );
+    ) || !has_len(output, strided_len(output_stride, dim, num_frames))
+    {
+        return;
+    }
     // SAFETY: All strided matrix extents were validated above.
     unsafe {
         ffi::film_scale_shift(
@@ -397,12 +356,11 @@ pub(crate) fn film_scale(
     scale_rows: usize,
     num_frames: usize,
 ) {
-    film_lengths(input, input_stride, scale, scale_rows, dim, dim, num_frames);
-    require_len(
-        output,
-        strided_len(output_stride, dim, num_frames, "FiLM output"),
-        "FiLM output",
-    );
+    if !film_lengths(input, input_stride, scale, scale_rows, dim, dim, num_frames)
+        || !has_len(output, strided_len(output_stride, dim, num_frames))
+    {
+        return;
+    }
     // SAFETY: All strided matrix extents were validated above.
     unsafe {
         ffi::film_scale(
@@ -426,15 +384,17 @@ pub(crate) fn film_inplace_scale_shift(
     scale_shift_rows: usize,
     num_frames: usize,
 ) {
-    film_lengths(
+    if !film_lengths(
         data,
         data_stride,
         scale_shift,
         scale_shift_rows,
         dim,
-        product(dim, 2, "FiLM scale and shift"),
+        product(dim, 2),
         num_frames,
-    );
+    ) {
+        return;
+    }
     // SAFETY: The mutable data and scale matrix extents were validated above.
     unsafe {
         ffi::film_inplace_scale_shift(
@@ -456,7 +416,9 @@ pub(crate) fn film_inplace_scale(
     scale_rows: usize,
     num_frames: usize,
 ) {
-    film_lengths(data, data_stride, scale, scale_rows, dim, dim, num_frames);
+    if !film_lengths(data, data_stride, scale, scale_rows, dim, dim, num_frames) {
+        return;
+    }
     // SAFETY: The mutable data and scale matrix extents were validated above.
     unsafe {
         ffi::film_inplace_scale(
@@ -479,15 +441,9 @@ pub(crate) fn gated_activation(
     secondary_type: i32,
     use_fast_tanh: bool,
 ) {
-    assert!(
-        rows >= product(bottleneck, 2, "gated activation"),
-        "gated activation requires two bottleneck regions"
-    );
-    require_len(
-        data,
-        product(rows, num_frames, "gated activation"),
-        "gated activation data",
-    );
+    if rows < product(bottleneck, 2) || !has_len(data, product(rows, num_frames)) {
+        return;
+    }
     // SAFETY: The matrix extent and both bottleneck regions were validated above.
     unsafe {
         ffi::gated_activation(
@@ -511,15 +467,9 @@ pub(crate) fn blended_activation(
     secondary_type: i32,
     use_fast_tanh: bool,
 ) {
-    assert!(
-        rows >= product(bottleneck, 2, "blended activation"),
-        "blended activation requires two bottleneck regions"
-    );
-    require_len(
-        data,
-        product(rows, num_frames, "blended activation"),
-        "blended activation data",
-    );
+    if rows < product(bottleneck, 2) || !has_len(data, product(rows, num_frames)) {
+        return;
+    }
     // SAFETY: The matrix extent and both bottleneck regions were validated above.
     unsafe {
         ffi::blended_activation(
@@ -540,7 +490,9 @@ pub(crate) fn activation_inplace(
     activation_type: i32,
     use_fast_tanh: bool,
 ) {
-    require_len(data, len, "activation data");
+    if !has_len(data, len) {
+        return;
+    }
     // SAFETY: The mutable slice covers `len` initialized elements.
     unsafe {
         ffi::activation_inplace(
@@ -554,14 +506,18 @@ pub(crate) fn activation_inplace(
 
 #[allow(dead_code)]
 pub(crate) fn tanh_inplace(data: &mut [f32], len: usize) {
-    require_len(data, len, "tanh data");
+    if !has_len(data, len) {
+        return;
+    }
     // SAFETY: The mutable slice covers `len` initialized elements.
     unsafe { ffi::tanh_inplace(data.as_mut_ptr(), len) }
 }
 
 #[allow(dead_code)]
 pub(crate) fn tanh_poly_inplace(data: &mut [f32], len: usize) {
-    require_len(data, len, "polynomial tanh data");
+    if !has_len(data, len) {
+        return;
+    }
     // SAFETY: The mutable slice covers `len` initialized elements.
     unsafe { ffi::tanh_poly_inplace(data.as_mut_ptr(), len) }
 }
@@ -571,15 +527,15 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    #[should_panic(expected = "conv1x1 output requires")]
     fn safe_facade_rejects_short_output_buffer() {
         super::conv1x1_small(&mut [], &[1.0], &[1.0], None, 1, 1, 1, 1);
     }
 
     #[test]
-    #[should_panic(expected = "FiLM data stride is smaller")]
     fn safe_facade_rejects_invalid_stride() {
-        super::film_scale(&mut [0.0; 2], &[1.0; 2], &[1.0; 2], 2, 1, 2, 2, 1);
+        let mut output = [7.0; 2];
+        super::film_scale(&mut output, &[1.0; 2], &[1.0; 2], 2, 1, 2, 2, 1);
+        assert_eq!(output, [7.0; 2]);
     }
 
     proptest! {

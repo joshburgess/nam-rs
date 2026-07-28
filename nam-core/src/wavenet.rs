@@ -5,7 +5,7 @@ use crate::util::WeightIter;
 
 mod matrix_backend;
 
-use matrix_backend::{sgemm_colmajor, SGEMM_MIN_SIZE};
+use matrix_backend::{MatrixLayout, SGEMM_MIN_SIZE};
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
 
@@ -203,6 +203,7 @@ struct Conv1x1 {
     bias: Option<Vec<f32>>,
     out_channels: usize,
     in_channels: usize,
+    matrix_layout: MatrixLayout,
     #[allow(dead_code)]
     groups: usize,
     // Pre-allocated output buffer for block processing
@@ -217,12 +218,14 @@ impl Conv1x1 {
         groups: usize,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
+        let matrix_layout = MatrixLayout::new(out_channels, in_channels)
+            .map_err(|error| NamError::InvalidConfig(error.to_string()))?;
         let out_per_group = out_channels / groups;
         let in_per_group = in_channels / groups;
 
         // Build weight in column-major order matching Eigen layout
         // Eigen column-major: W(i,j) at index j * out_channels + i
-        let mut weight_colmajor = vec![0.0f32; out_channels * in_channels];
+        let mut weight_colmajor = vec![0.0f32; matrix_layout.left_len()];
 
         // C++ weight order: for group, for out_per_group, for in_per_group
         for g in 0..groups {
@@ -248,6 +251,7 @@ impl Conv1x1 {
             bias,
             out_channels,
             in_channels,
+            matrix_layout,
             groups,
             output_buf: ColMajorMatrix::new(out_channels, 1),
         })
@@ -274,9 +278,7 @@ impl Conv1x1 {
             } else {
                 self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-            sgemm_colmajor(
-                out_ch,
-                in_ch,
+            self.matrix_layout.multiply(
                 num_frames,
                 1.0,
                 &self.weight_colmajor,
@@ -312,9 +314,7 @@ impl Conv1x1 {
             } else {
                 self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-            sgemm_colmajor(
-                out_ch,
-                in_ch,
+            self.matrix_layout.multiply(
                 num_frames,
                 1.0,
                 &self.weight_colmajor,
@@ -509,6 +509,7 @@ struct Conv1d {
     dilation: usize,
     out_channels: usize,
     in_channels: usize,
+    matrix_layout: MatrixLayout,
     #[allow(dead_code)]
     groups: usize,
     // Block processing state
@@ -548,7 +549,19 @@ impl Conv1d {
         has_bias: bool,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
+        let matrix_layout = MatrixLayout::new(out_channels, in_channels)
+            .map_err(|error| NamError::InvalidConfig(error.to_string()))?;
         let is_depthwise = groups == in_channels && in_channels == out_channels;
+        #[cfg(feature = "fast-kernels")]
+        let flat_weight_len = kernel_size
+            .checked_mul(if is_depthwise {
+                out_channels
+            } else {
+                matrix_layout.left_len()
+            })
+            .ok_or_else(|| {
+                NamError::InvalidConfig("convolution weight dimensions overflow".into())
+            })?;
 
         let weights = if is_depthwise {
             // Depthwise: one weight per channel per kernel tap
@@ -571,7 +584,7 @@ impl Conv1d {
             let in_per_group = in_channels / groups;
 
             let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
-                .map(|_| vec![0.0f32; out_channels * in_channels])
+                .map(|_| vec![0.0f32; matrix_layout.left_len()])
                 .collect();
 
             // C++ weight order: for group, for out_per_group, for in_per_group, for kernel_tap
@@ -602,7 +615,7 @@ impl Conv1d {
         let flat_weights = match &weights {
             Conv1dWeights::Depthwise(dw) => {
                 // flat_weights[k * ch + c]
-                let mut flat = Vec::with_capacity(kernel_size * out_channels);
+                let mut flat = Vec::with_capacity(flat_weight_len);
                 for tap in dw {
                     flat.extend_from_slice(tap);
                 }
@@ -610,7 +623,7 @@ impl Conv1d {
             }
             Conv1dWeights::General(taps) => {
                 // flat_weights[k * (out_ch * in_ch) + ...], just concatenate
-                let mut flat = Vec::with_capacity(kernel_size * out_channels * in_channels);
+                let mut flat = Vec::with_capacity(flat_weight_len);
                 for tap in taps {
                     flat.extend_from_slice(tap);
                 }
@@ -625,6 +638,7 @@ impl Conv1d {
             dilation,
             out_channels,
             in_channels,
+            matrix_layout,
             groups,
             input_buffer: RingBuffer2D::new(),
             output_buf: ColMajorMatrix::new(out_channels, 1),
@@ -699,9 +713,7 @@ impl Conv1d {
                     }
                     for k in 0..ks {
                         let w = &weights_colmajor[k];
-                        sgemm_colmajor(
-                            out_ch,
-                            in_ch,
+                        self.matrix_layout.multiply(
                             num_frames,
                             1.0,
                             w,
@@ -775,9 +787,7 @@ impl Conv1d {
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
 
                     if use_sgemm {
-                        sgemm_colmajor(
-                            out_ch,
-                            in_ch,
+                        self.matrix_layout.multiply(
                             num_frames,
                             1.0,
                             w,
@@ -3557,7 +3567,8 @@ mod tests {
             let alpha = 0.75f32;
             let beta = -0.25f32;
 
-            sgemm_colmajor(m, k, n, alpha, &a, &b, stride, beta, &mut actual);
+            let layout = MatrixLayout::new(m, k).unwrap();
+            prop_assert!(layout.multiply(n, alpha, &a, &b, stride, beta, &mut actual));
             for column in 0..n {
                 for row in 0..m {
                     let mut product = 0.0f32;

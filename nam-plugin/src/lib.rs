@@ -306,6 +306,7 @@ impl NamPlugin {
             *input = (sample * in_gain) as nam_core::Sample;
         }
 
+        let mut process_error = AudioProcessError::None;
         if let Some(resampler) = model.resampler.as_mut() {
             if let Err(error) = resampler.process(
                 &mut *model.dsp,
@@ -314,18 +315,25 @@ impl NamPlugin {
             ) {
                 resampler.reset();
                 self.output_buf[..num_samples].fill(0.0);
-                self.audio_error.store(error as u8, Ordering::Release);
-            } else {
-                self.audio_error
-                    .store(AudioProcessError::None as u8, Ordering::Release);
+                process_error = error;
             }
         } else {
             model.dsp.process(
                 &self.input_buf[..num_samples],
                 &mut self.output_buf[..num_samples],
             );
+        }
+        if process_error == AudioProcessError::None
+            && mute_non_finite(&mut self.output_buf[..num_samples])
+        {
+            process_error = AudioProcessError::NonFiniteOutput;
+        }
+        let reported_error = AudioProcessError::from_raw(self.audio_error.load(Ordering::Acquire));
+        if process_error == AudioProcessError::NonFiniteOutput
+            || reported_error != AudioProcessError::NonFiniteOutput
+        {
             self.audio_error
-                .store(AudioProcessError::None as u8, Ordering::Release);
+                .store(process_error as u8, Ordering::Release);
         }
 
         for (sample, &output) in channel.iter_mut().zip(&self.output_buf[..num_samples]) {
@@ -335,6 +343,17 @@ impl NamPlugin {
 
         ProcessStatus::Normal
     }
+}
+
+fn mute_non_finite(samples: &mut [nam_core::Sample]) -> bool {
+    let mut found = false;
+    for sample in samples {
+        if !sample.is_finite() {
+            *sample = 0.0;
+            found = true;
+        }
+    }
+    found
 }
 
 #[cfg(feature = "benchmark-internals")]
@@ -709,6 +728,8 @@ impl Plugin for NamPlugin {
     }
 
     fn reset(&mut self) {
+        self.audio_error
+            .store(AudioProcessError::None as u8, Ordering::Release);
         if let Some(model) = self.model.as_mut() {
             let model_rate = model
                 .dsp
@@ -764,6 +785,7 @@ nih_export_vst3!(NamPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A trivial pass-through DSP for testing resampling in isolation.
     struct PassthroughDsp;
@@ -790,6 +812,26 @@ mod tests {
                 validation_esr: None,
             };
             &META
+        }
+    }
+
+    struct NonFiniteDsp;
+
+    impl nam_core::Dsp for NonFiniteDsp {
+        fn process(&mut self, input: &[nam_core::Sample], output: &mut [nam_core::Sample]) {
+            output[..input.len()].fill(0.25);
+            if let Some(sample) = output.first_mut() {
+                *sample = nam_core::Sample::NAN;
+            }
+            if let Some(sample) = output.get_mut(1) {
+                *sample = nam_core::Sample::INFINITY;
+            }
+        }
+
+        fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {}
+
+        fn metadata(&self) -> &nam_core::dsp::DspMetadata {
+            PassthroughDsp.metadata()
         }
     }
 
@@ -860,6 +902,65 @@ mod tests {
         plugin.output_buf = vec![0.0; buffer_size];
         plugin.max_buffer_size = buffer_size;
         plugin
+    }
+
+    #[test]
+    fn callback_mutes_non_finite_model_output_without_allocating() {
+        let buffer_size = 64;
+        let mut plugin = plugin_with_passthrough_model(buffer_size);
+        plugin.model = Some(LoadedModel {
+            generation: 1,
+            dsp: Box::new(NonFiniteDsp),
+            resampler: None,
+        });
+        let mut audio = vec![1.0f32; buffer_size];
+        let mut buffer = mono_buffer(&mut audio);
+
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+        drop(buffer);
+
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(allocations, 0);
+        assert_eq!(&audio[..2], &[0.0, 0.0]);
+        assert!(audio[2..].iter().all(|sample| sample.is_finite()));
+        assert_eq!(
+            AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+            AudioProcessError::NonFiniteOutput
+        );
+
+        plugin.model = Some(loaded_model(1));
+        audio.fill(1.0);
+        let mut buffer = mono_buffer(&mut audio);
+        plugin.process_buffer(&mut buffer);
+        assert!(audio.iter().all(|sample| sample.is_finite()));
+        assert_eq!(
+            AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+            AudioProcessError::NonFiniteOutput
+        );
+    }
+
+    #[test]
+    fn callback_resets_resampling_before_non_finite_output_can_poison_it() {
+        let buffer_size = 4096;
+        let mut plugin = plugin_with_resampled_passthrough_model(44_100, 48_000, buffer_size);
+        if let Some(model) = plugin.model.as_mut() {
+            model.dsp = Box::new(NonFiniteDsp);
+        }
+        let mut audio = vec![1.0f32; buffer_size];
+        let mut buffer = mono_buffer(&mut audio);
+
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+        drop(buffer);
+
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(allocations, 0);
+        assert!(audio.iter().all(|sample| *sample == 0.0));
+        assert_eq!(
+            AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+            AudioProcessError::NonFiniteOutput
+        );
     }
 
     fn plugin_with_resampled_passthrough_model(
@@ -1048,6 +1149,100 @@ mod tests {
                 rs.model_output.capacity(),
             )
         );
+    }
+
+    fn render_resampled_stream(
+        host_rate: usize,
+        model_rate: usize,
+        partitions: &[usize],
+        total_samples: usize,
+    ) -> Vec<nam_core::Sample> {
+        let mut resampler = ResamplerState::new(host_rate, model_rate, 4096).unwrap();
+        let capacities = (
+            resampler.input_pending.capacity(),
+            resampler.model_rate_pending.capacity(),
+            resampler.output_pending.capacity(),
+        );
+        let mut model = PassthroughDsp;
+        let mut rendered = Vec::with_capacity(total_samples);
+        let mut position = 0usize;
+        let mut partition_index = 0usize;
+        while position < total_samples {
+            let requested = partitions[partition_index % partitions.len()];
+            let count = requested.min(4096).min(total_samples - position);
+            let input: Vec<_> = (position..position + count)
+                .map(|sample| {
+                    let phase = sample as f64 * 0.013_579;
+                    nam_core::dsp::sample_from_f64(phase.sin() * 0.5)
+                })
+                .collect();
+            let mut output = vec![0.0; count];
+            let (result, allocations) = allocation_tracking::count_allocations(|| {
+                resampler.process(&mut model, &input, &mut output)
+            });
+            assert_eq!(result, Ok(()));
+            assert_eq!(allocations, 0);
+            assert!(resampler.input_pending.len() <= capacities.0);
+            assert!(resampler.model_rate_pending.len() <= capacities.1);
+            assert!(resampler.output_pending.len() <= capacities.2);
+            rendered.extend(output);
+            position += count;
+            partition_index += 1;
+        }
+        assert_eq!(rendered.len(), total_samples);
+        rendered
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn long_running_resampling_is_block_partition_invariant(
+            partitions in proptest::collection::vec(1usize..=4096, 1..64),
+            reverse_rates in any::<bool>(),
+        ) {
+            let (host_rate, model_rate) = if reverse_rates {
+                (48_000, 44_100)
+            } else {
+                (44_100, 48_000)
+            };
+            let expected = render_resampled_stream(host_rate, model_rate, &[257], 16_384);
+            let actual =
+                render_resampled_stream(host_rate, model_rate, &partitions, 16_384);
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn resampler_reset_restores_fresh_latency_and_filter_state() {
+        let input: Vec<_> = (0..8192)
+            .map(|sample| {
+                let value = if sample == 0 { 1.0 } else { 0.0 };
+                nam_core::dsp::sample_from_f64(value)
+            })
+            .collect();
+        let mut reused = ResamplerState::new(44_100, 48_000, 4096).unwrap();
+        let mut model = PassthroughDsp;
+        let mut first = vec![0.0; input.len()];
+        for (input, output) in input.chunks(257).zip(first.chunks_mut(257)) {
+            reused.process(&mut model, input, output).unwrap();
+        }
+        reused.reset();
+        let mut after_reset = vec![0.0; input.len()];
+        for (input, output) in input.chunks(61).zip(after_reset.chunks_mut(61)) {
+            reused.process(&mut model, input, output).unwrap();
+        }
+
+        let fresh_impulse = {
+            let mut state = ResamplerState::new(44_100, 48_000, 4096).unwrap();
+            let mut output = vec![0.0; input.len()];
+            for (input, output) in input.chunks(4096).zip(output.chunks_mut(4096)) {
+                state.process(&mut PassthroughDsp, input, output).unwrap();
+            }
+            output
+        };
+        assert_eq!(after_reset, fresh_impulse);
+        assert_eq!(first, fresh_impulse);
     }
 
     #[test]
@@ -1282,5 +1477,92 @@ mod tests {
 
         producer.join().unwrap();
         assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 32);
+    }
+
+    #[test]
+    fn plugin_lifecycle_state_machine_never_installs_stale_or_post_drop_models() {
+        #[derive(Clone, Copy)]
+        enum Event {
+            RequestNext,
+            LoaderCompletes(u64),
+            Callback,
+            Drop,
+        }
+
+        #[derive(Clone, Copy)]
+        struct Lifecycle {
+            alive: bool,
+            latest: u64,
+            published: Option<u64>,
+            installed: Option<u64>,
+        }
+
+        impl Lifecycle {
+            fn apply(mut self, event: Event) -> Self {
+                match event {
+                    Event::RequestNext if self.alive => {
+                        self.latest = self.latest.saturating_add(1);
+                    }
+                    Event::LoaderCompletes(generation)
+                        if self.alive && generation == self.latest =>
+                    {
+                        self.published = Some(generation);
+                    }
+                    Event::Callback if self.alive => {
+                        if let Some(generation) = self.published.take() {
+                            if generation == self.latest {
+                                self.installed = Some(generation);
+                            }
+                        }
+                    }
+                    Event::Drop => {
+                        self.alive = false;
+                        self.published = None;
+                    }
+                    _ => {}
+                }
+                self
+            }
+
+            fn assert_invariants(self) {
+                assert!(self
+                    .published
+                    .is_none_or(|generation| self.alive && generation <= self.latest));
+                assert!(self
+                    .installed
+                    .is_none_or(|generation| generation <= self.latest));
+                if !self.alive {
+                    assert!(self.published.is_none());
+                }
+            }
+        }
+
+        fn explore(state: Lifecycle, depth: usize) {
+            state.assert_invariants();
+            if depth == 0 {
+                return;
+            }
+            let events = [
+                Event::RequestNext,
+                Event::LoaderCompletes(1),
+                Event::LoaderCompletes(2),
+                Event::LoaderCompletes(3),
+                Event::Callback,
+                Event::Drop,
+            ];
+            for event in events {
+                explore(state.apply(event), depth - 1);
+            }
+        }
+
+        explore(
+            Lifecycle {
+                alive: true,
+                latest: 1,
+                published: None,
+                installed: None,
+            },
+            7,
+        );
     }
 }

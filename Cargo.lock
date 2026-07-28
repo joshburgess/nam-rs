@@ -2958,6 +2958,7 @@ dependencies = [
  "nam-core",
  "nih_plug",
  "nih_plug_egui",
+ "proptest",
  "rfd",
  "rubato",
 ]
