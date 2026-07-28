@@ -25,6 +25,10 @@ library_benchmark_group!(name = callback_group; benchmarks = callback);
 main!(
     config = LibraryBenchmarkConfig::default()
         .callgrind_args(["collect-atstart=no"])
+        .env(
+            "GLIBC_TUNABLES",
+            "glibc.cpu.hwcaps=-SSE4_2,-AVX,-AVX2,-AVX512F",
+        )
         .entry_point(EntryPoint::None);
     library_benchmark_groups = callback_group
 );
