@@ -227,8 +227,9 @@ jobs:
 
   inference-instruction-baseline:
     name: Inference Instructions (${{ matrix.name }})
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: default
@@ -268,7 +269,7 @@ jobs:
 
   plugin-callback-instruction-budget:
     name: Plugin Callback Instructions
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
