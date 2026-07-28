@@ -230,14 +230,17 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
+      MMTEST_FEATURE: ${{ matrix.mmtest_feature }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: default
             args: --no-default-features
+            mmtest_feature: sse2
           - name: faer
             args: --no-default-features --features faer
+            mmtest_feature: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
