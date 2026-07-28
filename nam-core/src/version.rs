@@ -22,14 +22,6 @@ pub fn verify_config_version(version_str: &str) -> Result<(), NamError> {
     if minor < 5 {
         return Err(NamError::UnsupportedVersion(version_str.to_string()));
     }
-    // 0.5.x through 0.7.x are fully supported
-    if minor > 7 {
-        eprintln!(
-            "Warning: Model config version {} is newer than latest fully-supported version 0.7.0. \
-             Continuing with partial support.",
-            version_str
-        );
-    }
     Ok(())
 }
 

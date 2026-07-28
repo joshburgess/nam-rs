@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::activations::Activation;
-use crate::dsp::{Dsp, DspMetadata, Sample};
+use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
 use crate::util::WeightIter;
 
@@ -169,6 +169,7 @@ pub struct ConvNet {
     dilations: Vec<usize>,
     prewarm_samples: usize,
     metadata: DspMetadata,
+    activation_mode: ActivationMode,
 }
 
 impl ConvNet {
@@ -255,6 +256,7 @@ impl ConvNet {
             dilations: dilations.to_vec(),
             prewarm_samples,
             metadata,
+            activation_mode: ActivationMode::Accurate,
         })
     }
 
@@ -293,7 +295,7 @@ impl ConvNet {
             // Activation
             self.blocks[block_idx]
                 .activation
-                .apply_slice(&mut frame_out);
+                .apply_slice_with_mode(&mut frame_out, self.activation_mode);
 
             // Write to next level's history
             let next_level = block_idx + 1;
@@ -310,7 +312,8 @@ impl ConvNet {
 impl Dsp for ConvNet {
     fn process(&mut self, input: &[Sample], output: &mut [Sample]) {
         for (i, &sample) in input.iter().enumerate() {
-            output[i] = self.process_sample(sample as f32) as Sample;
+            output[i] =
+                crate::dsp::sample_from_f32(self.process_sample(crate::dsp::sample_to_f32(sample)));
         }
     }
 
@@ -328,6 +331,10 @@ impl Dsp for ConvNet {
 
     fn metadata(&self) -> &DspMetadata {
         &self.metadata
+    }
+
+    fn set_activation_mode(&mut self, mode: ActivationMode) {
+        self.activation_mode = mode;
     }
 }
 

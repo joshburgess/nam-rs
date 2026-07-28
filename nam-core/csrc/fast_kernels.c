@@ -1,11 +1,11 @@
 /**
- * Performance-critical DSP kernels compiled with -ffast-math.
+ * Performance-critical DSP kernels compiled with optimization enabled.
  *
  * Coarse-grained functions that process entire operations in one call
  * to avoid FFI overhead. Each function does enough work to amortize
  * the cross-language call cost.
  *
- * Compiled via the `cc` crate with -O3 -ffast-math.
+ * Compiled via the `cc` crate with -O3.
  */
 
 #include <math.h>
@@ -30,8 +30,6 @@ void fast_conv1d_depthwise(
     size_t kernel_size,
     size_t num_frames
 ) {
-    size_t total = ch * num_frames;
-
     /* Initialize output with bias */
     for (size_t f = 0; f < num_frames; f++) {
         size_t off = f * ch;
@@ -292,7 +290,8 @@ void fast_film_inplace_scale(
 }
 
 /* ── Gated activation: z[c] = primary(z[c]) * secondary(z[bottleneck+c])
- * activation_type: 0=Tanh, 1=SiLU, 2=Hardswish, 3=Softsign, 4=HardTanh
+ * activation_type: 0=Tanh, 1=SiLU, 2=Hardswish, 3=Softsign,
+ *                  4=HardTanh, 5=ReLU, 6=Sigmoid, 7=Softsigmoid
  * Applies to topRows(bottleneck) of z, which has z_rows stride.
  */
 static inline float apply_activation(float x, int type, int use_fast_tanh) {
@@ -322,6 +321,10 @@ static inline float apply_activation(float x, int type, int use_fast_tanh) {
             return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
         case 5: /* ReLU */
             return x > 0.0f ? x : 0.0f;
+        case 6: /* Sigmoid */
+            return 1.0f / (1.0f + expf(-x));
+        case 7: /* Softsigmoid */
+            return 0.5f * (1.0f + x / (1.0f + fabsf(x)));
         default:
             return x;
     }

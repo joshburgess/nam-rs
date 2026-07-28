@@ -1,3 +1,5 @@
+#![allow(clippy::print_stderr)]
+
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -54,10 +56,9 @@ fn main() {
             fast,
         } => {
             if fast {
-                nam_core::enable_fast_tanh();
                 eprintln!("Fast tanh: enabled");
             }
-            bench(&model, buffer_size, iterations);
+            bench(&model, buffer_size, iterations, fast);
         }
     }
 }
@@ -132,7 +133,7 @@ fn render(model_path: &Path, input_path: &Path, output_path: &Path) {
     });
 
     for &sample in &output_samples {
-        if let Err(e) = writer.write_sample(sample as f32) {
+        if let Err(e) = writer.write_sample(nam_core::dsp::sample_to_f32(sample)) {
             eprintln!("Error writing WAV sample: {}", e);
             std::process::exit(1);
         }
@@ -149,10 +150,15 @@ fn render(model_path: &Path, input_path: &Path, output_path: &Path) {
     );
 }
 
-fn bench(model_path: &Path, buffer_size: usize, iterations: usize) {
+fn bench(model_path: &Path, buffer_size: usize, iterations: usize, fast: bool) {
     let mut model = nam_core::get_dsp(model_path).unwrap_or_else(|e| {
         eprintln!("Failed to load model: {}", e);
         std::process::exit(1);
+    });
+    model.set_activation_mode(if fast {
+        nam_core::ActivationMode::Fast
+    } else {
+        nam_core::ActivationMode::Accurate
     });
 
     let sample_rate = model.metadata().expected_sample_rate.unwrap_or(48000.0);

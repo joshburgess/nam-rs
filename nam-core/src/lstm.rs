@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2};
 
-use crate::dsp::{Dsp, DspMetadata, Sample};
+use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::{sigmoid, tanh_auto, WeightIter};
+use crate::util::{sigmoid, tanh, WeightIter};
 
 struct LstmCell {
     /// Combined weight matrix [4*hidden, input_size + hidden_size], row-major.
@@ -49,7 +49,7 @@ impl LstmCell {
 
     /// Process one sample through this cell.
     #[inline]
-    fn process(&mut self, input: &Array1<f32>) {
+    fn process(&mut self, input: &Array1<f32>, activation_mode: ActivationMode) {
         let h = self.hidden_size;
 
         // Copy input into xh
@@ -63,13 +63,13 @@ impl LstmCell {
 
         // Apply gate activations and update cell/hidden state
         for i in 0..h {
-            let ig = sigmoid(self.ifgo[i]); // input gate
-            let fg = sigmoid(self.ifgo[i + h]); // forget gate
-            let gg = tanh_auto(self.ifgo[i + 2 * h]); // cell gate
-            let og = sigmoid(self.ifgo[i + 3 * h]); // output gate
+            let ig = sigmoid(self.ifgo[i], activation_mode); // input gate
+            let fg = sigmoid(self.ifgo[i + h], activation_mode); // forget gate
+            let gg = tanh(self.ifgo[i + 2 * h], activation_mode); // cell gate
+            let og = sigmoid(self.ifgo[i + 3 * h], activation_mode); // output gate
 
             self.c[i] = fg * self.c[i] + ig * gg;
-            self.xh[self.input_size + i] = og * tanh_auto(self.c[i]);
+            self.xh[self.input_size + i] = og * tanh(self.c[i], activation_mode);
         }
     }
 
@@ -95,6 +95,7 @@ pub struct Lstm {
     input_buf: Array1<f32>,
     metadata: DspMetadata,
     expected_sample_rate: f64,
+    activation_mode: ActivationMode,
 }
 
 impl Lstm {
@@ -157,6 +158,7 @@ impl Lstm {
             input_buf: Array1::zeros(input_size),
             metadata,
             expected_sample_rate,
+            activation_mode: ActivationMode::Accurate,
         })
     }
 }
@@ -164,19 +166,19 @@ impl Lstm {
 impl Dsp for Lstm {
     fn process(&mut self, input: &[Sample], output: &mut [Sample]) {
         for (i, &sample) in input.iter().enumerate() {
-            self.input_buf[0] = sample as f32;
+            self.input_buf[0] = crate::dsp::sample_to_f32(sample);
 
             // Forward through LSTM layers
-            self.cells[0].process(&self.input_buf);
+            self.cells[0].process(&self.input_buf, self.activation_mode);
             for layer in 1..self.cells.len() {
                 let prev_hidden = self.cells[layer - 1].hidden_state().to_owned();
-                self.cells[layer].process(&prev_hidden);
+                self.cells[layer].process(&prev_hidden, self.activation_mode);
             }
 
             if let Some(final_cell) = self.cells.last() {
                 let out =
                     self.head_weight.row(0).dot(&final_cell.hidden_state()) + self.head_bias[0];
-                output[i] = out as Sample;
+                output[i] = crate::dsp::sample_from_f32(out);
             }
         }
     }
@@ -199,6 +201,10 @@ impl Dsp for Lstm {
 
     fn metadata(&self) -> &DspMetadata {
         &self.metadata
+    }
+
+    fn set_activation_mode(&mut self, mode: ActivationMode) {
+        self.activation_mode = mode;
     }
 }
 
@@ -504,11 +510,16 @@ mod tests {
 
         assert!(output.iter().all(|&x| x.is_finite()));
         // Output should not be constant
-        let min = output.iter().copied().fold(f64::INFINITY, |a, b| a.min(b));
+        let min = output
+            .iter()
+            .copied()
+            .map(crate::dsp::sample_to_f64)
+            .fold(f64::INFINITY, f64::min);
         let max = output
             .iter()
             .copied()
-            .fold(f64::NEG_INFINITY, |a, b| a.max(b));
+            .map(crate::dsp::sample_to_f64)
+            .fold(f64::NEG_INFINITY, f64::max);
         assert!(max - min > 1e-6, "LSTM output should vary with sine input");
     }
 

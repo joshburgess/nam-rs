@@ -42,7 +42,7 @@ impl Dsp for Linear {
     fn process(&mut self, input: &[Sample], output: &mut [Sample]) {
         let len = self.weights.len();
         for (i, &sample) in input.iter().enumerate() {
-            self.history[self.history_pos] = sample as f32;
+            self.history[self.history_pos] = crate::dsp::sample_to_f32(sample);
 
             let mut sum = 0.0f32;
             for (j, &w) in self.weights.iter().enumerate() {

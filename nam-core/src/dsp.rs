@@ -5,6 +5,60 @@ pub type Sample = f64;
 
 use crate::error::NamError;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActivationMode {
+    #[default]
+    Accurate,
+    Fast,
+}
+
+impl ActivationMode {
+    #[inline]
+    pub(crate) fn use_fast_tanh(self) -> bool {
+        matches!(self, Self::Fast)
+    }
+}
+
+#[cfg(feature = "float_io")]
+pub fn sample_to_f64(sample: Sample) -> f64 {
+    f64::from(sample)
+}
+
+#[cfg(not(feature = "float_io"))]
+pub fn sample_to_f64(sample: Sample) -> f64 {
+    sample
+}
+
+#[cfg(feature = "float_io")]
+pub fn sample_to_f32(sample: Sample) -> f32 {
+    sample
+}
+
+#[cfg(not(feature = "float_io"))]
+pub fn sample_to_f32(sample: Sample) -> f32 {
+    sample as f32
+}
+
+#[cfg(feature = "float_io")]
+pub fn sample_from_f32(sample: f32) -> Sample {
+    sample
+}
+
+#[cfg(not(feature = "float_io"))]
+pub fn sample_from_f32(sample: f32) -> Sample {
+    f64::from(sample)
+}
+
+#[cfg(feature = "float_io")]
+pub fn sample_from_f64(sample: f64) -> Sample {
+    sample as f32
+}
+
+#[cfg(not(feature = "float_io"))]
+pub fn sample_from_f64(sample: f64) -> Sample {
+    sample
+}
+
 /// Metadata parsed from the .nam file.
 #[derive(Debug, Clone, Default)]
 pub struct DspMetadata {
@@ -48,6 +102,8 @@ pub trait Dsp: Send {
 
     fn metadata(&self) -> &DspMetadata;
 
+    fn set_activation_mode(&mut self, _mode: ActivationMode) {}
+
     /// Select a slimmable model width, where 0.0 chooses the smallest width and 1.0 the largest.
     fn set_slimming(&mut self, _value: f64) -> Result<(), NamError> {
         Err(NamError::InvalidConfig(
@@ -68,7 +124,7 @@ pub trait Dsp: Send {
         let mut output = [Sample::default()];
         self.process(&input, &mut output);
         if !out.is_empty() {
-            out[0] = output[0] as f32;
+            out[0] = sample_to_f32(output[0]);
         }
     }
 

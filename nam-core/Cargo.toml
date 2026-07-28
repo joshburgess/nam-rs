@@ -1,15 +1,19 @@
 [package]
 name = "nam-core"
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 description = "Rust DSP inference engine for Neural Amp Modeler"
+
+[lints]
+workspace = true
 
 [features]
 default = []
 float_io = []  # Use f32 instead of f64 for process() I/O (matches C++ DSP_SAMPLE_FLOAT)
 faer = ["dep:faer"]  # Use faer GEMM instead of matrixmultiply
-fast-kernels = []  # C inner loops compiled with -ffast-math
+fast-kernels = []  # Optimized C inner loops
 
 [build-dependencies]
 cc = { version = "1", optional = false }
@@ -26,7 +30,16 @@ thiserror = "2"
 approx = "0.5"
 criterion = "0.5"
 hound = "3.5"
+iai-callgrind = { version = "0.14", features = ["client_requests_defs"] }
+proptest = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+iai-callgrind = { version = "0.14", features = ["client_requests"] }
 
 [[bench]]
 name = "inference"
+harness = false
+
+[[bench]]
+name = "inference_callgrind"
 harness = false

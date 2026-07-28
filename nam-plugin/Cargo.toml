@@ -1,14 +1,34 @@
 [package]
 name = "nam-plugin"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+benchmark-internals = []
+
+[[bench]]
+name = "callback_callgrind"
+harness = false
+required-features = ["benchmark-internals"]
+
 [dependencies]
-nam-core = { path = "../nam-core" }
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+crossbeam-queue = "0.3"
+nam-core = { version = "0.1.0", path = "../nam-core" }
+nih_plug = { version = "0.0.0", git = "https://github.com/robbert-vdh/nih-plug.git", rev = "28b149ec4d62757d0b448809148a0c3ca6e09a95" }
+nih_plug_egui = { version = "0.0.0", git = "https://github.com/robbert-vdh/nih-plug.git", rev = "28b149ec4d62757d0b448809148a0c3ca6e09a95" }
 rfd = "0.15"
 rubato = "0.14"
+
+[dev-dependencies]
+iai-callgrind = { version = "0.14", features = ["client_requests_defs"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+iai-callgrind = { version = "0.14", features = ["client_requests"] }

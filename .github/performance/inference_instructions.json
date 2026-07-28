@@ -1,0 +1,50 @@
+{
+  "tolerance_percent": 3.0,
+  "configurations": {
+    "default": {
+      "a1_standard": 3298462,
+      "a2_max": 2113915
+    },
+    "faer": {
+      "a1_standard": 3209945,
+      "a2_max": 2089959
+    },
+    "fast-kernels": {
+      "a1_standard": 2290512,
+      "a2_max": 1206251
+    }
+  },
+  "scaling_envelopes": [
+    {
+      "reference": "a1_standard",
+      "reference_samples": 64,
+      "benchmark": "a1_standard_16",
+      "benchmark_samples": 16,
+      "max_relative_instructions_per_sample": 2.0
+    },
+    {
+      "reference": "a1_standard",
+      "reference_samples": 64,
+      "benchmark": "a1_standard_256",
+      "benchmark_samples": 256,
+      "max_relative_instructions_per_sample": 1.15
+    },
+    {
+      "reference": "a2_max",
+      "reference_samples": 64,
+      "benchmark": "a2_max_16",
+      "benchmark_samples": 16,
+      "max_relative_instructions_per_sample": 2.0
+    },
+    {
+      "reference": "a2_max",
+      "reference_samples": 64,
+      "benchmark": "a2_max_256",
+      "benchmark_samples": 256,
+      "max_relative_instructions_per_sample": 1.15
+    }
+  ],
+  "absolute_limits": {
+    "lstm_64": 10000000
+  }
+}

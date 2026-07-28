@@ -1,87 +1,141 @@
+use crossbeam_queue::ArrayQueue;
 use nih_plug::prelude::*;
 use nih_plug_egui::resizable_window::ResizableWindow;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
-use rubato::{FftFixedInOut, Resampler};
-use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-/// Background task for model loading (runs off the audio thread).
-enum NamTask {
-    LoadModel(PathBuf),
+mod resampler;
+
+use resampler::{AudioProcessError, ResamplerState};
+
+#[cfg(test)]
+mod allocation_tracking {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static TRACKING: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct TrackingAllocator;
+
+    // SAFETY: Every allocation operation is forwarded to `System` with unchanged arguments.
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: This allocator forwards the unchanged layout to the system allocator.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            // SAFETY: This allocator forwards the unchanged layout to the system allocator.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: The pointer and layout came from the system allocator above.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            // SAFETY: The pointer and layout came from the system allocator above.
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    fn record_allocation() {
+        TRACKING.with(|tracking| {
+            if tracking.get() {
+                ALLOCATIONS.with(|allocations| allocations.set(allocations.get() + 1));
+            }
+        });
+    }
+
+    pub(super) fn count_allocations<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATIONS.with(|allocations| allocations.set(0));
+        TRACKING.with(|tracking| tracking.set(true));
+        let result = operation();
+        TRACKING.with(|tracking| tracking.set(false));
+        let count = ALLOCATIONS.with(Cell::get);
+        (result, count)
+    }
 }
 
-/// The NAM audio plugin.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: allocation_tracking::TrackingAllocator =
+    allocation_tracking::TrackingAllocator;
+
+enum NamTask {
+    LoadModel { generation: u64, path: PathBuf },
+}
+
+struct LoadedModel {
+    generation: u64,
+    dsp: Box<dyn nam_core::Dsp>,
+    resampler: Option<ResamplerState>,
+}
+
 struct NamPlugin {
     params: Arc<NamParams>,
-    /// Shared model slot: GUI writes a new model here, audio thread reads it.
-    model: Arc<Mutex<Option<Box<dyn nam_core::Dsp>>>>,
-    /// Pre-allocated buffers to avoid allocations in process().
+    model: Option<LoadedModel>,
+    deferred_retire: Option<LoadedModel>,
+    loaded_models: Arc<ArrayQueue<LoadedModel>>,
+    retired_models: Arc<ArrayQueue<LoadedModel>>,
+    latest_generation: Arc<AtomicU64>,
+    installed_generation: Arc<AtomicU64>,
+    load_status: Arc<Mutex<ModelLoadStatus>>,
+    audio_error: Arc<AtomicU8>,
+    plugin_alive: Arc<AtomicBool>,
     input_buf: Vec<nam_core::Sample>,
     output_buf: Vec<nam_core::Sample>,
     sample_rate: f64,
     max_buffer_size: usize,
-    /// Resampling state (None if host rate matches model rate).
-    resampler: Option<ResamplerState>,
 }
 
-/// Handles resampling between host sample rate and model sample rate.
-/// Uses rubato's FftFixedInOut which requires fixed input chunk sizes.
-/// We buffer samples in VecDeques to handle variable DAW buffer sizes.
-struct ResamplerState {
-    /// Host rate -> model rate
-    to_model: FftFixedInOut<f64>,
-    /// Model rate -> host rate
-    to_host: FftFixedInOut<f64>,
-    /// Accumulates host-rate samples until we have enough for a resample chunk
-    input_pending: VecDeque<f64>,
-    /// Accumulates model-rate samples waiting to be back-resampled to host rate
-    model_rate_pending: VecDeque<f64>,
-    /// Accumulates host-rate output samples ready for the DAW
-    output_pending: VecDeque<f64>,
-    /// Fixed input chunk size for to_model resampler
-    to_model_chunk: usize,
-    /// Fixed input chunk size for to_host resampler
-    to_host_chunk: usize,
-    /// Pre-allocated model I/O buffers
-    model_input: Vec<nam_core::Sample>,
-    model_output: Vec<nam_core::Sample>,
-    /// Pre-allocated chunk buffers for rubato (avoids allocations in process)
-    to_model_scratch: Vec<Vec<f64>>,
-    to_host_scratch: Vec<Vec<f64>>,
+#[derive(Clone, Debug)]
+enum ModelLoadStatus {
+    Empty,
+    Loading {
+        generation: u64,
+        path: PathBuf,
+    },
+    Ready {
+        generation: u64,
+        path: PathBuf,
+    },
+    Failed {
+        generation: u64,
+        path: PathBuf,
+        message: String,
+    },
 }
 
-impl ResamplerState {
-    fn new(host_rate: usize, model_rate: usize) -> Option<Self> {
-        // FftFixedInOut: both input and output are fixed-size chunks
-        let to_model = FftFixedInOut::<f64>::new(host_rate, model_rate, 128, 1).ok()?;
-        let to_host = FftFixedInOut::<f64>::new(model_rate, host_rate, 128, 1).ok()?;
-
-        let to_model_chunk = to_model.input_frames_max();
-        let to_host_chunk = to_host.input_frames_max();
-        let max_model_buf = to_model.output_frames_max() * 8;
-
-        Some(Self {
-            to_model,
-            to_host,
-            input_pending: VecDeque::with_capacity(to_model_chunk * 4),
-            model_rate_pending: VecDeque::with_capacity(to_host_chunk * 4),
-            output_pending: VecDeque::with_capacity(to_host_chunk * 4),
-            to_model_chunk,
-            to_host_chunk,
-            model_input: vec![0.0; max_model_buf],
-            model_output: vec![0.0; max_model_buf],
-            to_model_scratch: vec![vec![0.0; to_model_chunk]; 1],
-            to_host_scratch: vec![vec![0.0; to_host_chunk]; 1],
-        })
+fn mark_load_failed(
+    status: &Mutex<ModelLoadStatus>,
+    latest_generation: &AtomicU64,
+    generation: u64,
+    path: PathBuf,
+    message: String,
+) {
+    if latest_generation.load(Ordering::Acquire) != generation {
+        return;
     }
-
-    fn reset(&mut self) {
-        self.input_pending.clear();
-        self.model_rate_pending.clear();
-        self.output_pending.clear();
-    }
+    *status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ModelLoadStatus::Failed {
+        generation,
+        path,
+        message,
+    };
 }
 
 #[derive(Params)]
@@ -102,30 +156,43 @@ struct NamParams {
     pub model_path: Mutex<String>,
 }
 
-struct GuiState {
-    model_name: String,
-    status: String,
-}
+struct GuiState;
 
 impl Default for GuiState {
     fn default() -> Self {
-        Self {
-            model_name: String::new(),
-            status: "No model loaded".to_string(),
-        }
+        Self
     }
 }
 
 impl Default for NamPlugin {
     fn default() -> Self {
+        let loaded_models = Arc::new(ArrayQueue::new(1));
+        let retired_models = Arc::new(ArrayQueue::new(4));
+        let retired_models_weak = Arc::downgrade(&retired_models);
+        let _ = thread::Builder::new()
+            .name("nam-model-reaper".to_string())
+            .spawn(move || {
+                while let Some(retired_models) = retired_models_weak.upgrade() {
+                    while retired_models.pop().is_some() {}
+                    thread::park_timeout(Duration::from_millis(10));
+                }
+            });
+
         Self {
             params: Arc::new(NamParams::default()),
-            model: Arc::new(Mutex::new(None)),
+            model: None,
+            deferred_retire: None,
+            loaded_models,
+            retired_models,
+            latest_generation: Arc::new(AtomicU64::new(0)),
+            installed_generation: Arc::new(AtomicU64::new(0)),
+            load_status: Arc::new(Mutex::new(ModelLoadStatus::Empty)),
+            audio_error: Arc::new(AtomicU8::new(AudioProcessError::None as u8)),
+            plugin_alive: Arc::new(AtomicBool::new(true)),
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             sample_rate: 48000.0,
             max_buffer_size: 4096,
-            resampler: None,
         }
     }
 }
@@ -145,7 +212,7 @@ impl Default for NamParams {
             )
             .with_unit(" dB")
             .with_step_size(0.1)
-            .with_smoother(SmoothingStyle::Logarithmic(50.0)),
+            .with_smoother(SmoothingStyle::Linear(50.0)),
 
             output_gain: FloatParam::new(
                 "Output Gain",
@@ -157,15 +224,9 @@ impl Default for NamParams {
             )
             .with_unit(" dB")
             .with_step_size(0.1)
-            .with_smoother(SmoothingStyle::Logarithmic(50.0)),
+            .with_smoother(SmoothingStyle::Linear(50.0)),
 
-            fast_mode: BoolParam::new("Fast Mode", false).with_callback(Arc::new(|val| {
-                if val {
-                    nam_core::enable_fast_tanh();
-                } else {
-                    nam_core::disable_fast_tanh();
-                }
-            })),
+            fast_mode: BoolParam::new("Fast Mode", false),
 
             model_path: Mutex::new(String::new()),
         }
@@ -173,106 +234,194 @@ impl Default for NamParams {
 }
 
 impl NamPlugin {
-    fn setup_resampler(&mut self) {
-        let model_rate = {
-            let guard = self.model.lock().expect("mutex poisoned");
-            match guard.as_ref() {
-                Some(m) => m.metadata().expected_sample_rate.unwrap_or(0.0),
-                None => 0.0,
-            }
+    fn flush_deferred_retire(&mut self) -> bool {
+        let Some(retired) = self.deferred_retire.take() else {
+            return true;
         };
-
-        let host_rate = self.sample_rate;
-
-        if model_rate <= 0.0 || (host_rate - model_rate).abs() < 0.5 {
-            self.resampler = None;
-            return;
-        }
-
-        nih_log!(
-            "Setting up resampler: host {} Hz <-> model {} Hz",
-            host_rate,
-            model_rate
-        );
-
-        match ResamplerState::new(host_rate as usize, model_rate as usize) {
-            Some(rs) => {
-                self.resampler = Some(rs);
-            }
-            None => {
-                nih_error!("Failed to create resampler");
-                self.resampler = None;
+        match self.retired_models.push(retired) {
+            Ok(()) => true,
+            Err(retired) => {
+                self.deferred_retire = Some(retired);
+                false
             }
         }
     }
 
-    /// Process with resampling: host_rate -> model_rate -> model -> model_rate -> host_rate
-    fn process_resampled(
-        rs: &mut ResamplerState,
-        model: &mut dyn nam_core::Dsp,
-        input: &[nam_core::Sample],
-        output: &mut [nam_core::Sample],
-    ) {
-        let num_samples = input.len();
+    fn install_pending_model(&mut self) {
+        if !self.flush_deferred_retire() {
+            return;
+        }
+        let Some(loaded) = self.loaded_models.pop() else {
+            return;
+        };
 
-        // 1. Push host-rate input into pending buffer
-        for &s in input {
-            rs.input_pending.push_back(s);
+        if loaded.generation != self.latest_generation.load(Ordering::Acquire) {
+            self.deferred_retire = Some(loaded);
+            self.flush_deferred_retire();
+            return;
         }
 
-        // 2. Resample host_rate -> model_rate in fixed-size chunks
-        while rs.input_pending.len() >= rs.to_model_chunk {
-            for i in 0..rs.to_model_chunk {
-                rs.to_model_scratch[0][i] = rs.input_pending.pop_front().unwrap_or(0.0);
-            }
-            if let Ok(resampled) = rs.to_model.process(&rs.to_model_scratch, None) {
-                for &s in &resampled[0] {
-                    rs.model_rate_pending.push_back(s);
-                }
-            }
+        let generation = loaded.generation;
+        if let Some(retired) = self.model.replace(loaded) {
+            self.deferred_retire = Some(retired);
+            self.flush_deferred_retire();
+        }
+        self.audio_error
+            .store(AudioProcessError::None as u8, Ordering::Release);
+        self.installed_generation
+            .store(generation, Ordering::Release);
+    }
+
+    fn process_buffer(&mut self, buffer: &mut Buffer) -> ProcessStatus {
+        let activation_mode = if self.params.fast_mode.value() {
+            nam_core::ActivationMode::Fast
+        } else {
+            nam_core::ActivationMode::Accurate
+        };
+        self.process_buffer_with_activation_mode(buffer, activation_mode)
+    }
+
+    fn process_buffer_with_activation_mode(
+        &mut self,
+        buffer: &mut Buffer,
+        activation_mode: nam_core::ActivationMode,
+    ) -> ProcessStatus {
+        let num_samples = buffer.samples();
+        if num_samples == 0 {
+            return ProcessStatus::Normal;
         }
 
-        // 3. Process all available model-rate samples through NAM
-        let model_samples = rs.model_rate_pending.len();
-        if model_samples > 0 {
-            if model_samples > rs.model_input.len() {
-                rs.model_input.resize(model_samples, 0.0);
-            }
-            if model_samples > rs.model_output.len() {
-                rs.model_output.resize(model_samples, 0.0);
-            }
-            for i in 0..model_samples {
-                rs.model_input[i] =
-                    rs.model_rate_pending.pop_front().unwrap_or(0.0) as nam_core::Sample;
-            }
+        self.install_pending_model();
+        let model = match self.model.as_mut() {
+            Some(model) => model,
+            None => return ProcessStatus::Normal,
+        };
+        model.dsp.set_activation_mode(activation_mode);
 
-            model.process(
-                &rs.model_input[..model_samples],
-                &mut rs.model_output[..model_samples],
+        let channel_data = buffer.as_slice();
+        let channel = &mut channel_data[0];
+
+        for (input, &sample) in self.input_buf[..num_samples].iter_mut().zip(channel.iter()) {
+            let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
+            *input = (sample * in_gain) as nam_core::Sample;
+        }
+
+        if let Some(resampler) = model.resampler.as_mut() {
+            if let Err(error) = resampler.process(
+                &mut *model.dsp,
+                &self.input_buf[..num_samples],
+                &mut self.output_buf[..num_samples],
+            ) {
+                resampler.reset();
+                self.output_buf[..num_samples].fill(0.0);
+                self.audio_error.store(error as u8, Ordering::Release);
+            } else {
+                self.audio_error
+                    .store(AudioProcessError::None as u8, Ordering::Release);
+            }
+        } else {
+            model.dsp.process(
+                &self.input_buf[..num_samples],
+                &mut self.output_buf[..num_samples],
             );
-
-            // 4. Push model output into model_rate_pending for back-resampling
-            //    (reuse the same deque — it was just drained)
-            for i in 0..model_samples {
-                rs.model_rate_pending.push_back(rs.model_output[i]);
-            }
+            self.audio_error
+                .store(AudioProcessError::None as u8, Ordering::Release);
         }
 
-        // 5. Resample model_rate -> host_rate in fixed-size chunks
-        while rs.model_rate_pending.len() >= rs.to_host_chunk {
-            for i in 0..rs.to_host_chunk {
-                rs.to_host_scratch[0][i] = rs.model_rate_pending.pop_front().unwrap_or(0.0);
-            }
-            if let Ok(resampled) = rs.to_host.process(&rs.to_host_scratch, None) {
-                for &s in &resampled[0] {
-                    rs.output_pending.push_back(s);
-                }
-            }
+        for (sample, &output) in channel.iter_mut().zip(&self.output_buf[..num_samples]) {
+            let out_gain = util::db_to_gain_fast(self.params.output_gain.smoothed.next());
+            *sample = nam_core::dsp::sample_to_f32(output) * out_gain;
         }
 
-        // 6. Fill output from pending output buffer
-        for sample in output.iter_mut().take(num_samples) {
-            *sample = rs.output_pending.pop_front().unwrap_or(0.0) as nam_core::Sample;
+        ProcessStatus::Normal
+    }
+}
+
+#[cfg(feature = "benchmark-internals")]
+pub mod benchmark {
+    use super::{LoadedModel, NamPlugin, ProcessStatus, ResamplerState};
+    use nih_plug::prelude::Buffer;
+    use std::sync::atomic::Ordering;
+
+    struct PassthroughDsp;
+
+    impl nam_core::Dsp for PassthroughDsp {
+        fn process(&mut self, input: &[nam_core::Sample], output: &mut [nam_core::Sample]) {
+            output[..input.len()].copy_from_slice(input);
+        }
+
+        fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {}
+
+        fn metadata(&self) -> &nam_core::dsp::DspMetadata {
+            static METADATA: nam_core::dsp::DspMetadata = nam_core::dsp::DspMetadata {
+                raw: None,
+                loudness: None,
+                gain: None,
+                expected_sample_rate: None,
+                name: None,
+                modeled_by: None,
+                gear_type: None,
+                gear_make: None,
+                gear_model: None,
+                tone_type: None,
+                input_level_dbu: None,
+                output_level_dbu: None,
+                validation_esr: None,
+            };
+            &METADATA
+        }
+    }
+
+    pub struct CallbackCase {
+        plugin: NamPlugin,
+        audio: Vec<f32>,
+    }
+
+    impl CallbackCase {
+        pub fn new(
+            host_rate: usize,
+            model_rate: usize,
+            buffer_size: usize,
+        ) -> Result<Self, rubato::ResamplerConstructionError> {
+            let resampler = if host_rate == model_rate {
+                None
+            } else {
+                Some(ResamplerState::new(host_rate, model_rate, buffer_size)?)
+            };
+            let mut plugin = NamPlugin::default();
+            plugin.model = Some(LoadedModel {
+                generation: 1,
+                dsp: Box::new(PassthroughDsp),
+                resampler,
+            });
+            plugin.latest_generation.store(1, Ordering::Release);
+            plugin.installed_generation.store(1, Ordering::Release);
+            plugin.input_buf = vec![0.0; buffer_size];
+            plugin.output_buf = vec![0.0; buffer_size];
+            plugin.sample_rate = host_rate as f64;
+            plugin.max_buffer_size = buffer_size;
+
+            let mut case = Self {
+                plugin,
+                audio: vec![0.25; buffer_size],
+            };
+            for _ in 0..4 {
+                case.process();
+            }
+            Ok(case)
+        }
+
+        pub fn process(&mut self) {
+            let mut buffer = Buffer::default();
+            // SAFETY: The temporary buffer cannot outlive `self.audio`, and its
+            // only channel contains exactly `self.audio.len()` samples.
+            unsafe {
+                buffer.set_slices(self.audio.len(), |channels| channels.push(&mut self.audio));
+            }
+            assert_eq!(
+                self.plugin.process_buffer(&mut buffer),
+                ProcessStatus::Normal
+            );
         }
     }
 }
@@ -300,27 +449,90 @@ impl Plugin for NamPlugin {
     }
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
-        let model_slot = self.model.clone();
+        let loaded_models = self.loaded_models.clone();
+        let plugin_alive = self.plugin_alive.clone();
+        let latest_generation = self.latest_generation.clone();
+        let load_status = self.load_status.clone();
         let params = self.params.clone();
         let sample_rate = self.sample_rate;
         let max_buf = self.max_buffer_size;
 
         Box::new(move |task| match task {
-            NamTask::LoadModel(path) => {
+            NamTask::LoadModel { generation, path } => {
+                if latest_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
                 nih_log!("Loading model from {:?}", path);
                 match nam_core::get_dsp(&path) {
                     Ok(mut dsp) => {
+                        dsp.set_activation_mode(if params.fast_mode.value() {
+                            nam_core::ActivationMode::Fast
+                        } else {
+                            nam_core::ActivationMode::Accurate
+                        });
                         let model_rate = dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
                         dsp.reset(model_rate, max_buf);
                         dsp.prewarm();
-                        *model_slot.lock().expect("mutex poisoned") = Some(dsp);
-                        if let Ok(mut p) = params.model_path.lock() {
-                            *p = path.to_string_lossy().to_string();
+                        let resampler = if (sample_rate - model_rate).abs() < 0.5 {
+                            None
+                        } else {
+                            match ResamplerState::new(
+                                sample_rate as usize,
+                                model_rate as usize,
+                                max_buf,
+                            ) {
+                                Ok(resampler) => Some(resampler),
+                                Err(error) => {
+                                    let message = format!(
+                                        "Could not resample from {sample_rate:.0} Hz to {model_rate:.0} Hz: {error}"
+                                    );
+                                    nih_error!("{message}");
+                                    mark_load_failed(
+                                        &load_status,
+                                        &latest_generation,
+                                        generation,
+                                        path,
+                                        message,
+                                    );
+                                    return;
+                                }
+                            }
+                        };
+                        let mut loaded = LoadedModel {
+                            generation,
+                            dsp,
+                            resampler,
+                        };
+                        loop {
+                            if !plugin_alive.load(Ordering::Acquire)
+                                || latest_generation.load(Ordering::Acquire) != generation
+                            {
+                                return;
+                            }
+                            match loaded_models.push(loaded) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    loaded = returned;
+                                    if let Some(obsolete) = loaded_models.pop() {
+                                        drop(obsolete);
+                                    } else {
+                                        thread::yield_now();
+                                    }
+                                }
+                            }
                         }
                         nih_log!("Model loaded successfully");
                     }
-                    Err(e) => {
-                        nih_error!("Failed to load model: {}", e);
+                    Err(error) => {
+                        let message = format!("Failed to load model: {error}");
+                        nih_error!("{message}");
+                        mark_load_failed(
+                            &load_status,
+                            &latest_generation,
+                            generation,
+                            path,
+                            message,
+                        );
                     }
                 }
             }
@@ -329,13 +541,16 @@ impl Plugin for NamPlugin {
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
-        let model_slot = self.model.clone();
+        let latest_generation = self.latest_generation.clone();
+        let installed_generation = self.installed_generation.clone();
+        let load_status = self.load_status.clone();
+        let audio_error = self.audio_error.clone();
 
         create_egui_editor(
             self.params.editor_state.clone(),
-            GuiState::default(),
+            GuiState,
             |_, _| {},
-            move |egui_ctx, setter, state| {
+            move |egui_ctx, setter, _state| {
                 let egui_state = params.editor_state.clone();
 
                 ResizableWindow::new("nam-editor")
@@ -350,16 +565,23 @@ impl Plugin for NamPlugin {
                                     .add_filter("NAM Model", &["nam"])
                                     .pick_file()
                                 {
-                                    state.model_name = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default();
-                                    state.status = "Loading...".to_string();
-                                    async_executor.execute_background(NamTask::LoadModel(path));
+                                    let generation =
+                                        latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                                    *load_status
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                        ModelLoadStatus::Loading {
+                                            generation,
+                                            path: path.clone(),
+                                        };
+                                    async_executor.execute_background(NamTask::LoadModel {
+                                        generation,
+                                        path,
+                                    });
                                 }
                             }
 
-                            if model_slot.lock().expect("mutex poisoned").is_some() {
+                            if installed_generation.load(Ordering::Acquire) != 0 {
                                 ui.label(
                                     egui::RichText::new("●")
                                         .color(egui::Color32::GREEN)
@@ -374,16 +596,58 @@ impl Plugin for NamPlugin {
                             }
                         });
 
-                        if state.model_name.is_empty() {
-                            ui.label("No model loaded");
-                        } else {
-                            ui.label(&state.model_name);
+                        let installed = installed_generation.load(Ordering::Acquire);
+                        let mut status = load_status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let ready = match &*status {
+                            ModelLoadStatus::Loading { generation, path }
+                                if *generation == installed =>
+                            {
+                                Some((*generation, path.clone()))
+                            }
+                            _ => None,
+                        };
+                        if let Some((generation, path)) = ready {
+                            *params
+                                .model_path
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                path.to_string_lossy().to_string();
+                            *status = ModelLoadStatus::Ready { generation, path };
                         }
+                        match &*status {
+                            ModelLoadStatus::Empty => {
+                                ui.label("No model loaded");
+                            }
+                            ModelLoadStatus::Loading { path, .. } => {
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                                ui.label("Loading...");
+                            }
+                            ModelLoadStatus::Ready { generation, path } => {
+                                debug_assert_eq!(*generation, installed);
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                                ui.label("Ready");
+                            }
+                            ModelLoadStatus::Failed {
+                                generation,
+                                path,
+                                message,
+                            } => {
+                                debug_assert_eq!(
+                                    *generation,
+                                    latest_generation.load(Ordering::Acquire)
+                                );
+                                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                                ui.colored_label(egui::Color32::RED, message);
+                            }
+                        }
+                        drop(status);
 
-                        if model_slot.lock().expect("mutex poisoned").is_some()
-                            && state.status == "Loading..."
-                        {
-                            state.status = "Ready".to_string();
+                        let process_error =
+                            AudioProcessError::from_raw(audio_error.load(Ordering::Acquire));
+                        if process_error != AudioProcessError::None {
+                            ui.colored_label(egui::Color32::RED, process_error.message());
                         }
 
                         ui.separator();
@@ -426,31 +690,36 @@ impl Plugin for NamPlugin {
             .params
             .model_path
             .lock()
-            .expect("mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !path.is_empty() && self.model.lock().expect("mutex poisoned").is_none() {
-            context.execute(NamTask::LoadModel(PathBuf::from(path)));
+        if !path.is_empty() && self.model.is_none() {
+            let path = PathBuf::from(path);
+            let generation = self.latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            *self
+                .load_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = ModelLoadStatus::Loading {
+                generation,
+                path: path.clone(),
+            };
+            context.execute(NamTask::LoadModel { generation, path });
         }
-
-        self.setup_resampler();
 
         true
     }
 
     fn reset(&mut self) {
-        if let Ok(mut model) = self.model.lock() {
-            if let Some(ref mut m) = *model {
-                let model_rate = m
-                    .metadata()
-                    .expected_sample_rate
-                    .unwrap_or(self.sample_rate);
-                m.reset(model_rate, self.max_buffer_size);
-                m.prewarm();
+        if let Some(model) = self.model.as_mut() {
+            let model_rate = model
+                .dsp
+                .metadata()
+                .expected_sample_rate
+                .unwrap_or(self.sample_rate);
+            model.dsp.reset(model_rate, self.max_buffer_size);
+            model.dsp.prewarm();
+            if let Some(resampler) = model.resampler.as_mut() {
+                resampler.reset();
             }
-        }
-        self.setup_resampler();
-        if let Some(ref mut rs) = self.resampler {
-            rs.reset();
         }
     }
 
@@ -460,46 +729,13 @@ impl Plugin for NamPlugin {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let num_samples = buffer.samples();
-        if num_samples == 0 {
-            return ProcessStatus::Normal;
-        }
+        self.process_buffer(buffer)
+    }
+}
 
-        let mut model_guard = self.model.lock().expect("mutex poisoned");
-        let model = match model_guard.as_mut() {
-            Some(m) => m,
-            None => return ProcessStatus::Normal,
-        };
-
-        let channel_data = buffer.as_slice();
-        let channel = &mut channel_data[0];
-
-        let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
-        for i in 0..num_samples {
-            self.input_buf[i] = (channel[i] * in_gain) as nam_core::Sample;
-        }
-
-        if let Some(ref mut rs) = self.resampler {
-            let input_copy: Vec<nam_core::Sample> = self.input_buf[..num_samples].to_vec();
-            Self::process_resampled(
-                rs,
-                &mut **model,
-                &input_copy,
-                &mut self.output_buf[..num_samples],
-            );
-        } else {
-            model.process(
-                &self.input_buf[..num_samples],
-                &mut self.output_buf[..num_samples],
-            );
-        }
-
-        let out_gain = util::db_to_gain_fast(self.params.output_gain.smoothed.next());
-        for i in 0..num_samples {
-            channel[i] = (self.output_buf[i] as f32) * out_gain;
-        }
-
-        ProcessStatus::Normal
+impl Drop for NamPlugin {
+    fn drop(&mut self) {
+        self.plugin_alive.store(false, Ordering::Release);
     }
 }
 
@@ -557,9 +793,142 @@ mod tests {
         }
     }
 
+    struct ActivationModeProbe {
+        mode: nam_core::ActivationMode,
+    }
+
+    impl nam_core::Dsp for ActivationModeProbe {
+        fn process(&mut self, input: &[nam_core::Sample], output: &mut [nam_core::Sample]) {
+            let value = if self.mode == nam_core::ActivationMode::Fast {
+                1.0
+            } else {
+                -1.0
+            };
+            output[..input.len()].fill(value);
+        }
+
+        fn reset(&mut self, _sample_rate: f64, _max_buffer_size: usize) {}
+
+        fn metadata(&self) -> &nam_core::dsp::DspMetadata {
+            static META: nam_core::dsp::DspMetadata = nam_core::dsp::DspMetadata {
+                raw: None,
+                loudness: None,
+                gain: None,
+                expected_sample_rate: None,
+                name: None,
+                modeled_by: None,
+                gear_type: None,
+                gear_make: None,
+                gear_model: None,
+                tone_type: None,
+                input_level_dbu: None,
+                output_level_dbu: None,
+                validation_esr: None,
+            };
+            &META
+        }
+
+        fn set_activation_mode(&mut self, mode: nam_core::ActivationMode) {
+            self.mode = mode;
+        }
+    }
+
+    fn loaded_model(generation: u64) -> LoadedModel {
+        LoadedModel {
+            generation,
+            dsp: Box::new(PassthroughDsp),
+            resampler: None,
+        }
+    }
+
+    fn mono_buffer(samples: &mut [f32]) -> Buffer<'_> {
+        let mut buffer = Buffer::default();
+        // SAFETY: The buffer does not outlive `samples`, and every channel has `samples.len()`
+        // elements.
+        unsafe {
+            buffer.set_slices(samples.len(), |channels| channels.push(samples));
+        }
+        buffer
+    }
+
+    fn plugin_with_passthrough_model(buffer_size: usize) -> NamPlugin {
+        let mut plugin = NamPlugin::default();
+        plugin.model = Some(loaded_model(1));
+        plugin.latest_generation.store(1, Ordering::Release);
+        plugin.installed_generation.store(1, Ordering::Release);
+        plugin.input_buf = vec![0.0; buffer_size];
+        plugin.output_buf = vec![0.0; buffer_size];
+        plugin.max_buffer_size = buffer_size;
+        plugin
+    }
+
+    fn plugin_with_resampled_passthrough_model(
+        host_rate: usize,
+        model_rate: usize,
+        buffer_size: usize,
+    ) -> NamPlugin {
+        let mut plugin = plugin_with_passthrough_model(buffer_size);
+        if let Some(model) = plugin.model.as_mut() {
+            model.resampler =
+                Some(ResamplerState::new(host_rate, model_rate, buffer_size).unwrap());
+        }
+        plugin.sample_rate = host_rate as f64;
+        plugin
+    }
+
+    #[test]
+    fn resampler_rejects_invalid_sample_rates() {
+        assert!(ResamplerState::new(0, 48000, 4096).is_err());
+        assert!(ResamplerState::new(48000, 0, 4096).is_err());
+    }
+
+    #[test]
+    fn oversized_audio_is_reported_without_growing_buffers() {
+        let mut resampler = ResamplerState::new(44100, 48000, 64).unwrap();
+        let capacity = resampler.input_pending.capacity();
+        let input = vec![0.0; capacity + 1];
+        let mut output = vec![0.0; input.len()];
+
+        assert_eq!(
+            resampler.process(&mut PassthroughDsp, &input, &mut output),
+            Err(AudioProcessError::InputCapacity)
+        );
+        assert_eq!(resampler.input_pending.capacity(), capacity);
+    }
+
+    #[test]
+    fn model_installation_rejects_stale_generations() {
+        let mut plugin = NamPlugin::default();
+        plugin.latest_generation.store(2, Ordering::Release);
+        assert!(plugin.loaded_models.push(loaded_model(1)).is_ok());
+        plugin.install_pending_model();
+        assert!(plugin.model.is_none());
+
+        assert!(plugin.loaded_models.push(loaded_model(2)).is_ok());
+        plugin.install_pending_model();
+        assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn saturated_retirement_queue_defers_drop() {
+        let mut plugin = NamPlugin::default();
+        plugin.retired_models = Arc::new(ArrayQueue::new(1));
+        assert!(plugin.retired_models.push(loaded_model(1)).is_ok());
+        plugin.deferred_retire = Some(loaded_model(2));
+
+        assert!(!plugin.flush_deferred_retire());
+        assert_eq!(
+            plugin
+                .deferred_retire
+                .as_ref()
+                .map(|model| model.generation),
+            Some(2)
+        );
+    }
+
     #[test]
     fn test_process_resampled_produces_output() {
-        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut rs = ResamplerState::new(44100, 48000, 4096).unwrap();
         let mut model = PassthroughDsp;
 
         // Feed enough samples to produce output (need multiple chunks)
@@ -567,7 +936,7 @@ mod tests {
         let input = vec![0.5 as nam_core::Sample; num_samples];
         let mut output = vec![0.0 as nam_core::Sample; num_samples];
 
-        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+        rs.process(&mut model, &input, &mut output).unwrap();
 
         // After enough samples, output should have data
         // (first few calls may produce zeros due to resampler latency)
@@ -581,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_process_resampled_multiple_calls() {
-        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut rs = ResamplerState::new(44100, 48000, 4096).unwrap();
         let mut model = PassthroughDsp;
 
         // Simulate multiple process() calls with varying buffer sizes (like a real DAW)
@@ -591,7 +960,7 @@ mod tests {
         for &size in &buffer_sizes {
             let input = vec![0.3 as nam_core::Sample; size];
             let mut output = vec![0.0 as nam_core::Sample; size];
-            NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+            rs.process(&mut model, &input, &mut output).unwrap();
             total_nonzero += output.iter().filter(|&&x| x != 0.0).count();
         }
 
@@ -603,21 +972,26 @@ mod tests {
 
     #[test]
     fn test_process_resampled_preserves_signal_level() {
-        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut rs = ResamplerState::new(44100, 48000, 4096).unwrap();
         let mut model = PassthroughDsp;
 
         // Feed a constant signal — after resampler settles, output should be ~same level
         let settle = vec![0.5 as nam_core::Sample; 4096]; // let resampler settle
         let mut discard = vec![0.0 as nam_core::Sample; 4096];
-        NamPlugin::process_resampled(&mut rs, &mut model, &settle, &mut discard);
+        rs.process(&mut model, &settle, &mut discard).unwrap();
 
         let input = vec![0.5 as nam_core::Sample; 2048];
         let mut output = vec![0.0 as nam_core::Sample; 2048];
-        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+        rs.process(&mut model, &input, &mut output).unwrap();
 
         // Check the latter half (fully settled)
         let tail = &output[1024..];
-        let mean: f64 = tail.iter().copied().sum::<f64>() / tail.len() as f64;
+        let mean: f64 = tail
+            .iter()
+            .copied()
+            .map(nam_core::dsp::sample_to_f64)
+            .sum::<f64>()
+            / tail.len() as f64;
         assert!(
             (mean - 0.5).abs() < 0.05,
             "Mean output {:.4} should be close to input 0.5 after settling",
@@ -627,13 +1001,13 @@ mod tests {
 
     #[test]
     fn test_resampler_reset_clears_state() {
-        let mut rs = ResamplerState::new(44100, 48000).unwrap();
+        let mut rs = ResamplerState::new(44100, 48000, 4096).unwrap();
         let mut model = PassthroughDsp;
 
         // Feed some data
         let input = vec![1.0 as nam_core::Sample; 512];
         let mut output = vec![0.0 as nam_core::Sample; 512];
-        NamPlugin::process_resampled(&mut rs, &mut model, &input, &mut output);
+        rs.process(&mut model, &input, &mut output).unwrap();
 
         assert!(
             !rs.input_pending.is_empty() || !rs.output_pending.is_empty(),
@@ -644,5 +1018,269 @@ mod tests {
         rs.reset();
         assert!(rs.input_pending.is_empty());
         assert!(rs.output_pending.is_empty());
+    }
+
+    #[test]
+    fn process_resampled_keeps_all_buffer_capacities_stable() {
+        let mut rs = ResamplerState::new(44100, 48000, 4096).unwrap();
+        let capacities = (
+            rs.input_pending.capacity(),
+            rs.model_rate_pending.capacity(),
+            rs.output_pending.capacity(),
+            rs.model_input.capacity(),
+            rs.model_output.capacity(),
+        );
+        let mut model = PassthroughDsp;
+        let input = vec![0.25; 4096];
+        let mut output = vec![0.0; 4096];
+
+        for _ in 0..16 {
+            rs.process(&mut model, &input, &mut output).unwrap();
+        }
+
+        assert_eq!(
+            capacities,
+            (
+                rs.input_pending.capacity(),
+                rs.model_rate_pending.capacity(),
+                rs.output_pending.capacity(),
+                rs.model_input.capacity(),
+                rs.model_output.capacity(),
+            )
+        );
+    }
+
+    #[test]
+    fn steady_state_resampling_does_not_allocate() {
+        let mut resampler = ResamplerState::new(44100, 48000, 4096).unwrap();
+        let mut model = PassthroughDsp;
+        let input = vec![0.25; 4096];
+        let mut output = vec![0.0; 4096];
+
+        for _ in 0..4 {
+            resampler.process(&mut model, &input, &mut output).unwrap();
+        }
+        let (result, allocations) = allocation_tracking::count_allocations(|| {
+            resampler.process(&mut model, &input, &mut output)
+        });
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(allocations, 0, "steady-state audio processing allocated");
+    }
+
+    #[test]
+    fn complete_steady_state_callback_does_not_allocate() {
+        let buffer_size = 128;
+        let mut plugin = plugin_with_passthrough_model(buffer_size);
+        let mut audio = vec![0.25f32; buffer_size];
+        let mut buffer = mono_buffer(&mut audio);
+        for _ in 0..4 {
+            assert_eq!(plugin.process_buffer(&mut buffer), ProcessStatus::Normal);
+        }
+
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(allocations, 0, "the complete audio callback allocated");
+    }
+
+    #[test]
+    fn plugin_instances_keep_independent_activation_modes() {
+        fn probe_plugin() -> NamPlugin {
+            let mut plugin = plugin_with_passthrough_model(1);
+            plugin.model = Some(LoadedModel {
+                generation: 1,
+                dsp: Box::new(ActivationModeProbe {
+                    mode: nam_core::ActivationMode::Accurate,
+                }),
+                resampler: None,
+            });
+            plugin
+        }
+
+        let mut accurate = probe_plugin();
+        let mut fast = probe_plugin();
+        let mut accurate_sample = [0.0];
+        let mut fast_sample = [0.0];
+
+        assert_eq!(
+            accurate.process_buffer_with_activation_mode(
+                &mut mono_buffer(&mut accurate_sample),
+                nam_core::ActivationMode::Accurate,
+            ),
+            ProcessStatus::Normal
+        );
+        assert_eq!(
+            fast.process_buffer_with_activation_mode(
+                &mut mono_buffer(&mut fast_sample),
+                nam_core::ActivationMode::Fast,
+            ),
+            ProcessStatus::Normal
+        );
+        assert_eq!(accurate_sample, [-1.0]);
+        assert_eq!(fast_sample, [1.0]);
+
+        accurate_sample[0] = 0.0;
+        accurate.process_buffer_with_activation_mode(
+            &mut mono_buffer(&mut accurate_sample),
+            nam_core::ActivationMode::Accurate,
+        );
+        assert_eq!(accurate_sample, [-1.0]);
+    }
+
+    #[test]
+    fn gain_smoothing_is_block_partition_invariant_and_allocation_free() {
+        fn render(block_size: usize) -> Vec<f32> {
+            const TOTAL_SAMPLES: usize = 16_384;
+            const MAX_BUFFER_SIZE: usize = 4096;
+
+            let mut plugin = plugin_with_passthrough_model(MAX_BUFFER_SIZE);
+            plugin.params.input_gain.smoothed.reset(0.0);
+            plugin.params.output_gain.smoothed.reset(0.0);
+            plugin.params.input_gain.smoothed.set_target(48_000.0, 12.0);
+            plugin
+                .params
+                .output_gain
+                .smoothed
+                .set_target(48_000.0, -6.0);
+
+            let mut rendered = Vec::with_capacity(TOTAL_SAMPLES);
+            while rendered.len() < TOTAL_SAMPLES {
+                let count = block_size.min(TOTAL_SAMPLES - rendered.len());
+                let mut audio = vec![1.0f32; count];
+                let mut buffer = mono_buffer(&mut audio);
+                let (status, allocations) =
+                    allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+                assert_eq!(status, ProcessStatus::Normal);
+                assert_eq!(
+                    allocations, 0,
+                    "gain-smoothed callback allocated for {block_size}-sample blocks"
+                );
+                rendered.extend(audio);
+            }
+            rendered
+        }
+
+        let reference = render(16);
+        for block_size in [64, 257, 4096] {
+            let candidate = render(block_size);
+            assert_eq!(candidate.len(), reference.len());
+            for (index, (actual, expected)) in candidate.iter().zip(&reference).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= f32::EPSILON,
+                    "block size {block_size} diverged at sample {index}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn complete_resampling_callback_handles_rate_and_block_size_matrix_without_allocating() {
+        const MAX_BUFFER_SIZE: usize = 4096;
+        for (host_rate, model_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            let mut plugin =
+                plugin_with_resampled_passthrough_model(host_rate, model_rate, MAX_BUFFER_SIZE);
+            for buffer_size in [16, 64, 257, MAX_BUFFER_SIZE] {
+                let mut audio = vec![0.25f32; buffer_size];
+                let mut buffer = mono_buffer(&mut audio);
+                let (status, allocations) =
+                    allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+                assert_eq!(status, ProcessStatus::Normal);
+                assert_eq!(
+                    allocations, 0,
+                    "{host_rate} to {model_rate} Hz callback allocated for {buffer_size} samples"
+                );
+                assert_eq!(
+                    AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+                    AudioProcessError::None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn callback_defers_saturated_retirement_without_allocating_or_losing_models() {
+        let buffer_size = 64;
+        let mut plugin = plugin_with_passthrough_model(buffer_size);
+        plugin.retired_models = Arc::new(ArrayQueue::new(1));
+        assert!(plugin.retired_models.push(loaded_model(99)).is_ok());
+        plugin.latest_generation.store(2, Ordering::Release);
+        assert!(plugin.loaded_models.push(loaded_model(2)).is_ok());
+
+        let mut audio = vec![0.25f32; buffer_size];
+        let mut buffer = mono_buffer(&mut audio);
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(allocations, 0);
+        assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 2);
+        assert_eq!(
+            plugin
+                .deferred_retire
+                .as_ref()
+                .map(|model| model.generation),
+            Some(1)
+        );
+
+        plugin.latest_generation.store(3, Ordering::Release);
+        assert!(plugin.loaded_models.push(loaded_model(3)).is_ok());
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(allocations, 0);
+        assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 2);
+        assert_eq!(plugin.loaded_models.len(), 1);
+
+        assert_eq!(
+            plugin.retired_models.pop().map(|model| model.generation),
+            Some(99)
+        );
+        assert_eq!(plugin.process_buffer(&mut buffer), ProcessStatus::Normal);
+        assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 3);
+        assert_eq!(
+            plugin
+                .deferred_retire
+                .as_ref()
+                .map(|model| model.generation),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn callback_installs_models_from_a_synchronized_concurrent_loader() {
+        let buffer_size = 64;
+        let mut plugin = plugin_with_passthrough_model(buffer_size);
+        let loaded_models = Arc::clone(&plugin.loaded_models);
+        let latest_generation = Arc::clone(&plugin.latest_generation);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (installed_tx, installed_rx) = std::sync::mpsc::sync_channel(0);
+        let producer = std::thread::spawn(move || {
+            for generation in 2..=32 {
+                latest_generation.store(generation, Ordering::Release);
+                assert!(loaded_models.push(loaded_model(generation)).is_ok());
+                ready_tx.send(generation).unwrap();
+                assert_eq!(installed_rx.recv().unwrap(), generation);
+            }
+        });
+
+        let mut audio = vec![0.25f32; buffer_size];
+        let mut buffer = mono_buffer(&mut audio);
+        for expected_generation in 2..=32 {
+            assert_eq!(ready_rx.recv().unwrap(), expected_generation);
+            let (status, allocations) =
+                allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+            assert_eq!(status, ProcessStatus::Normal);
+            assert_eq!(allocations, 0);
+            assert_eq!(
+                plugin.installed_generation.load(Ordering::Acquire),
+                expected_generation
+            );
+            assert!(installed_tx.send(expected_generation).is_ok());
+            let _ = plugin.retired_models.pop();
+        }
+
+        producer.join().unwrap();
+        assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 32);
     }
 }

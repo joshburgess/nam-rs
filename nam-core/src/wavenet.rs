@@ -1,77 +1,11 @@
 use crate::activations::Activation;
-use crate::dsp::{Dsp, DspMetadata, Sample};
+use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
 use crate::util::WeightIter;
 
-/// Use matrixmultiply::sgemm for matrices at or above this size (out_ch * in_ch).
-/// Below this threshold, use the hand-written dot-product loop which preserves
-/// exact floating-point order for bit-identical results on small models.
-const SGEMM_MIN_SIZE: usize = 64;
+mod matrix_backend;
 
-/// Column-major GEMM: C = alpha * A @ B + beta * C
-/// A is (m x k), B is (k x n), C is (m x n), all column-major.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-unsafe fn sgemm_colmajor(
-    m: usize,
-    k: usize,
-    n: usize,
-    alpha: f32,
-    a: *const f32,
-    b: *const f32,
-    b_col_stride: isize,
-    beta: f32,
-    c: *mut f32,
-) {
-    #[cfg(feature = "faer")]
-    {
-        // Construct faer matrix views from raw col-major pointers.
-        // A is (m x k) col-major with stride m, B is (k x n) with given stride, C is (m x n).
-        let a_slice = core::slice::from_raw_parts(a, m * k);
-        let b_slice = core::slice::from_raw_parts(b, (b_col_stride as usize) * n);
-        let c_slice = core::slice::from_raw_parts_mut(c, m * n);
-
-        let a_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(a_slice, m, k);
-        let b_mat = faer::mat::from_column_major_slice::<f32, usize, usize>(
-            b_slice,
-            b_col_stride as usize,
-            n,
-        );
-        // B may have stride > k (when input buffer has extra rows). Use only top k rows.
-        let b_mat = b_mat.subrows(0, k);
-        let c_mat = faer::mat::from_column_major_slice_mut::<f32, usize, usize>(c_slice, m, n);
-
-        // C = beta*C + alpha*A*B
-        faer::linalg::matmul::matmul(
-            c_mat,
-            a_mat,
-            b_mat,
-            Some(beta), // scale existing C
-            alpha,      // scale A*B
-            faer::Parallelism::None,
-        );
-    }
-
-    #[cfg(not(feature = "faer"))]
-    {
-        matrixmultiply::sgemm(
-            m,
-            k,
-            n,
-            alpha,
-            a,
-            1,
-            m as isize, // A: col-major
-            b,
-            1,
-            b_col_stride, // B: col-major with given stride
-            beta,
-            c,
-            1,
-            m as isize, // C: col-major
-        );
-    }
-}
+use matrix_backend::{sgemm_colmajor, SGEMM_MIN_SIZE};
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
 
@@ -340,19 +274,17 @@ impl Conv1x1 {
             } else {
                 self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-            unsafe {
-                sgemm_colmajor(
-                    out_ch,
-                    in_ch,
-                    num_frames,
-                    1.0,
-                    self.weight_colmajor.as_ptr(),
-                    input.data.as_ptr(),
-                    input.rows as isize,
-                    1.0,
-                    self.output_buf.data.as_mut_ptr(),
-                );
-            }
+            sgemm_colmajor(
+                out_ch,
+                in_ch,
+                num_frames,
+                1.0,
+                &self.weight_colmajor,
+                &input.data,
+                input.rows,
+                1.0,
+                &mut self.output_buf.data,
+            );
         } else {
             // Small matrix: specialized paths for common sizes, with fused bias
             self.process_block_small_gemm(&input.data, input.rows, num_frames);
@@ -380,19 +312,17 @@ impl Conv1x1 {
             } else {
                 self.output_buf.data[..out_ch * num_frames].fill(0.0);
             }
-            unsafe {
-                sgemm_colmajor(
-                    out_ch,
-                    in_ch,
-                    num_frames,
-                    1.0,
-                    self.weight_colmajor.as_ptr(),
-                    input_data.as_ptr(),
-                    input_stride as isize,
-                    1.0,
-                    self.output_buf.data.as_mut_ptr(),
-                );
-            }
+            sgemm_colmajor(
+                out_ch,
+                in_ch,
+                num_frames,
+                1.0,
+                &self.weight_colmajor,
+                input_data,
+                input_stride,
+                1.0,
+                &mut self.output_buf.data,
+            );
         } else {
             self.process_block_small_gemm(input_data, input_stride, num_frames);
         }
@@ -416,22 +346,16 @@ impl Conv1x1 {
         // Fast-kernels: route all sizes through C for -ffast-math vectorization
         #[cfg(feature = "fast-kernels")]
         {
-            let bias_ptr = match bias {
-                Some(ref b) => b.as_ptr(),
-                None => core::ptr::null(),
-            };
-            unsafe {
-                crate::fast_kernels::fast_conv1x1_small(
-                    out.as_mut_ptr(),
-                    w.as_ptr(),
-                    input_data.as_ptr(),
-                    bias_ptr,
-                    out_ch,
-                    in_ch,
-                    input_stride,
-                    num_frames,
-                );
-            }
+            crate::fast_kernels::conv1x1_small(
+                out,
+                w,
+                input_data,
+                bias.as_deref(),
+                out_ch,
+                in_ch,
+                input_stride,
+                num_frames,
+            );
             // Return early so the non-fast-kernels fallback below is skipped
             #[allow(clippy::needless_return, unreachable_code)]
             return;
@@ -737,40 +661,36 @@ impl Conv1d {
         // Fast-kernels path: single C FFI call for the entire Conv1d
         #[cfg(feature = "fast-kernels")]
         {
-            // Build tap pointer array
-            let tap_ptrs: Vec<*const f32> = (0..ks)
+            let tap_slices: Vec<&[f32]> = (0..ks)
                 .map(|k| {
                     let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
                     let lookback = (-offset_signed) as usize;
-                    self.input_buffer.read_ptr(num_frames, lookback).as_ptr()
+                    self.input_buffer.read_ptr(num_frames, lookback)
                 })
                 .collect();
-
             let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
             match &self.weights {
-                Conv1dWeights::Depthwise(_) => unsafe {
-                    crate::fast_kernels::fast_conv1d_depthwise(
-                        self.output_buf.data.as_mut_ptr(),
-                        tap_ptrs.as_ptr(),
-                        self.flat_weights.as_ptr(),
-                        self.bias.as_ptr(),
+                Conv1dWeights::Depthwise(_) => {
+                    crate::fast_kernels::conv1d_depthwise(
+                        &mut self.output_buf.data,
+                        &tap_slices,
+                        &self.flat_weights,
+                        &self.bias,
                         out_ch,
-                        ks,
                         num_frames,
                     );
-                },
-                Conv1dWeights::General(_) if !use_sgemm => unsafe {
-                    crate::fast_kernels::fast_conv1d_small_gemv(
-                        self.output_buf.data.as_mut_ptr(),
-                        tap_ptrs.as_ptr(),
-                        self.flat_weights.as_ptr(),
-                        self.bias.as_ptr(),
+                }
+                Conv1dWeights::General(_) if !use_sgemm => {
+                    crate::fast_kernels::conv1d_small_gemv(
+                        &mut self.output_buf.data,
+                        &tap_slices,
+                        &self.flat_weights,
+                        &self.bias,
                         out_ch,
                         in_ch,
-                        ks,
                         num_frames,
                     );
-                },
+                }
                 Conv1dWeights::General(weights_colmajor) => {
                     // Large matrix: initialize with bias, then accumulate via sgemm
                     for f in 0..num_frames {
@@ -779,19 +699,17 @@ impl Conv1d {
                     }
                     for k in 0..ks {
                         let w = &weights_colmajor[k];
-                        unsafe {
-                            sgemm_colmajor(
-                                out_ch,
-                                in_ch,
-                                num_frames,
-                                1.0,
-                                w.as_ptr(),
-                                tap_ptrs[k],
-                                in_ch as isize,
-                                1.0,
-                                self.output_buf.data.as_mut_ptr(),
-                            );
-                        }
+                        sgemm_colmajor(
+                            out_ch,
+                            in_ch,
+                            num_frames,
+                            1.0,
+                            w,
+                            tap_slices[k],
+                            in_ch,
+                            1.0,
+                            &mut self.output_buf.data,
+                        );
                     }
                 }
             }
@@ -857,19 +775,17 @@ impl Conv1d {
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
 
                     if use_sgemm {
-                        unsafe {
-                            sgemm_colmajor(
-                                out_ch,
-                                in_ch,
-                                num_frames,
-                                1.0,
-                                w.as_ptr(),
-                                tap_data.as_ptr(),
-                                in_ch as isize,
-                                1.0,
-                                self.output_buf.data.as_mut_ptr(),
-                            );
-                        }
+                        sgemm_colmajor(
+                            out_ch,
+                            in_ch,
+                            num_frames,
+                            1.0,
+                            w,
+                            tap_data,
+                            in_ch,
+                            1.0,
+                            &mut self.output_buf.data,
+                        );
                     } else {
                         for f in 0..num_frames {
                             let in_col_start = f * in_ch;
@@ -968,30 +884,28 @@ impl FiLM {
 
         #[cfg(feature = "fast-kernels")]
         {
-            unsafe {
-                if self.do_shift {
-                    crate::fast_kernels::fast_film_scale_shift(
-                        self.output_buf.data.as_mut_ptr(),
-                        input_data.as_ptr(),
-                        scale_shift.data.as_ptr(),
-                        dim,
-                        input_stride,
-                        dim,
-                        ss_rows,
-                        num_frames,
-                    );
-                } else {
-                    crate::fast_kernels::fast_film_scale(
-                        self.output_buf.data.as_mut_ptr(),
-                        input_data.as_ptr(),
-                        scale_shift.data.as_ptr(),
-                        dim,
-                        input_stride,
-                        dim,
-                        ss_rows,
-                        num_frames,
-                    );
-                }
+            if self.do_shift {
+                crate::fast_kernels::film_scale_shift(
+                    &mut self.output_buf.data,
+                    input_data,
+                    &scale_shift.data,
+                    dim,
+                    input_stride,
+                    dim,
+                    ss_rows,
+                    num_frames,
+                );
+            } else {
+                crate::fast_kernels::film_scale(
+                    &mut self.output_buf.data,
+                    input_data,
+                    &scale_shift.data,
+                    dim,
+                    input_stride,
+                    dim,
+                    ss_rows,
+                    num_frames,
+                );
             }
             // Return early so the non-fast-kernels fallback below is skipped
             #[allow(clippy::needless_return, unreachable_code)]
@@ -1065,26 +979,24 @@ impl FiLM {
 
         #[cfg(feature = "fast-kernels")]
         {
-            unsafe {
-                if self.do_shift {
-                    crate::fast_kernels::fast_film_inplace_scale_shift(
-                        target_data.as_mut_ptr(),
-                        scale_shift.data.as_ptr(),
-                        dim,
-                        target_stride,
-                        ss_rows,
-                        num_frames,
-                    );
-                } else {
-                    crate::fast_kernels::fast_film_inplace_scale(
-                        target_data.as_mut_ptr(),
-                        scale_shift.data.as_ptr(),
-                        dim,
-                        target_stride,
-                        ss_rows,
-                        num_frames,
-                    );
-                }
+            if self.do_shift {
+                crate::fast_kernels::film_inplace_scale_shift(
+                    target_data,
+                    &scale_shift.data,
+                    dim,
+                    target_stride,
+                    ss_rows,
+                    num_frames,
+                );
+            } else {
+                crate::fast_kernels::film_inplace_scale(
+                    target_data,
+                    &scale_shift.data,
+                    dim,
+                    target_stride,
+                    ss_rows,
+                    num_frames,
+                );
             }
             // Return early so the non-fast-kernels fallback below is skipped
             #[allow(clippy::needless_return, unreachable_code)]
@@ -1409,6 +1321,7 @@ impl WaveNetLayer {
         condition: &ColMajorMatrix,
         num_frames: usize,
         active_channels: Option<usize>,
+        use_fast_tanh: bool,
     ) {
         let bottleneck = self.bottleneck;
         let z_rows = self.conv.out_channels; // 2*bottleneck when gated, bottleneck when not
@@ -1465,16 +1378,13 @@ impl WaveNetLayer {
             && self.gating_mode == GatingMode::None
             && matches!(self.activation, Activation::Tanh)
         {
-            let use_fast = crate::util::is_fast_tanh_enabled();
-            unsafe {
-                crate::fast_kernels::fast_add_activate(
-                    self.z_buf.data.as_mut_ptr(),
-                    self.conv.output_buf.data.as_ptr(),
-                    self.input_mixin.output_buf.data.as_ptr(),
-                    z_len,
-                    use_fast as i32,
-                );
-            }
+            crate::fast_kernels::add_activate(
+                &mut self.z_buf.data,
+                &self.conv.output_buf.data,
+                &self.input_mixin.output_buf.data,
+                z_len,
+                use_fast_tanh,
+            );
             true
         } else {
             false
@@ -1485,14 +1395,12 @@ impl WaveNetLayer {
 
         if !did_fused_add_activate {
             #[cfg(feature = "fast-kernels")]
-            unsafe {
-                crate::fast_kernels::fast_vec_add(
-                    self.z_buf.data.as_mut_ptr(),
-                    self.conv.output_buf.data.as_ptr(),
-                    self.input_mixin.output_buf.data.as_ptr(),
-                    z_len,
-                );
-            }
+            crate::fast_kernels::vec_add(
+                &mut self.z_buf.data,
+                &self.conv.output_buf.data,
+                &self.input_mixin.output_buf.data,
+                z_len,
+            );
             #[cfg(not(feature = "fast-kernels"))]
             for i in 0..z_len {
                 self.z_buf.data[i] =
@@ -1517,6 +1425,7 @@ impl WaveNetLayer {
                         &mut self.z_buf.data,
                         bottleneck,
                         num_frames,
+                        use_fast_tanh,
                     );
                 }
 
@@ -1546,19 +1455,18 @@ impl WaveNetLayer {
             GatingMode::Gated => {
                 // Gating: output[c] = primary(z[c]) * secondary(z[bottleneck+c])
                 if active_channels.is_some() {
-                    let use_fast = crate::util::is_fast_tanh_enabled();
                     for f in 0..num_frames {
                         let z_off = f * z_rows;
                         for c in 0..active_bottleneck {
                             let primary = self.activation.apply_scalar_channel_fast(
                                 self.z_buf.data[z_off + c],
                                 c,
-                                use_fast,
+                                use_fast_tanh,
                             );
                             let gate = self.secondary_activation.apply_scalar_channel_fast(
                                 self.z_buf.data[z_off + active_bottleneck + c],
                                 c,
-                                use_fast,
+                                use_fast_tanh,
                             );
                             self.z_buf.data[z_off + c] = primary * gate;
                         }
@@ -1570,33 +1478,29 @@ impl WaveNetLayer {
                         let p_id = self.activation.c_type_id();
                         let s_id = self.secondary_activation.c_type_id();
                         if let (Some(p), Some(s)) = (p_id, s_id) {
-                            let use_fast = crate::util::is_fast_tanh_enabled();
-                            unsafe {
-                                crate::fast_kernels::fast_gated_activation(
-                                    self.z_buf.data.as_mut_ptr(),
-                                    z_rows,
-                                    bottleneck,
-                                    num_frames,
-                                    p,
-                                    s,
-                                    use_fast as i32,
-                                );
-                            }
+                            crate::fast_kernels::gated_activation(
+                                &mut self.z_buf.data,
+                                z_rows,
+                                bottleneck,
+                                num_frames,
+                                p,
+                                s,
+                                use_fast_tanh,
+                            );
                         } else {
                             // Fallback for PReLU/LeakyRelu with per-channel params
-                            let use_fast = crate::util::is_fast_tanh_enabled();
                             for f in 0..num_frames {
                                 let z_off = f * z_rows;
                                 for c in 0..bottleneck {
                                     let primary = self.activation.apply_scalar_channel_fast(
                                         self.z_buf.data[z_off + c],
                                         c,
-                                        use_fast,
+                                        use_fast_tanh,
                                     );
                                     let gate = self.secondary_activation.apply_scalar_channel_fast(
                                         self.z_buf.data[z_off + bottleneck + c],
                                         c,
-                                        use_fast,
+                                        use_fast_tanh,
                                     );
                                     self.z_buf.data[z_off + c] = primary * gate;
                                 }
@@ -1605,19 +1509,18 @@ impl WaveNetLayer {
                     }
                     #[cfg(not(feature = "fast-kernels"))]
                     {
-                        let use_fast = crate::util::is_fast_tanh_enabled();
                         for f in 0..num_frames {
                             let z_off = f * z_rows;
                             for c in 0..bottleneck {
                                 let primary = self.activation.apply_scalar_channel_fast(
                                     self.z_buf.data[z_off + c],
                                     c,
-                                    use_fast,
+                                    use_fast_tanh,
                                 );
                                 let gate = self.secondary_activation.apply_scalar_channel_fast(
                                     self.z_buf.data[z_off + bottleneck + c],
                                     c,
-                                    use_fast,
+                                    use_fast_tanh,
                                 );
                                 self.z_buf.data[z_off + c] = primary * gate;
                             }
@@ -1647,18 +1550,19 @@ impl WaveNetLayer {
             GatingMode::Blended => {
                 // Blending: z[c] = alpha * activated(z[c]) + (1-alpha) * z[c]
                 if active_channels.is_some() {
-                    let use_fast = crate::util::is_fast_tanh_enabled();
                     for f in 0..num_frames {
                         let z_off = f * z_rows;
                         for c in 0..active_bottleneck {
                             let pre_act = self.z_buf.data[z_off + c];
-                            let activated = self
-                                .activation
-                                .apply_scalar_channel_fast(pre_act, c, use_fast);
+                            let activated = self.activation.apply_scalar_channel_fast(
+                                pre_act,
+                                c,
+                                use_fast_tanh,
+                            );
                             let alpha = self.secondary_activation.apply_scalar_channel_fast(
                                 self.z_buf.data[z_off + active_bottleneck + c],
                                 c,
-                                use_fast,
+                                use_fast_tanh,
                             );
                             self.z_buf.data[z_off + c] =
                                 alpha * activated + (1.0 - alpha) * pre_act;
@@ -1671,32 +1575,30 @@ impl WaveNetLayer {
                         let p_id = self.activation.c_type_id();
                         let s_id = self.secondary_activation.c_type_id();
                         if let (Some(p), Some(s)) = (p_id, s_id) {
-                            let use_fast = crate::util::is_fast_tanh_enabled();
-                            unsafe {
-                                crate::fast_kernels::fast_blended_activation(
-                                    self.z_buf.data.as_mut_ptr(),
-                                    z_rows,
-                                    bottleneck,
-                                    num_frames,
-                                    p,
-                                    s,
-                                    use_fast as i32,
-                                );
-                            }
+                            crate::fast_kernels::blended_activation(
+                                &mut self.z_buf.data,
+                                z_rows,
+                                bottleneck,
+                                num_frames,
+                                p,
+                                s,
+                                use_fast_tanh,
+                            );
                         } else {
-                            let use_fast = crate::util::is_fast_tanh_enabled();
                             for f in 0..num_frames {
                                 let z_off = f * z_rows;
                                 for c in 0..bottleneck {
                                     let pre_act = self.z_buf.data[z_off + c];
-                                    let activated = self
-                                        .activation
-                                        .apply_scalar_channel_fast(pre_act, c, use_fast);
+                                    let activated = self.activation.apply_scalar_channel_fast(
+                                        pre_act,
+                                        c,
+                                        use_fast_tanh,
+                                    );
                                     let alpha =
                                         self.secondary_activation.apply_scalar_channel_fast(
                                             self.z_buf.data[z_off + bottleneck + c],
                                             c,
-                                            use_fast,
+                                            use_fast_tanh,
                                         );
                                     self.z_buf.data[z_off + c] =
                                         alpha * activated + (1.0 - alpha) * pre_act;
@@ -1706,18 +1608,19 @@ impl WaveNetLayer {
                     }
                     #[cfg(not(feature = "fast-kernels"))]
                     {
-                        let use_fast = crate::util::is_fast_tanh_enabled();
                         for f in 0..num_frames {
                             let z_off = f * z_rows;
                             for c in 0..bottleneck {
                                 let pre_act = self.z_buf.data[z_off + c];
-                                let activated = self
-                                    .activation
-                                    .apply_scalar_channel_fast(pre_act, c, use_fast);
+                                let activated = self.activation.apply_scalar_channel_fast(
+                                    pre_act,
+                                    c,
+                                    use_fast_tanh,
+                                );
                                 let alpha = self.secondary_activation.apply_scalar_channel_fast(
                                     self.z_buf.data[z_off + bottleneck + c],
                                     c,
-                                    use_fast,
+                                    use_fast_tanh,
                                 );
                                 self.z_buf.data[z_off + c] =
                                     alpha * activated + (1.0 - alpha) * pre_act;
@@ -1811,14 +1714,12 @@ impl WaveNetLayer {
         if let Some(ref l1x1) = self.layer1x1 {
             let total = ch * num_frames;
             #[cfg(feature = "fast-kernels")]
-            unsafe {
-                crate::fast_kernels::fast_vec_add(
-                    self.output_next_layer.data.as_mut_ptr(),
-                    input.data.as_ptr(),
-                    l1x1.output_buf.data.as_ptr(),
-                    total,
-                );
-            }
+            crate::fast_kernels::vec_add(
+                &mut self.output_next_layer.data,
+                &input.data,
+                &l1x1.output_buf.data,
+                total,
+            );
             #[cfg(not(feature = "fast-kernels"))]
             {
                 let inp = &input.data;
@@ -2034,10 +1935,11 @@ impl WaveNetLayerArray {
         layer_inputs: &ColMajorMatrix,
         condition: &ColMajorMatrix,
         num_frames: usize,
+        use_fast_tanh: bool,
     ) {
         // Zero head inputs accumulator
         self.head_inputs.zero_cols(num_frames);
-        self.process_inner(layer_inputs, condition, num_frames);
+        self.process_inner(layer_inputs, condition, num_frames, use_fast_tanh);
     }
 
     /// Process with previous head input (subsequent layer arrays).
@@ -2048,11 +1950,12 @@ impl WaveNetLayerArray {
         condition: &ColMajorMatrix,
         head_inputs: &ColMajorMatrix,
         num_frames: usize,
+        use_fast_tanh: bool,
     ) {
         // Copy head inputs from previous layer array
         let len = self.head_output_size * num_frames;
         self.head_inputs.data[..len].copy_from_slice(&head_inputs.data[..len]);
-        self.process_inner(layer_inputs, condition, num_frames);
+        self.process_inner(layer_inputs, condition, num_frames, use_fast_tanh);
     }
 
     /// Common inner processing. Matches C++ _LayerArray::ProcessInner
@@ -2061,6 +1964,7 @@ impl WaveNetLayerArray {
         layer_inputs: &ColMajorMatrix,
         condition: &ColMajorMatrix,
         num_frames: usize,
+        use_fast_tanh: bool,
     ) {
         // Rechannel: project input to layer channels
         self.rechannel.process_block(layer_inputs, num_frames);
@@ -2080,35 +1984,26 @@ impl WaveNetLayerArray {
         // Process layers
         let num_layers = self.layers.len();
 
-        // We need to handle the borrowing carefully.
-        // Layer i reads from: rechannel output (if i==0) or layer[i-1].output_next_layer
-        // Layer i writes to: its own output_next_layer and output_head
-        // Head inputs accumulate from each layer's output_head
-
         for i in 0..num_layers {
-            // Get the input for this layer
-            // We use unsafe to work around the borrow checker, since we're reading from
-            // layer[i-1].output_next_layer while writing to layer[i].
-            // This is safe because we're accessing different layers.
             if i == 0 {
-                // First layer uses rechannel output
-                let input_ptr = &self.rechannel.output_buf as *const ColMajorMatrix;
-                let layer = &mut self.layers[i];
+                let layer = &mut self.layers[0];
                 layer.process_block(
-                    unsafe { &*input_ptr },
+                    &self.rechannel.output_buf,
                     condition,
                     num_frames,
                     active_channels,
+                    use_fast_tanh,
                 );
             } else {
-                // Subsequent layers use previous layer's output
-                let prev_output = &self.layers[i - 1].output_next_layer as *const ColMajorMatrix;
-                let layer = &mut self.layers[i];
+                let (processed, pending) = self.layers.split_at_mut(i);
+                let prev_output = &processed[i - 1].output_next_layer;
+                let layer = &mut pending[0];
                 layer.process_block(
-                    unsafe { &*prev_output },
+                    prev_output,
                     condition,
                     num_frames,
                     active_channels,
+                    use_fast_tanh,
                 );
             }
 
@@ -2121,13 +2016,7 @@ impl WaveNetLayerArray {
                 // Contiguous: single pass
                 let total = head_out_size * num_frames;
                 #[cfg(feature = "fast-kernels")]
-                unsafe {
-                    crate::fast_kernels::fast_vec_add_inplace(
-                        self.head_inputs.data.as_mut_ptr(),
-                        head_data.as_ptr(),
-                        total,
-                    );
-                }
+                crate::fast_kernels::vec_add_inplace(&mut self.head_inputs.data, head_data, total);
                 #[cfg(not(feature = "fast-kernels"))]
                 {
                     let dst = &mut self.head_inputs.data;
@@ -2210,12 +2099,16 @@ impl WaveNetHeadBlock {
         self.conv.set_max_buffer_size(max_buffer_size);
     }
 
-    fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
+    fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize, use_fast_tanh: bool) {
         let rows = self.conv.in_channels;
         let len = rows * num_frames;
         self.activation_buf.data[..len].copy_from_slice(&input.data[..len]);
-        self.activation
-            .apply_colmajor_inplace(&mut self.activation_buf.data, rows, num_frames);
+        self.activation.apply_colmajor_inplace(
+            &mut self.activation_buf.data,
+            rows,
+            num_frames,
+            use_fast_tanh,
+        );
         self.conv.process_block(&self.activation_buf, num_frames);
     }
 }
@@ -2304,6 +2197,7 @@ impl WaveNetHead {
         input_rows: usize,
         scale: f32,
         num_frames: usize,
+        use_fast_tanh: bool,
     ) {
         self.input_buf.resize(input_rows, num_frames);
         let len = input_rows * num_frames;
@@ -2314,10 +2208,14 @@ impl WaveNetHead {
             *dst = scale * *src;
         }
 
-        let mut current = &self.input_buf as *const ColMajorMatrix;
-        for block in &mut self.blocks {
-            block.process_block(unsafe { &*current }, num_frames);
-            current = &block.conv.output_buf as *const ColMajorMatrix;
+        for index in 0..self.blocks.len() {
+            if index == 0 {
+                self.blocks[0].process_block(&self.input_buf, num_frames, use_fast_tanh);
+            } else {
+                let (processed, pending) = self.blocks.split_at_mut(index);
+                let input = &processed[index - 1].conv.output_buf;
+                pending[0].process_block(input, num_frames, use_fast_tanh);
+            }
         }
     }
 
@@ -2343,6 +2241,7 @@ pub struct WaveNet {
     condition_input: ColMajorMatrix,
     condition_output: ColMajorMatrix,
     max_buffer_size: usize,
+    activation_mode: ActivationMode,
 }
 
 fn normalize_wavenet_config(config: &serde_json::Value) -> Result<serde_json::Value, NamError> {
@@ -2933,6 +2832,7 @@ impl WaveNet {
             condition_input: ColMajorMatrix::new(in_channels, 1),
             condition_output: ColMajorMatrix::new(cond_out_ch.max(condition_size), 1),
             max_buffer_size: 0,
+            activation_mode: ActivationMode::Accurate,
         })
     }
 
@@ -2990,7 +2890,7 @@ impl WaveNet {
         // Buffer is pre-zeroed by resize(), so only write the first channel.
         let in_ch = self.in_channels;
         for (f, &sample) in input.iter().enumerate().take(num_frames) {
-            self.condition_input.data[f * in_ch] = sample as f32;
+            self.condition_input.data[f * in_ch] = crate::dsp::sample_to_f32(sample);
         }
 
         // Step 2: Process condition
@@ -3032,40 +2932,37 @@ impl WaveNet {
         for arr_idx in 0..num_arrays {
             if arr_idx == 0 {
                 // First layer array: use condition_input as layer_inputs, condition_output as condition
-                let cond_input_ptr = &self.condition_input as *const ColMajorMatrix;
-                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
                 self.layer_arrays[arr_idx].process_first(
-                    unsafe { &*cond_input_ptr },
-                    unsafe { &*cond_output_ptr },
+                    &self.condition_input,
+                    &self.condition_output,
                     num_frames,
+                    self.activation_mode.use_fast_tanh(),
                 );
             } else {
                 // Subsequent: use previous array's layer_outputs and head_outputs
-                let prev_layer_outputs =
-                    &self.layer_arrays[arr_idx - 1].layer_outputs as *const ColMajorMatrix;
-                let prev_head_outputs = &self.layer_arrays[arr_idx - 1].head_rechannel.output_buf
-                    as *const ColMajorMatrix;
-                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
-                self.layer_arrays[arr_idx].process_subsequent(
-                    unsafe { &*prev_layer_outputs },
-                    unsafe { &*cond_output_ptr },
-                    unsafe { &*prev_head_outputs },
+                let (processed, pending) = self.layer_arrays.split_at_mut(arr_idx);
+                let previous = &processed[arr_idx - 1];
+                pending[0].process_subsequent(
+                    &previous.layer_outputs,
+                    &self.condition_output,
+                    &previous.head_rechannel.output_buf,
                     num_frames,
+                    self.activation_mode.use_fast_tanh(),
                 );
             }
         }
 
         // Step 4: Extract output from final layer-array head or optional top-level head
         let last = num_arrays - 1;
-        let layer_head =
-            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let layer_head = &self.layer_arrays[last].head_rechannel.output_buf;
         let (final_head, out_ch, output_scale) = if let Some(ref mut head) = self.head {
             let layer_out_ch = self.layer_arrays[last].head_rechannel.out_channels;
             head.process_block(
-                unsafe { &*layer_head },
+                layer_head,
                 layer_out_ch,
                 self.head_scale,
                 num_frames,
+                self.activation_mode.use_fast_tanh(),
             );
             let Some(head_output) = head.output() else {
                 output.fill(Sample::default());
@@ -3074,7 +2971,7 @@ impl WaveNet {
             (head_output, head.out_channels(), 1.0)
         } else {
             (
-                unsafe { &*layer_head },
+                layer_head,
                 self.layer_arrays[last].head_rechannel.out_channels,
                 self.head_scale,
             )
@@ -3129,24 +3026,21 @@ impl WaveNet {
         let num_arrays = self.layer_arrays.len();
         for arr_idx in 0..num_arrays {
             if arr_idx == 0 {
-                let cond_input_ptr = &self.condition_input as *const ColMajorMatrix;
-                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
                 self.layer_arrays[arr_idx].process_first(
-                    unsafe { &*cond_input_ptr },
-                    unsafe { &*cond_output_ptr },
+                    &self.condition_input,
+                    &self.condition_output,
                     1,
+                    self.activation_mode.use_fast_tanh(),
                 );
             } else {
-                let prev_layer_outputs =
-                    &self.layer_arrays[arr_idx - 1].layer_outputs as *const ColMajorMatrix;
-                let prev_head_outputs = &self.layer_arrays[arr_idx - 1].head_rechannel.output_buf
-                    as *const ColMajorMatrix;
-                let cond_output_ptr = &self.condition_output as *const ColMajorMatrix;
-                self.layer_arrays[arr_idx].process_subsequent(
-                    unsafe { &*prev_layer_outputs },
-                    unsafe { &*cond_output_ptr },
-                    unsafe { &*prev_head_outputs },
+                let (processed, pending) = self.layer_arrays.split_at_mut(arr_idx);
+                let previous = &processed[arr_idx - 1];
+                pending[0].process_subsequent(
+                    &previous.layer_outputs,
+                    &self.condition_output,
+                    &previous.head_rechannel.output_buf,
                     1,
+                    self.activation_mode.use_fast_tanh(),
                 );
             }
         }
@@ -3179,14 +3073,19 @@ impl Dsp for WaveNet {
     }
 
     fn process_sample_multi_channel(&mut self, input_sample: Sample, out: &mut [f32]) {
-        self.process_sample_for_multi_channel(input_sample as f32);
+        self.process_sample_for_multi_channel(crate::dsp::sample_to_f32(input_sample));
 
         let last = self.layer_arrays.len() - 1;
-        let layer_head =
-            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let layer_head = &self.layer_arrays[last].head_rechannel.output_buf;
         let (final_head, out_ch, scale) = if let Some(ref mut head) = self.head {
             let layer_out_ch = self.layer_arrays[last].head_rechannel.out_channels;
-            head.process_block(unsafe { &*layer_head }, layer_out_ch, self.head_scale, 1);
+            head.process_block(
+                layer_head,
+                layer_out_ch,
+                self.head_scale,
+                1,
+                self.activation_mode.use_fast_tanh(),
+            );
             let Some(head_output) = head.output() else {
                 for o in out {
                     *o = 0.0;
@@ -3196,7 +3095,7 @@ impl Dsp for WaveNet {
             (head_output, head.out_channels(), 1.0)
         } else {
             (
-                unsafe { &*layer_head },
+                layer_head,
                 self.layer_arrays[last].head_rechannel.out_channels,
                 self.head_scale,
             )
@@ -3224,8 +3123,7 @@ impl Dsp for WaveNet {
 
         // Extract multi-channel head output from the last layer array
         let last = self.layer_arrays.len() - 1;
-        let layer_head =
-            &self.layer_arrays[last].head_rechannel.output_buf as *const ColMajorMatrix;
+        let layer_head = &self.layer_arrays[last].head_rechannel.output_buf;
         let (final_head, head_ch, scale) = if let Some(ref head) = self.head {
             let Some(head_output) = head.output() else {
                 output_data.fill(0.0);
@@ -3234,7 +3132,7 @@ impl Dsp for WaveNet {
             (head_output, head.out_channels(), 1.0)
         } else {
             (
-                unsafe { &*layer_head },
+                layer_head,
                 self.layer_arrays[last].head_rechannel.out_channels,
                 self.head_scale,
             )
@@ -3265,6 +3163,13 @@ impl Dsp for WaveNet {
     fn metadata(&self) -> &DspMetadata {
         &self.metadata
     }
+
+    fn set_activation_mode(&mut self, mode: ActivationMode) {
+        self.activation_mode = mode;
+        if let Some(condition_dsp) = self.condition_dsp.as_mut() {
+            condition_dsp.set_activation_mode(mode);
+        }
+    }
 }
 
 // ── Activation helper for column-major block processing ─────────────────────
@@ -3273,7 +3178,13 @@ impl Activation {
     /// Apply activation in-place to a column-major matrix.
     /// The matrix has `rows` per column and `num_cols` columns.
     /// Applies per-channel (row) for PReLU.
-    fn apply_colmajor_inplace(&self, data: &mut [f32], rows: usize, num_cols: usize) {
+    fn apply_colmajor_inplace(
+        &self,
+        data: &mut [f32],
+        rows: usize,
+        num_cols: usize,
+        use_fast_tanh: bool,
+    ) {
         match self {
             Activation::PReLU(slopes) => {
                 for f in 0..num_cols {
@@ -3289,20 +3200,11 @@ impl Activation {
                 let len = rows * num_cols;
                 #[cfg(feature = "fast-kernels")]
                 if let Some(act_id) = self.c_type_id() {
-                    let use_fast = crate::util::is_fast_tanh_enabled();
-                    unsafe {
-                        crate::fast_kernels::fast_activation_inplace(
-                            data.as_mut_ptr(),
-                            len,
-                            act_id,
-                            use_fast as i32,
-                        );
-                    }
+                    crate::fast_kernels::activation_inplace(data, len, act_id, use_fast_tanh);
                     return;
                 }
-                let use_fast = crate::util::is_fast_tanh_enabled();
                 for x in data[..len].iter_mut() {
-                    *x = self.apply_scalar_fast(*x, use_fast);
+                    *x = self.apply_scalar_fast(*x, use_fast_tanh);
                 }
             }
         }
@@ -3397,6 +3299,7 @@ fn parse_gating_and_secondary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::path::Path;
 
     fn load_wavenet(filename: &str) -> Option<WaveNet> {
@@ -3608,6 +3511,97 @@ mod tests {
         let mut output = vec![0.0 as Sample; 8];
         model.process(&input, &mut output);
         output
+    }
+
+    fn render_small_config(
+        activation: &str,
+        weights: &[f32],
+        input: &[Sample],
+        chunk_size: usize,
+    ) -> Vec<Sample> {
+        let mut layer = minimal_upstream_layer_config();
+        layer["activation"] = serde_json::Value::String(activation.to_string());
+        let config = serde_json::json!({
+            "layers_configs": [layer],
+            "head": null,
+            "head_scale": 1.0
+        });
+        let mut model = WaveNet::from_config(&config, weights, DspMetadata::default()).unwrap();
+        model.reset(48_000.0, input.len().max(1));
+        let mut output = Vec::with_capacity(input.len());
+        for chunk in input.chunks(chunk_size) {
+            let mut chunk_output = vec![Sample::default(); chunk.len()];
+            model.process(chunk, &mut chunk_output);
+            output.extend(chunk_output);
+        }
+        output
+    }
+
+    proptest! {
+        #[test]
+        fn backend_equivalence_matrix_matches_column_major_oracle(
+            m in 1usize..12,
+            k in 1usize..12,
+            n in 1usize..12,
+            padding in 0usize..4,
+            raw_a in prop::collection::vec(-1.0f32..1.0, 1..144),
+            raw_b in prop::collection::vec(-1.0f32..1.0, 1..180),
+            raw_c in prop::collection::vec(-1.0f32..1.0, 1..144),
+        ) {
+            let stride = k + padding;
+            let a = raw_a.into_iter().cycle().take(m * k).collect::<Vec<_>>();
+            let b = raw_b.into_iter().cycle().take(stride * n).collect::<Vec<_>>();
+            let initial = raw_c.into_iter().cycle().take(m * n).collect::<Vec<_>>();
+            let mut actual = initial.clone();
+            let mut expected = initial;
+            let alpha = 0.75f32;
+            let beta = -0.25f32;
+
+            sgemm_colmajor(m, k, n, alpha, &a, &b, stride, beta, &mut actual);
+            for column in 0..n {
+                for row in 0..m {
+                    let mut product = 0.0f32;
+                    for inner in 0..k {
+                        product += a[inner * m + row] * b[column * stride + inner];
+                    }
+                    let index = column * m + row;
+                    expected[index] = alpha * product + beta * expected[index];
+                }
+            }
+
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                prop_assert!(
+                    (actual - expected).abs() <= 2.0e-4,
+                    "matrix output {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+
+        #[test]
+        fn backend_equivalence_randomized_wavenet_is_block_partition_invariant(
+            activation in prop_oneof![
+                Just("Tanh"),
+                Just("ReLU"),
+                Just("Sigmoid"),
+                Just("Softsign"),
+            ],
+            weights in prop::collection::vec(-0.75f32..0.75, 8),
+            input in prop::collection::vec(-0.5f64..0.5, 1..96),
+            chunk_size in 1usize..24,
+        ) {
+            let input = input
+                .into_iter()
+                .map(crate::dsp::sample_from_f64)
+                .collect::<Vec<_>>();
+            let full = render_small_config(activation, &weights, &input, input.len());
+            let partitioned = render_small_config(activation, &weights, &input, chunk_size);
+            for (index, (&full, &partitioned)) in full.iter().zip(&partitioned).enumerate() {
+                prop_assert!(
+                    (full - partitioned).abs() <= 2.0e-5,
+                    "sample {index}: full={full}, partitioned={partitioned}"
+                );
+            }
+        }
     }
 
     #[test]

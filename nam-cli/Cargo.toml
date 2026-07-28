@@ -1,7 +1,12 @@
 [package]
 name = "nam-cli"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = []
@@ -9,6 +14,6 @@ faer = ["nam-core/faer"]
 fast-kernels = ["nam-core/fast-kernels"]
 
 [dependencies]
-nam-core = { path = "../nam-core" }
+nam-core = { version = "0.1.0", path = "../nam-core" }
 clap = { version = "4", features = ["derive"] }
 hound = "3.5"

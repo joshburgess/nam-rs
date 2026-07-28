@@ -1,5 +1,6 @@
+use crate::dsp::ActivationMode;
 use crate::error::NamError;
-use crate::util::{fast_sigmoid, fast_tanh, is_fast_tanh_enabled};
+use crate::util::{fast_sigmoid, fast_tanh};
 
 #[derive(Debug, Clone)]
 pub enum Activation {
@@ -33,8 +34,9 @@ impl Activation {
             Activation::HardSwish => Some(2),
             Activation::Softsign => Some(3),
             Activation::HardTanh => Some(4),
-            Activation::Sigmoid => Some(0), // use tanh-based sigmoid via SiLU path? No, treat as tanh for now
             Activation::Relu => Some(5),
+            Activation::Sigmoid => Some(6),
+            Activation::Softsigmoid => Some(7),
             _ => None, // PReLU, LeakyRelu, LeakyHardTanh have per-channel params
         }
     }
@@ -43,7 +45,7 @@ impl Activation {
     /// which hoists the fast_tanh flag check out of the loop.
     #[inline]
     pub fn apply_scalar(&self, x: f32) -> f32 {
-        self.apply_scalar_fast(x, is_fast_tanh_enabled())
+        self.apply_scalar_fast(x, false)
     }
 
     #[inline]
@@ -112,7 +114,7 @@ impl Activation {
     /// for PReLU, which has per-channel slopes.
     #[inline]
     pub fn apply_scalar_channel(&self, x: f32, channel: usize) -> f32 {
-        self.apply_scalar_channel_fast(x, channel, is_fast_tanh_enabled())
+        self.apply_scalar_channel_fast(x, channel, false)
     }
 
     #[inline]
@@ -132,7 +134,12 @@ impl Activation {
 
     #[inline]
     pub fn apply_slice(&self, data: &mut [f32]) {
-        let use_fast = is_fast_tanh_enabled();
+        self.apply_slice_with_mode(data, ActivationMode::Accurate);
+    }
+
+    #[inline]
+    pub(crate) fn apply_slice_with_mode(&self, data: &mut [f32], mode: ActivationMode) {
+        let use_fast = mode.use_fast_tanh();
         for x in data.iter_mut() {
             *x = self.apply_scalar_fast(*x, use_fast);
         }
@@ -296,6 +303,57 @@ mod tests {
         let x = 1.0f32;
         let expected = x / (1.0 + (-x).exp());
         assert!((act.apply_scalar(x) - expected).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "fast-kernels")]
+    #[test]
+    fn c_activation_ids_are_unique_and_complete() {
+        let activations = [
+            Activation::Tanh,
+            Activation::Silu,
+            Activation::HardSwish,
+            Activation::Softsign,
+            Activation::HardTanh,
+            Activation::Relu,
+            Activation::Sigmoid,
+            Activation::Softsigmoid,
+        ];
+        let mut ids = activations
+            .iter()
+            .map(Activation::c_type_id)
+            .collect::<Option<Vec<_>>>()
+            .unwrap();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), activations.len());
+    }
+
+    #[cfg(feature = "fast-kernels")]
+    #[test]
+    fn c_activation_kernel_matches_rust_activations() {
+        let cases = [
+            Activation::Tanh,
+            Activation::Silu,
+            Activation::HardSwish,
+            Activation::Softsign,
+            Activation::HardTanh,
+            Activation::Relu,
+            Activation::Sigmoid,
+            Activation::Softsigmoid,
+        ];
+        for activation in cases {
+            let mut actual = [-2.0, -0.5, 0.0, 0.5, 2.0];
+            let expected = actual.map(|value| activation.apply_scalar_fast(value, false));
+            let id = activation.c_type_id().unwrap();
+            let len = actual.len();
+            crate::fast_kernels::activation_inplace(&mut actual, len, id, false);
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= f32::EPSILON,
+                    "activation {activation:?}: expected {expected}, got {actual}"
+                );
+            }
+        }
     }
 
     #[test]

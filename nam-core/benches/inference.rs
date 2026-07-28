@@ -1,3 +1,5 @@
+#![allow(clippy::print_stderr, clippy::unwrap_used)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::path::Path;
 

@@ -1,6 +1,24 @@
 [workspace]
 members = ["nam-core", "nam-cli", "nam-plugin", "nam-trainer", "xtask"]
+exclude = ["fuzz"]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
 
 [profile.release]
 opt-level = 3

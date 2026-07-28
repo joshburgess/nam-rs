@@ -1,25 +1,5 @@
+use crate::dsp::ActivationMode;
 use crate::error::NamError;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Global toggle for fast tanh/sigmoid approximations.
-/// When enabled, uses polynomial approximations matching C++ NAM's fast_tanh.
-/// Faster (~1.5-2x) but introduces ~3e-4 error per call.
-static USE_FAST_TANH: AtomicBool = AtomicBool::new(false);
-
-/// Enable fast tanh/sigmoid polynomial approximations (performance mode).
-pub fn enable_fast_tanh() {
-    USE_FAST_TANH.store(true, Ordering::Relaxed);
-}
-
-/// Disable fast tanh/sigmoid, using standard math (accuracy mode, default).
-pub fn disable_fast_tanh() {
-    USE_FAST_TANH.store(false, Ordering::Relaxed);
-}
-
-/// Returns true if fast tanh/sigmoid is currently enabled.
-pub fn is_fast_tanh_enabled() -> bool {
-    USE_FAST_TANH.load(Ordering::Relaxed)
-}
 
 /// Fast tanh polynomial approximation matching C++ NAM implementation.
 /// Max error ~3e-4 vs std::tanh.
@@ -37,20 +17,18 @@ pub fn fast_sigmoid(x: f32) -> f32 {
     0.5 * (fast_tanh(x * 0.5) + 1.0)
 }
 
-/// Tanh that respects the fast_tanh toggle.
 #[inline]
-pub fn tanh_auto(x: f32) -> f32 {
-    if USE_FAST_TANH.load(Ordering::Relaxed) {
+pub fn tanh(x: f32, mode: ActivationMode) -> f32 {
+    if mode.use_fast_tanh() {
         fast_tanh(x)
     } else {
         x.tanh()
     }
 }
 
-/// Sigmoid that respects the fast_tanh toggle.
 #[inline]
-pub fn sigmoid_auto(x: f32) -> f32 {
-    if USE_FAST_TANH.load(Ordering::Relaxed) {
+pub fn sigmoid(x: f32, mode: ActivationMode) -> f32 {
+    if mode.use_fast_tanh() {
         fast_sigmoid(x)
     } else {
         1.0 / (1.0 + (-x).exp())
@@ -104,11 +82,6 @@ impl<'a> WeightIter<'a> {
         }
         Ok(())
     }
-}
-
-#[inline]
-pub fn sigmoid(x: f32) -> f32 {
-    sigmoid_auto(x)
 }
 
 #[cfg(test)]
@@ -198,38 +171,34 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_tanh_toggle() {
-        disable_fast_tanh();
-        let std_result = tanh_auto(1.0);
+    fn test_activation_modes_are_explicit() {
+        let std_result = tanh(1.0, ActivationMode::Accurate);
         assert_eq!(std_result, 1.0f32.tanh());
 
-        enable_fast_tanh();
-        let fast_result = tanh_auto(1.0);
+        let fast_result = tanh(1.0, ActivationMode::Fast);
         assert_eq!(fast_result, fast_tanh(1.0));
-        assert!(fast_result != std_result); // they should differ
-
-        disable_fast_tanh(); // restore default
+        assert_ne!(fast_result, std_result);
     }
 
     #[test]
     fn test_sigmoid_at_zero() {
-        assert!((sigmoid(0.0) - 0.5).abs() < 1e-7);
+        assert!((sigmoid(0.0, ActivationMode::Accurate) - 0.5).abs() < 1e-7);
     }
 
     #[test]
     fn test_sigmoid_symmetry() {
         for &x in &[0.5, 1.0, 2.0, 5.0] {
-            let s_pos = sigmoid(x);
-            let s_neg = sigmoid(-x);
+            let s_pos = sigmoid(x, ActivationMode::Accurate);
+            let s_neg = sigmoid(-x, ActivationMode::Accurate);
             assert!((s_pos + s_neg - 1.0).abs() < 1e-6);
         }
     }
 
     #[test]
     fn test_sigmoid_bounds() {
-        assert!(sigmoid(-10.0) > 0.0);
-        assert!(sigmoid(-10.0) < 0.001);
-        assert!(sigmoid(10.0) > 0.999);
-        assert!(sigmoid(10.0) < 1.0);
+        assert!(sigmoid(-10.0, ActivationMode::Accurate) > 0.0);
+        assert!(sigmoid(-10.0, ActivationMode::Accurate) < 0.001);
+        assert!(sigmoid(10.0, ActivationMode::Accurate) > 0.999);
+        assert!(sigmoid(10.0, ActivationMode::Accurate) < 1.0);
     }
 }
