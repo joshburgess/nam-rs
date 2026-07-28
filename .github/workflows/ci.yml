@@ -227,7 +227,7 @@ jobs:
 
   inference-instruction-baseline:
     name: Inference Instructions (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
