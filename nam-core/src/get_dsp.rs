@@ -147,21 +147,20 @@ fn submodel_arch_and_config(
     Ok((arch, config))
 }
 
-fn build_submodel_from_weight_prefix(
+fn build_submodel_from_remaining_weights(
     arch: &str,
     config: &serde_json::Value,
     weights: &[f32],
     metadata: &DspMetadata,
 ) -> Result<(Box<dyn Dsp>, usize), NamError> {
-    for end in 0..=weights.len() {
-        if let Ok(model) = build_dsp_from_parts(arch, config, &weights[..end], metadata.clone()) {
-            return Ok((model, end));
+    match build_dsp_from_parts(arch, config, weights, metadata.clone()) {
+        Ok(model) => Ok((model, weights.len())),
+        Err(NamError::WeightMismatch { expected, actual }) if expected < actual => {
+            let model = build_dsp_from_parts(arch, config, &weights[..expected], metadata.clone())?;
+            Ok((model, expected))
         }
+        Err(error) => Err(error),
     }
-    Err(NamError::WeightMismatch {
-        expected: weights.len() + 1,
-        actual: weights.len(),
-    })
 }
 
 // ── Sequential ─────────────────────────────────────────────────────────────
@@ -189,17 +188,11 @@ impl Sequential {
 
         let mut models = Vec::with_capacity(model_entries.len());
         let mut offset = 0usize;
-        for (idx, entry) in model_entries.iter().enumerate() {
+        for entry in model_entries {
             let (arch, config) = submodel_arch_and_config(entry)?;
             let remaining = &weights[offset..];
-            let (model, consumed) = if idx + 1 == model_entries.len() {
-                (
-                    build_dsp_from_parts(arch, config, remaining, metadata.clone())?,
-                    remaining.len(),
-                )
-            } else {
-                build_submodel_from_weight_prefix(arch, config, remaining, &metadata)?
-            };
+            let (model, consumed) =
+                build_submodel_from_remaining_weights(arch, config, remaining, &metadata)?;
             offset += consumed;
             models.push(model);
         }
@@ -1141,6 +1134,84 @@ mod tests {
         assert!(matches!(
             err,
             NamError::EmptyConfigArray { field } if field == "config.models"
+        ));
+    }
+
+    #[test]
+    fn test_get_dsp_sequential_splits_each_model_weight_range() {
+        let json = r#"{
+            "version": "0.7.0",
+            "architecture": "Sequential",
+            "metadata": {},
+            "config": {
+                "models": [
+                    {"name": "Linear", "config": {"receptive_field": 1}},
+                    {"name": "Linear", "config": {"receptive_field": 1}},
+                    {"name": "Linear", "config": {"receptive_field": 1}}
+                ]
+            },
+            "weights": [2.0, 3.0, 4.0]
+        }"#;
+        let mut model = get_dsp_from_json(json).unwrap();
+        let input = [1.0 as Sample];
+        let mut output = [Sample::default()];
+
+        model.process(&input, &mut output);
+
+        assert!((output[0] - 24.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn test_get_dsp_nested_sequential_splits_weight_ranges_recursively() {
+        let json = r#"{
+            "version": "0.7.0",
+            "architecture": "Sequential",
+            "metadata": {},
+            "config": {
+                "models": [
+                    {
+                        "name": "Sequential",
+                        "config": {
+                            "models": [
+                                {"name": "Linear", "config": {"receptive_field": 1}},
+                                {"name": "Linear", "config": {"receptive_field": 1}}
+                            ]
+                        }
+                    },
+                    {"name": "Linear", "config": {"receptive_field": 1}}
+                ]
+            },
+            "weights": [2.0, 3.0, 4.0]
+        }"#;
+        let mut model = get_dsp_from_json(json).unwrap();
+        let input = [1.0 as Sample];
+        let mut output = [Sample::default()];
+
+        model.process(&input, &mut output);
+
+        assert!((output[0] - 24.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn test_get_dsp_sequential_rejects_trailing_weights() {
+        let json = r#"{
+            "version": "0.7.0",
+            "architecture": "Sequential",
+            "metadata": {},
+            "config": {
+                "models": [
+                    {"name": "Linear", "config": {"receptive_field": 1}}
+                ]
+            },
+            "weights": [2.0, 3.0]
+        }"#;
+
+        assert!(matches!(
+            get_dsp_from_json(json),
+            Err(NamError::WeightMismatch {
+                expected: 1,
+                actual: 2
+            })
         ));
     }
 
