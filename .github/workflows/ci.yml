@@ -257,6 +257,8 @@ jobs:
             feature_args: "--features fast-kernels"
     env:
       IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
+      CARGO_PROFILE_BENCH_DEBUG: true
+      CARGO_PROFILE_BENCH_STRIP: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
