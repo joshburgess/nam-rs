@@ -6,8 +6,10 @@ use crate::util::{
 };
 
 mod matrix_backend;
+mod small_matrix_backend;
 
 use matrix_backend::{MatrixLayout, SGEMM_MIN_SIZE};
+use small_matrix_backend::{Conv1x1Dimensions, SmallMatrixBackend};
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
 
@@ -215,6 +217,7 @@ struct Conv1x1 {
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
+    small_matrix_backend: SmallMatrixBackend,
     #[allow(dead_code)]
     groups: usize,
     // Pre-allocated output buffer for block processing
@@ -268,6 +271,7 @@ impl Conv1x1 {
             out_channels,
             in_channels,
             matrix_layout,
+            small_matrix_backend: SmallMatrixBackend::detect(),
             groups,
             output_buf: ColMajorMatrix::new(out_channels, 1),
         })
@@ -378,6 +382,22 @@ impl Conv1x1 {
         }
 
         #[cfg(not(feature = "fast-kernels"))]
+        if self.small_matrix_backend.conv1x1(
+            out,
+            w,
+            input_data,
+            bias.as_deref(),
+            Conv1x1Dimensions {
+                out_channels: out_ch,
+                in_channels: in_ch,
+                input_stride,
+                num_frames,
+            },
+        ) {
+            return;
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
         for frame in 0..num_frames {
             let input_column = frame * input_stride;
             let output_column = frame * out_ch;
@@ -421,6 +441,7 @@ struct Conv1d {
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
+    small_matrix_backend: SmallMatrixBackend,
     #[allow(dead_code)]
     groups: usize,
     // Block processing state
@@ -588,6 +609,7 @@ impl Conv1d {
             out_channels,
             in_channels,
             matrix_layout,
+            small_matrix_backend: SmallMatrixBackend::detect(),
             groups,
             input_buffer: RingBuffer2D::new(),
             output_buf: ColMajorMatrix::new(out_channels, 1),
@@ -757,6 +779,17 @@ impl Conv1d {
                             &mut self.output_buf.data,
                         );
                     } else {
+                        if out_ch == 1
+                            && self.small_matrix_backend.conv1d_one_output_tap(
+                                &mut self.output_buf.data,
+                                w,
+                                tap_data,
+                                in_ch,
+                                num_frames,
+                            )
+                        {
+                            continue;
+                        }
                         for f in 0..num_frames {
                             let in_col_start = f * in_ch;
                             let out_col_start = f * out_ch;
