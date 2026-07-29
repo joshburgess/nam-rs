@@ -1,4 +1,8 @@
 {
+  "platform": {
+    "system": "Linux",
+    "machine": "x86_64"
+  },
   "tolerance_percent": 0.0,
   "configurations": {
     "plugin": {}

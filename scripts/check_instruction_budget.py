@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -46,6 +47,19 @@ def check_budget(
 ) -> list[str]:
     with baseline_path.open(encoding="utf-8") as baseline_file:
         baseline = json.load(baseline_file)
+
+    expected_platform = baseline.get("platform")
+    if expected_platform is not None:
+        actual_system = platform.system()
+        actual_machine = platform.machine()
+        expected_system = expected_platform["system"]
+        expected_machine = expected_platform["machine"]
+        if actual_system != expected_system or actual_machine != expected_machine:
+            return [
+                "instruction baseline platform mismatch: "
+                f"expected {expected_system}/{expected_machine}, "
+                f"found {actual_system}/{actual_machine}"
+            ]
 
     tolerance_percent = baseline["tolerance_percent"]
     expected = baseline["configurations"].get(configuration)

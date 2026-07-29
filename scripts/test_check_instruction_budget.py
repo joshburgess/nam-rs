@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from check_instruction_budget import check_budget, read_instruction_counts
 
@@ -71,6 +72,33 @@ class InstructionBudgetTests(unittest.TestCase):
             errors = check_budget("default", {"a1": 100, "extra": 1}, baseline_path)
             self.assertIn("missing benchmark measurement: a2", errors)
             self.assertIn("unexpected benchmark measurement: extra", errors)
+
+    def test_rejects_a_different_baseline_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            baseline_path = Path(directory) / "baseline.json"
+            baseline_path.write_text(
+                json.dumps(
+                    {
+                        "platform": {"system": "Linux", "machine": "x86_64"},
+                        "tolerance_percent": 3.0,
+                        "configurations": {"default": {"a1": 100}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("check_instruction_budget.platform.system", return_value="Darwin"),
+                patch("check_instruction_budget.platform.machine", return_value="arm64"),
+            ):
+                errors = check_budget("default", {"a1": 100}, baseline_path)
+            self.assertEqual(
+                errors,
+                [
+                    "instruction baseline platform mismatch: "
+                    "expected Linux/x86_64, found Darwin/arm64"
+                ],
+            )
 
     def test_enforces_scaling_envelopes_and_absolute_limits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

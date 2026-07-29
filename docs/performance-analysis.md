@@ -62,6 +62,10 @@ Linux CI enforces these Callgrind budgets independently for the default,
   callbacks that trigger a partition transform.
 - An absolute instruction ceiling for the 64-sample LSTM callback.
 
+The budget files are pinned to Linux x86-64, and the checker rejects attempts
+to apply them on another architecture. Bench profiles retain symbols so a
+budget change can be traced to the functions and source lines that caused it.
+
 ## Optimization Journey
 
 ### What worked
@@ -87,6 +91,37 @@ Linux CI enforces these Callgrind budgets independently for the default,
 | Axpy loop without sgemm | 50% **slower** on standard WaveNet | The compiler's auto-vectorizer couldn't match matrixmultiply's hand-tuned SIMD micro-kernels for 16x16 matrices. |
 | Axpy loop replacing sgemm | Faster on some, but a2_max accuracy degraded 4.77e-06 → 6.20e-06 | Different FP accumulation order compounds through a2_max's deep network with large weights. |
 | fast_tanh polynomial | Only 11% speedup | tanh is ~11% of total time, not the bottleneck. GEMM dominates. |
+
+### Small-matrix SIMD evaluation
+
+On 2026-07-29, A1 callback profiles were collected at 32, 64, 128, and 256
+frames before implementing architecture-specific small-matrix kernels.
+
+On Apple M4, `Conv1x1::process_block_small_gemm` accounted for 5.03% to 6.68%
+of callback samples. A NEON prototype was compared with the scalar build in
+paired Criterion runs:
+
+| Frames | Full callback change |
+|-------:|---------------------:|
+| 32 | 0.34% faster |
+| 64 | 6.50% slower |
+| 128 | 0.09% faster |
+| 256 | 2.91% faster |
+
+On Linux x86-64, the same Conv1x1 path accounted for 10.17% to 10.27% of
+Callgrind instructions, including software `fmaf` calls. An AVX2/FMA prototype
+also vectorized the single-output layer head:
+
+| Frames | Scalar instructions | AVX2/FMA instructions | Improvement |
+|-------:|--------------------:|----------------------:|------------:|
+| 32 | 2,048,948 | 1,881,179 | 8.19% |
+| 64 | 4,110,634 | 3,771,629 | 8.25% |
+| 128 | 8,237,169 | 7,555,812 | 8.27% |
+| 256 | 16,477,384 | 15,111,102 | 8.29% |
+
+Neither prototype met the repository requirement of at least 10% improvement
+for the complete callback on a supported platform. Both were removed. The
+scalar fallback remains the default small-matrix implementation.
 
 ## Key Insights
 
@@ -116,10 +151,10 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The allocation-free backend covers the batched matrix path. Further A1 work is
-limited to the smaller matrix path. A platform-specific SIMD implementation is
-only justified if profiles show that path is material and benchmarks clear the
-repository's performance threshold without changing render accuracy.
+The allocation-free backend covers the batched matrix path. The measured NEON
+and AVX2/FMA small-matrix prototypes did not clear the retention threshold.
+Further A1 work should begin with a new full-callback profile and target a path
+with more than 10% achievable headroom.
 
 ## Real-world impact of the performance gap
 
