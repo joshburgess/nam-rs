@@ -1,6 +1,6 @@
 use crate::dsp::{Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::WeightIter;
+use crate::util::{positive_config_usize, WeightIter};
 
 pub struct Linear {
     weights: Vec<f32>,
@@ -16,10 +16,7 @@ impl Linear {
         weights: &[f32],
         metadata: DspMetadata,
     ) -> Result<Self, NamError> {
-        let receptive_field = config["receptive_field"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("receptive_field".into()))?
-            as usize;
+        let receptive_field = positive_config_usize(&config["receptive_field"], "receptive_field")?;
         let has_bias = config["bias"].as_bool().unwrap_or(false);
 
         let mut iter = WeightIter::new(weights);
@@ -158,6 +155,17 @@ mod tests {
         let result =
             Linear::from_config(&config, &[1.0, 2.0, 3.0, 4.0, 5.0], DspMetadata::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_zero_receptive_field_is_rejected_before_processing() {
+        let config = serde_json::json!({ "receptive_field": 0 });
+
+        assert!(matches!(
+            Linear::from_config(&config, &[], DspMetadata::default()),
+            Err(NamError::InvalidConfigField { field, .. })
+                if field == "receptive_field"
+        ));
     }
 
     #[test]

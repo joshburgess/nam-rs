@@ -106,9 +106,9 @@ pub trait Dsp: Send {
 
     /// Select a slimmable model width, where 0.0 chooses the smallest width and 1.0 the largest.
     fn set_slimming(&mut self, _value: f64) -> Result<(), NamError> {
-        Err(NamError::InvalidConfig(
-            "DSP does not support slimmable width selection".into(),
-        ))
+        Err(NamError::UnsupportedOperation {
+            operation: "slimmable width selection",
+        })
     }
 
     /// Number of output channels. Default is 1 (mono).

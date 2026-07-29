@@ -17,8 +17,54 @@ pub enum NamError {
     #[error("Missing config field: {0}")]
     MissingField(String),
 
-    #[error("Invalid config: {0}")]
-    InvalidConfig(String),
+    #[error("Invalid config field {field}: {reason}")]
+    InvalidConfigField { field: String, reason: &'static str },
+
+    #[error("Config field {field} must be {expected}")]
+    InvalidConfigType {
+        field: String,
+        expected: &'static str,
+    },
+
+    #[error("Unsupported value for config field {field}: {value}")]
+    UnsupportedConfigValue { field: String, value: String },
+
+    #[error("Config field {field} must not be empty")]
+    EmptyConfigArray { field: String },
+
+    #[error("Config fields {first} and {second} are mutually exclusive")]
+    ConflictingConfigFields { first: String, second: String },
+
+    #[error("Invalid value at {field}[{index}]: expected {expected}")]
+    InvalidConfigArrayElement {
+        field: String,
+        index: usize,
+        expected: &'static str,
+    },
+
+    #[error("Config field {field} value {value} does not fit this platform")]
+    ConfigIntegerOutOfRange { field: String, value: u64 },
+
+    #[error("Config field {field} value {value} is outside {min}..={max}")]
+    ConfigValueOutOfRange {
+        field: String,
+        value: usize,
+        min: usize,
+        max: usize,
+    },
+
+    #[error(
+        "Config field {field} has length {actual}, but expected {expected} to match {expected_field}"
+    )]
+    ConfigLengthMismatch {
+        field: String,
+        actual: usize,
+        expected_field: String,
+        expected: usize,
+    },
+
+    #[error("Operation is not supported: {operation}")]
+    UnsupportedOperation { operation: &'static str },
 
     #[error("Weight range overflow: position {position}, requested {requested}")]
     WeightRangeOverflow { position: usize, requested: usize },
@@ -69,6 +115,12 @@ mod tests {
         };
         assert!(format!("{}", e).contains("matrix"));
         assert!(format!("{}", e).contains(&usize::MAX.to_string()));
+
+        let e = NamError::ConfigIntegerOutOfRange {
+            field: "channels".into(),
+            value: u64::MAX,
+        };
+        assert!(format!("{}", e).contains("channels"));
 
         let e = NamError::UnknownActivation("Mish".into());
         assert!(format!("{}", e).contains("Mish"));

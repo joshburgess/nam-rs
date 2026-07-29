@@ -1,7 +1,9 @@
 use crate::activations::Activation;
 use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::WeightIter;
+use crate::util::{
+    checked_dimension_add, checked_dimension_mul, config_usize, positive_config_usize, WeightIter,
+};
 
 mod matrix_backend;
 
@@ -34,24 +36,28 @@ impl FiLMParams {
         }
     }
 
-    fn from_json(val: &serde_json::Value) -> Self {
+    fn from_json(val: &serde_json::Value, field: &str) -> Result<Self, NamError> {
         if val.is_boolean() && !val.as_bool().unwrap_or(false) {
-            return Self::inactive();
+            return Ok(Self::inactive());
         }
         if val.is_null() {
-            return Self::inactive();
+            return Ok(Self::inactive());
         }
         if let Some(obj) = val.as_object() {
             let active = obj.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
             let shift = obj.get("shift").and_then(|v| v.as_bool()).unwrap_or(true);
-            let groups = obj.get("groups").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            Self {
+            let groups = obj
+                .get("groups")
+                .map(|value| positive_config_usize(value, &format!("{field}.groups")))
+                .transpose()?
+                .unwrap_or(1);
+            Ok(Self {
                 active,
                 shift,
                 groups,
-            }
+            })
         } else {
-            Self::inactive()
+            Ok(Self::inactive())
         }
     }
 }
@@ -512,6 +518,7 @@ struct Conv1d {
     bias: Vec<f32>,
     kernel_size: usize,
     dilation: usize,
+    receptive_field: usize,
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
@@ -554,6 +561,35 @@ impl Conv1d {
         has_bias: bool,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
+        if in_channels == 0 {
+            return Err(NamError::InvalidConfigField {
+                field: "convolution.in_channels".into(),
+                reason: "must be greater than zero",
+            });
+        }
+        if out_channels == 0 {
+            return Err(NamError::InvalidConfigField {
+                field: "convolution.out_channels".into(),
+                reason: "must be greater than zero",
+            });
+        }
+        if kernel_size == 0 {
+            return Err(NamError::InvalidConfigField {
+                field: "convolution.kernel_size".into(),
+                reason: "must be greater than zero",
+            });
+        }
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
+            return Err(NamError::InvalidConfigField {
+                field: "convolution.groups".into(),
+                reason: "must be positive and divide both input and output channels",
+            });
+        }
+        let receptive_field =
+            checked_dimension_mul("convolution receptive field", dilation, kernel_size - 1)?;
         let matrix_layout = MatrixLayout::new(out_channels, in_channels).map_err(|_| {
             NamError::DimensionOverflow {
                 context: "convolution weight matrix",
@@ -562,22 +598,17 @@ impl Conv1d {
             }
         })?;
         let is_depthwise = groups == in_channels && in_channels == out_channels;
-        #[cfg(feature = "fast-kernels")]
-        let flat_weight_len = kernel_size
-            .checked_mul(if is_depthwise {
+        let flat_weight_len = checked_dimension_mul(
+            "convolution weights",
+            kernel_size,
+            if is_depthwise {
                 out_channels
             } else {
                 matrix_layout.left_len()
-            })
-            .ok_or(NamError::DimensionOverflow {
-                context: "convolution weights",
-                left: kernel_size,
-                right: if is_depthwise {
-                    out_channels
-                } else {
-                    matrix_layout.left_len()
-                },
-            })?;
+            },
+        )?;
+        #[cfg(not(feature = "fast-kernels"))]
+        let _ = flat_weight_len;
 
         let weights = if is_depthwise {
             // Depthwise: one weight per channel per kernel tap
@@ -652,6 +683,7 @@ impl Conv1d {
             bias,
             kernel_size,
             dilation,
+            receptive_field,
             out_channels,
             in_channels,
             matrix_layout,
@@ -665,7 +697,7 @@ impl Conv1d {
 
     /// Receptive field (zero-indexed): dilation * (kernel_size - 1).
     fn receptive_field(&self) -> usize {
-        self.dilation * (self.kernel_size - 1)
+        self.receptive_field
     }
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
@@ -1854,10 +1886,10 @@ impl SlimmableConfig {
             .and_then(|v| v.as_str())
             .ok_or_else(|| NamError::MissingField("slimmable.method".into()))?;
         if method != "slice_channels_uniform" {
-            return Err(NamError::InvalidConfig(format!(
-                "Unsupported slimmable method: {}",
-                method
-            )));
+            return Err(NamError::UnsupportedConfigValue {
+                field: "slimmable.method".into(),
+                value: method.into(),
+            });
         }
         let allowed = value
             .get("kwargs")
@@ -1866,25 +1898,25 @@ impl SlimmableConfig {
             .ok_or_else(|| NamError::MissingField("slimmable.kwargs.allowed_channels".into()))?;
         let allowed_channels = allowed
             .iter()
-            .map(|v| {
-                let channel = v.as_u64().ok_or_else(|| {
-                    NamError::InvalidConfig(
-                        "slimmable.kwargs.allowed_channels contains non-integer value".into(),
-                    )
-                })? as usize;
+            .enumerate()
+            .map(|(index, value)| {
+                let field = format!("slimmable.kwargs.allowed_channels[{index}]");
+                let channel = positive_config_usize(value, &field)?;
                 if channel == 0 || channel > channels {
-                    return Err(NamError::InvalidConfig(format!(
-                        "slimmable allowed channel count {} is outside 1..={}",
-                        channel, channels
-                    )));
+                    return Err(NamError::ConfigValueOutOfRange {
+                        field,
+                        value: channel,
+                        min: 1,
+                        max: channels,
+                    });
                 }
                 Ok(channel)
             })
             .collect::<Result<Vec<_>, _>>()?;
         if allowed_channels.is_empty() {
-            return Err(NamError::InvalidConfig(
-                "slimmable.kwargs.allowed_channels must not be empty".into(),
-            ));
+            return Err(NamError::EmptyConfigArray {
+                field: "slimmable.kwargs.allowed_channels".into(),
+            });
         }
         let active_channels = allowed_channels[allowed_channels.len() - 1];
         Ok(Some(Self {
@@ -1895,9 +1927,10 @@ impl SlimmableConfig {
 
     fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
         if !value.is_finite() {
-            return Err(NamError::InvalidConfig(
-                "Slimming value must be finite".into(),
-            ));
+            return Err(NamError::InvalidConfigField {
+                field: "slimming".into(),
+                reason: "must be finite",
+            });
         }
         let ratio = value.clamp(0.0, 1.0);
         let idx = ((ratio * self.allowed_channels.len() as f64).floor() as usize)
@@ -1923,14 +1956,6 @@ struct WaveNetLayerArray {
 }
 
 impl WaveNetLayerArray {
-    fn receptive_field(&self) -> usize {
-        self.layers
-            .iter()
-            .map(|l| l.conv.receptive_field())
-            .sum::<usize>()
-            + self.head_rechannel.receptive_field()
-    }
-
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
         self.rechannel.set_max_buffer_size(max_buffer_size);
         self.head_rechannel.set_max_buffer_size(max_buffer_size);
@@ -2150,30 +2175,23 @@ impl WaveNetHead {
         in_channels: usize,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
-        let channels = config["channels"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("head.channels".into()))?
-            as usize;
-        let out_channels = config["out_channels"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("head.out_channels".into()))?
-            as usize;
+        let channels = positive_config_usize(&config["channels"], "head.channels")?;
+        let out_channels = positive_config_usize(&config["out_channels"], "head.out_channels")?;
         let activation = Activation::from_json(&config["activation"])?;
         let kernel_sizes = config["kernel_sizes"]
             .as_array()
             .ok_or_else(|| NamError::MissingField("head.kernel_sizes".into()))?;
         if kernel_sizes.is_empty() {
-            return Err(NamError::InvalidConfig(
-                "head.kernel_sizes must be non-empty".into(),
-            ));
+            return Err(NamError::EmptyConfigArray {
+                field: "head.kernel_sizes".into(),
+            });
         }
 
         let mut blocks = Vec::with_capacity(kernel_sizes.len());
         let mut block_in_channels = in_channels;
         for (idx, kernel_size) in kernel_sizes.iter().enumerate() {
-            let kernel_size = kernel_size.as_u64().ok_or_else(|| {
-                NamError::InvalidConfig("head.kernel_sizes contains non-integer value".into())
-            })? as usize;
+            let kernel_size =
+                positive_config_usize(kernel_size, &format!("head.kernel_sizes[{idx}]"))?;
             let block_out_channels = if idx + 1 == kernel_sizes.len() {
                 out_channels
             } else {
@@ -2193,13 +2211,6 @@ impl WaveNetHead {
             blocks,
             input_buf: ColMajorMatrix::new(in_channels, 1),
         })
-    }
-
-    fn receptive_field(&self) -> usize {
-        self.blocks
-            .iter()
-            .map(WaveNetHeadBlock::receptive_field)
-            .sum()
     }
 
     fn out_channels(&self) -> usize {
@@ -2273,9 +2284,10 @@ pub struct WaveNet {
 fn normalize_wavenet_config(config: &serde_json::Value) -> Result<serde_json::Value, NamError> {
     let mut normalized = config.clone();
     let Some(root) = normalized.as_object_mut() else {
-        return Err(NamError::InvalidConfig(
-            "WaveNet config must be a JSON object".into(),
-        ));
+        return Err(NamError::InvalidConfigType {
+            field: "config".into(),
+            expected: "a JSON object",
+        });
     };
 
     if !root.contains_key("layers") {
@@ -2300,9 +2312,10 @@ fn normalize_wavenet_config(config: &serde_json::Value) -> Result<serde_json::Va
 
 fn normalize_layer_array_config(layer: &mut serde_json::Value) -> Result<(), NamError> {
     let Some(layer_obj) = layer.as_object_mut() else {
-        return Err(NamError::InvalidConfig(
-            "WaveNet layer array config must be a JSON object".into(),
-        ));
+        return Err(NamError::InvalidConfigType {
+            field: "layers[]".into(),
+            expected: "a JSON object",
+        });
     };
 
     if let Some(head) = layer_obj.get("head").and_then(|head| head.as_object()) {
@@ -2486,43 +2499,29 @@ impl WaveNet {
 
         let in_channels = config
             .get("in_channels")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+            .map(|value| positive_config_usize(value, "in_channels"))
+            .transpose()?
+            .unwrap_or(1);
 
         for (la_idx, la_json) in layers_json.iter().enumerate() {
-            let input_size = la_json["input_size"]
-                .as_u64()
-                .ok_or_else(|| NamError::MissingField("layer_array.input_size".into()))?
-                as usize;
-            let cond_size = la_json["condition_size"]
-                .as_u64()
-                .ok_or_else(|| NamError::MissingField("layer_array.condition_size".into()))?
-                as usize;
-            let head_size = la_json["head_size"]
-                .as_u64()
-                .ok_or_else(|| NamError::MissingField("layer_array.head_size".into()))?
-                as usize;
-            let channels = la_json["channels"]
-                .as_u64()
-                .ok_or_else(|| NamError::MissingField("layer_array.channels".into()))?
-                as usize;
+            let input_size =
+                positive_config_usize(&la_json["input_size"], "layer_array.input_size")?;
+            let cond_size = config_usize(&la_json["condition_size"], "layer_array.condition_size")?;
+            let head_size = positive_config_usize(&la_json["head_size"], "layer_array.head_size")?;
+            let channels = positive_config_usize(&la_json["channels"], "layer_array.channels")?;
             let bottleneck = la_json
                 .get("bottleneck")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(channels as u64) as usize;
+                .map(|value| positive_config_usize(value, "layer_array.bottleneck"))
+                .transpose()?
+                .unwrap_or(channels);
             let dilations_arr = la_json["dilations"]
                 .as_array()
                 .ok_or_else(|| NamError::MissingField("layer_array.dilations".into()))?;
             let dilations: Vec<usize> = dilations_arr
                 .iter()
-                .map(|v| {
-                    v.as_u64()
-                        .ok_or_else(|| {
-                            NamError::InvalidConfig(
-                                "layer_array.dilations contains non-integer value".into(),
-                            )
-                        })
-                        .map(|n| n as usize)
+                .enumerate()
+                .map(|(index, value)| {
+                    config_usize(value, &format!("layer_array.dilations[{index}]"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -2535,36 +2534,34 @@ impl WaveNet {
                 let has_kernel_sizes = la_json.get("kernel_sizes").is_some();
 
                 if has_kernel_size && has_kernel_sizes {
-                    return Err(NamError::InvalidConfig(format!(
-                        "Layer array {}: only one of kernel_size (int) or kernel_sizes (array) may be provided",
-                        la_idx
-                    )));
+                    return Err(NamError::ConflictingConfigFields {
+                        first: format!("layers[{la_idx}].kernel_size"),
+                        second: format!("layers[{la_idx}].kernel_sizes"),
+                    });
                 } else if has_kernel_sizes {
                     let arr = la_json["kernel_sizes"].as_array().ok_or_else(|| {
-                        NamError::InvalidConfig(format!(
-                            "Layer array {}: kernel_sizes must be an array",
-                            la_idx
-                        ))
+                        NamError::InvalidConfigType {
+                            field: format!("layers[{la_idx}].kernel_sizes"),
+                            expected: "an array",
+                        }
                     })?;
                     let ks: Vec<usize> = arr
                         .iter()
-                        .map(|v| {
-                            v.as_u64()
-                                .ok_or_else(|| {
-                                    NamError::InvalidConfig(
-                                        "kernel_sizes contains non-integer value".into(),
-                                    )
-                                })
-                                .map(|n| n as usize)
+                        .enumerate()
+                        .map(|(index, value)| {
+                            positive_config_usize(
+                                value,
+                                &format!("layers[{la_idx}].kernel_sizes[{index}]"),
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     if ks.len() != num_layers {
-                        return Err(NamError::InvalidConfig(format!(
-                            "Layer array {}: kernel_sizes length ({}) must match dilations length ({})",
-                            la_idx,
-                            ks.len(),
-                            num_layers
-                        )));
+                        return Err(NamError::ConfigLengthMismatch {
+                            field: format!("layers[{la_idx}].kernel_sizes"),
+                            actual: ks.len(),
+                            expected_field: format!("layers[{la_idx}].dilations"),
+                            expected: num_layers,
+                        });
                     }
                     ks
                 } else if has_kernel_size {
@@ -2573,32 +2570,28 @@ impl WaveNet {
                         // Also accept kernel_size as an array (trainer compat)
                         let ks: Vec<usize> = arr
                             .iter()
-                            .map(|v| {
-                                v.as_u64()
-                                    .ok_or_else(|| {
-                                        NamError::InvalidConfig(
-                                            "kernel_size array contains non-integer value".into(),
-                                        )
-                                    })
-                                    .map(|n| n as usize)
+                            .enumerate()
+                            .map(|(index, value)| {
+                                positive_config_usize(
+                                    value,
+                                    &format!("layers[{la_idx}].kernel_size[{index}]"),
+                                )
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         if ks.len() != num_layers {
-                            return Err(NamError::InvalidConfig(format!(
-                                "Layer array {}: kernel_size array length ({}) must match dilations length ({})",
-                                la_idx,
-                                ks.len(),
-                                num_layers
-                            )));
+                            return Err(NamError::ConfigLengthMismatch {
+                                field: format!("layers[{la_idx}].kernel_size"),
+                                actual: ks.len(),
+                                expected_field: format!("layers[{la_idx}].dilations"),
+                                expected: num_layers,
+                            });
                         }
                         ks
                     } else {
-                        let ks = ks_val.as_u64().ok_or_else(|| {
-                            NamError::InvalidConfig(format!(
-                                "Layer array {}: kernel_size must be an integer or array",
-                                la_idx
-                            ))
-                        })? as usize;
+                        let ks = positive_config_usize(
+                            ks_val,
+                            &format!("layers[{la_idx}].kernel_size"),
+                        )?;
                         vec![ks; num_layers]
                     }
                 } else {
@@ -2607,6 +2600,9 @@ impl WaveNet {
                     ));
                 }
             };
+            for (&kernel_size, &dilation) in kernel_sizes.iter().zip(&dilations) {
+                checked_dimension_mul("convolution receptive field", dilation, kernel_size - 1)?;
+            }
 
             // Parse activation configs (per-layer or single)
             let activation_configs: Vec<Activation> = {
@@ -2628,24 +2624,31 @@ impl WaveNet {
             let head_bias = la_json["head_bias"].as_bool().unwrap_or(false);
             let head_kernel_size = la_json
                 .get("head_kernel_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
+                .map(|value| positive_config_usize(value, "layer_array.head_kernel_size"))
+                .transpose()?
+                .unwrap_or(1);
             let slimmable = SlimmableConfig::from_json(la_json.get("slimmable"), channels)?;
 
             // Groups
             let groups_input = la_json
                 .get("groups_input")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
+                .map(|value| positive_config_usize(value, "layer_array.groups_input"))
+                .transpose()?
+                .unwrap_or(1);
             let groups_input_mixin = la_json
                 .get("groups_input_mixin")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
+                .map(|value| positive_config_usize(value, "layer_array.groups_input_mixin"))
+                .transpose()?
+                .unwrap_or(1);
 
             // Layer1x1 config
             let (has_layer1x1, layer1x1_groups) = if let Some(l1x1) = la_json.get("layer1x1") {
                 let active = l1x1.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-                let groups = l1x1.get("groups").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                let groups = l1x1
+                    .get("groups")
+                    .map(|value| positive_config_usize(value, "layer_array.layer1x1.groups"))
+                    .transpose()?
+                    .unwrap_or(1);
                 (active, groups)
             } else {
                 (true, 1) // default: active with groups=1
@@ -2659,9 +2662,14 @@ impl WaveNet {
                     .unwrap_or(false);
                 let out_channels = h1x1
                     .get("out_channels")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(channels as u64) as usize;
-                let groups = h1x1.get("groups").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                    .map(|value| positive_config_usize(value, "layer_array.head1x1.out_channels"))
+                    .transpose()?
+                    .unwrap_or(channels);
+                let groups = h1x1
+                    .get("groups")
+                    .map(|value| positive_config_usize(value, "layer_array.head1x1.groups"))
+                    .transpose()?
+                    .unwrap_or(1);
                 Head1x1Params {
                     active,
                     out_channels,
@@ -2679,73 +2687,88 @@ impl WaveNet {
             let film_params = LayerFiLMParams {
                 conv_pre: la_json
                     .get("conv_pre_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.conv_pre_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 conv_post: la_json
                     .get("conv_post_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.conv_post_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 input_mixin_pre: la_json
                     .get("input_mixin_pre_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.input_mixin_pre_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 input_mixin_post: la_json
                     .get("input_mixin_post_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.input_mixin_post_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 activation_pre: la_json
                     .get("activation_pre_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.activation_pre_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 activation_post: la_json
                     .get("activation_post_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.activation_post_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 layer1x1_post: la_json
                     .get("layer1x1_post_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.layer1x1_post_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
                 head1x1_post: la_json
                     .get("head1x1_post_film")
-                    .map(FiLMParams::from_json)
+                    .map(|value| FiLMParams::from_json(value, "layer_array.head1x1_post_film"))
+                    .transpose()?
                     .unwrap_or_else(FiLMParams::inactive),
             };
 
             if slimmable.is_some() {
                 if condition_dsp.is_some() {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet does not support condition_dsp".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "condition_dsp".into(),
+                        reason: "is incompatible with slimmable layers",
+                    });
                 }
                 if layers_json.len() != 1 {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet supports exactly one layer array".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "layers".into(),
+                        reason: "must contain exactly one array for a slimmable WaveNet",
+                    });
                 }
                 if groups_input != 1 || groups_input_mixin != 1 {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet does not support grouped convolutions".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "groups_input".into(),
+                        reason: "grouped convolutions are incompatible with slimmable layers",
+                    });
                 }
                 if head1x1_params.active {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet does not support head1x1".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "head1x1.active".into(),
+                        reason: "must be false for slimmable layers",
+                    });
                 }
                 if layer1x1_groups != 1 {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet does not support grouped layer1x1".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "layer1x1.groups".into(),
+                        reason: "must be one for slimmable layers",
+                    });
                 }
                 if film_params.any_active() {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet does not support FiLM".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "film".into(),
+                        reason: "must be inactive for slimmable layers",
+                    });
                 }
                 if head_kernel_size != 1 {
-                    return Err(NamError::InvalidConfig(
-                        "SlimmableWaveNet requires head kernel_size 1".into(),
-                    ));
+                    return Err(NamError::InvalidConfigField {
+                        field: "head_kernel_size".into(),
+                        reason: "must be one for slimmable layers",
+                    });
                 }
             }
 
@@ -2812,7 +2835,9 @@ impl WaveNet {
         let head_in_channels = layer_arrays
             .last()
             .map(|la| la.head_rechannel.out_channels)
-            .ok_or_else(|| NamError::InvalidConfig("WaveNet requires at least one layer".into()))?;
+            .ok_or_else(|| NamError::EmptyConfigArray {
+                field: "layers".into(),
+            })?;
         let head = if config.get("head").is_some_and(|head| !head.is_null()) {
             Some(WaveNetHead::from_config(
                 &config["head"],
@@ -2833,12 +2858,35 @@ impl WaveNet {
             .as_ref()
             .map(|d| d.prewarm_samples())
             .unwrap_or(1);
-        let prewarm_samples_count = condition_prewarm
-            + layer_arrays
-                .iter()
-                .map(|la| la.receptive_field())
-                .sum::<usize>()
-            + head.as_ref().map(WaveNetHead::receptive_field).unwrap_or(0);
+        let layer_prewarm = layer_arrays.iter().try_fold(0usize, |total, layer_array| {
+            let layer_total = layer_array.layers.iter().try_fold(
+                layer_array.head_rechannel.receptive_field(),
+                |layer_total, layer| {
+                    checked_dimension_add(
+                        "WaveNet layer receptive field",
+                        layer_total,
+                        layer.conv.receptive_field(),
+                    )
+                },
+            )?;
+            checked_dimension_add("WaveNet receptive field", total, layer_total)
+        })?;
+        let head_prewarm = head
+            .as_ref()
+            .map(|head| {
+                head.blocks.iter().try_fold(0usize, |total, block| {
+                    checked_dimension_add(
+                        "WaveNet head receptive field",
+                        total,
+                        block.receptive_field(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let prewarm_samples_count =
+            checked_dimension_add("WaveNet prewarm", condition_prewarm, layer_prewarm)
+                .and_then(|total| checked_dimension_add("WaveNet prewarm", total, head_prewarm))?;
 
         // Determine condition output channels
         let cond_out_ch = if let Some(ref cdsp) = condition_dsp {
@@ -2896,9 +2944,9 @@ impl WaveNet {
         if found {
             Ok(())
         } else {
-            Err(NamError::InvalidConfig(
-                "WaveNet does not have slimmable layer arrays".into(),
-            ))
+            Err(NamError::UnsupportedOperation {
+                operation: "slimmable width selection on a non-slimmable WaveNet",
+            })
         }
     }
 
@@ -3248,10 +3296,10 @@ fn parse_gating_and_secondary(
             "gated" => Ok(GatingMode::Gated),
             "blended" => Ok(GatingMode::Blended),
             "none" => Ok(GatingMode::None),
-            other => Err(NamError::InvalidConfig(format!(
-                "Invalid gating_mode: {}",
-                other
-            ))),
+            other => Err(NamError::UnsupportedConfigValue {
+                field: "gating_mode".into(),
+                value: other.into(),
+            }),
         }
     };
 
@@ -3266,9 +3314,14 @@ fn parse_gating_and_secondary(
             let sec_val = la_json.get("secondary_activation");
 
             for (idx, gm_json) in arr.iter().enumerate() {
-                let mode_str = gm_json.as_str().ok_or_else(|| {
-                    NamError::InvalidConfig("gating_mode element not string".into())
-                })?;
+                let mode_str =
+                    gm_json
+                        .as_str()
+                        .ok_or_else(|| NamError::InvalidConfigArrayElement {
+                            field: "gating_mode".into(),
+                            index: idx,
+                            expected: "a string",
+                        })?;
                 let mode = parse_gating_str(mode_str)?;
                 modes.push(mode);
 
@@ -4069,15 +4122,10 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        let err = result
-            .err()
-            .expect("Both kernel_size and kernel_sizes should be rejected");
-        let err_msg = format!("{}", err);
-        assert!(
-            err_msg.contains("only one of"),
-            "Error should mention mutual exclusivity: {}",
-            err_msg
-        );
+        assert!(matches!(
+            result,
+            Err(NamError::ConflictingConfigFields { .. })
+        ));
     }
 
     #[test]
@@ -4087,15 +4135,30 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
         let metadata = DspMetadata::default();
         let result = WaveNet::from_config(&config, &weights, metadata);
-        let err = result
-            .err()
-            .expect("Mismatched kernel_sizes length should be rejected");
-        let err_msg = format!("{}", err);
-        assert!(
-            err_msg.contains("must match"),
-            "Error should mention length mismatch: {}",
-            err_msg
-        );
+        assert!(matches!(result, Err(NamError::ConfigLengthMismatch { .. })));
+    }
+
+    #[test]
+    fn test_receptive_field_overflow_is_rejected_before_reading_weights() {
+        let (config_str, _) = make_kernel_size_config(r#""kernel_size": 3"#, 1);
+        let mut config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+        config["layers"][0]["dilations"][0] = serde_json::json!(u64::MAX);
+
+        let result = WaveNet::from_config(&config, &[], DspMetadata::default());
+
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            result,
+            Err(NamError::DimensionOverflow {
+                context: "convolution receptive field",
+                ..
+            })
+        ));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            result,
+            Err(NamError::ConfigIntegerOutOfRange { .. })
+        ));
     }
 
     #[test]

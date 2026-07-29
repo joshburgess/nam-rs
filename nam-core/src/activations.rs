@@ -192,8 +192,9 @@ impl Activation {
                 .get("type")
                 .or_else(|| obj.get("name"))
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    NamError::InvalidConfig("activation object missing 'type' or 'name'".into())
+                .ok_or_else(|| NamError::InvalidConfigField {
+                    field: "activation".into(),
+                    reason: "object must contain a string 'type' or 'name'",
                 })?;
 
             match type_name {
@@ -252,10 +253,10 @@ impl Activation {
             }
         } else {
             // Empty or null -> default identity-like (just use Tanh as fallback)
-            Err(NamError::InvalidConfig(format!(
-                "activation config is neither string nor object: {:?}",
-                val
-            )))
+            Err(NamError::InvalidConfigType {
+                field: "activation".into(),
+                expected: "a string or object",
+            })
         }
     }
 }

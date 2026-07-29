@@ -3,7 +3,9 @@ use ndarray::{Array1, Array2, ArrayView1};
 use crate::activations::Activation;
 use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::WeightIter;
+use crate::util::{
+    checked_dimension_add, checked_dimension_mul, positive_config_usize, WeightIter,
+};
 
 /// Batch normalization (inference mode only): y = scale * x + loc.
 struct BatchNorm {
@@ -53,6 +55,7 @@ impl Conv1d {
         has_bias: bool,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
+        checked_dimension_mul("ConvNet convolution weight", out_channels, in_channels)?;
         // Weight layout: for group 0 (groups=1): for out_ch, for in_ch, for kernel_tap
         let kernel_size = 2;
         let mut w0 = Array2::<f32>::zeros((out_channels, in_channels));
@@ -178,16 +181,14 @@ impl ConvNet {
         weights: &[f32],
         metadata: DspMetadata,
     ) -> Result<Self, NamError> {
-        let channels = config["channels"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("channels".into()))?
-            as usize;
+        let channels = positive_config_usize(&config["channels"], "channels")?;
         let dilations: Vec<usize> = config["dilations"]
             .as_array()
             .ok_or_else(|| NamError::MissingField("dilations".into()))?
             .iter()
-            .map(|v| v.as_u64().unwrap_or(1) as usize)
-            .collect();
+            .enumerate()
+            .map(|(index, value)| positive_config_usize(value, &format!("dilations[{index}]")))
+            .collect::<Result<_, _>>()?;
         let use_batchnorm = config["batchnorm"].as_bool().unwrap_or(false);
 
         let activation_val = &config["activation"];
@@ -199,12 +200,27 @@ impl ConvNet {
 
         let in_channels = config
             .get("in_channels")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+            .map(|value| positive_config_usize(value, "in_channels"))
+            .transpose()?
+            .unwrap_or(1);
         let out_channels = config
             .get("out_channels")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+            .map(|value| positive_config_usize(value, "out_channels"))
+            .transpose()?
+            .unwrap_or(1);
+        let prewarm_samples = dilations.iter().try_fold(1usize, |total, &dilation| {
+            checked_dimension_add("ConvNet prewarm", total, dilation)
+        })?;
+        let num_levels = checked_dimension_add("ConvNet history levels", dilations.len(), 1)?;
+        for level in 0..num_levels {
+            let level_channels = if level == 0 { in_channels } else { channels };
+            let needed = if level < dilations.len() {
+                checked_dimension_add("ConvNet history length", dilations[level], 1)?
+            } else {
+                1
+            };
+            checked_dimension_mul("ConvNet history", needed, level_channels)?;
+        }
 
         let mut iter = WeightIter::new(weights);
         let mut blocks = Vec::with_capacity(dilations.len());
@@ -224,8 +240,6 @@ impl ConvNet {
         let head = Head::from_weights(channels, out_channels, &mut iter)?;
         iter.assert_exhausted()?;
 
-        let prewarm_samples = 1 + dilations.iter().sum::<usize>();
-
         // Compute max history needed: max dilation
         // We need history for each "level" (block input). The history length needed
         // at each level is the dilation of that block + 1.
@@ -234,16 +248,16 @@ impl ConvNet {
 
         // History buffers: for each block level (0 = input, 1..N = after block i-1)
         // we need dilation[i] + 1 frames of history.
-        let num_levels = dilations.len() + 1; // input + after each block
         let mut history = Vec::with_capacity(num_levels);
         for level in 0..num_levels {
             let level_channels = if level == 0 { in_channels } else { channels };
             // Need enough history for the max dilation that reads from this level
             let needed = if level < dilations.len() {
-                dilations[level] + 1
+                checked_dimension_add("ConvNet history length", dilations[level], 1)?
             } else {
                 1 // last level is only read by head, needs 1 frame
             };
+            checked_dimension_mul("ConvNet history", needed, level_channels)?;
             let buf: Vec<Vec<f32>> = (0..needed).map(|_| vec![0.0; level_channels]).collect();
             history.push(buf);
         }
@@ -560,5 +574,31 @@ mod tests {
         let input: Vec<Sample> = vec![];
         let mut output: Vec<Sample> = vec![];
         model.process(&input, &mut output);
+    }
+
+    #[test]
+    fn test_convnet_rejects_prewarm_overflow_before_reading_weights() {
+        let config = serde_json::json!({
+            "channels": 1,
+            "dilations": [u64::MAX],
+            "batchnorm": false,
+            "activation": "Tanh",
+        });
+
+        let result = ConvNet::from_config(&config, &[], DspMetadata::default());
+
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            result,
+            Err(NamError::DimensionOverflow {
+                context: "ConvNet prewarm",
+                ..
+            })
+        ));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            result,
+            Err(NamError::ConfigIntegerOutOfRange { .. })
+        ));
     }
 }

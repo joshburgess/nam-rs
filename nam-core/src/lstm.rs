@@ -2,7 +2,9 @@ use ndarray::{Array1, Array2};
 
 use crate::dsp::{ActivationMode, Dsp, DspMetadata, Sample};
 use crate::error::NamError;
-use crate::util::{sigmoid, tanh, WeightIter};
+use crate::util::{
+    checked_dimension_add, checked_dimension_mul, positive_config_usize, sigmoid, tanh, WeightIter,
+};
 
 struct LstmCell {
     /// Combined weight matrix [4*hidden, input_size + hidden_size], row-major.
@@ -22,17 +24,24 @@ struct LstmCell {
     hidden_size: usize,
 }
 
+#[derive(Clone, Copy)]
+struct LstmDimensions {
+    input: usize,
+    hidden: usize,
+    combined: usize,
+    gates: usize,
+}
+
 impl LstmCell {
     fn new(
         w: Array2<f32>,
         b: Array1<f32>,
         initial_hidden: Array1<f32>,
         initial_cell: Array1<f32>,
-        input_size: usize,
-        hidden_size: usize,
+        dimensions: LstmDimensions,
     ) -> Self {
-        let mut xh = Array1::zeros(input_size + hidden_size);
-        xh.slice_mut(ndarray::s![input_size..])
+        let mut xh = Array1::zeros(dimensions.combined);
+        xh.slice_mut(ndarray::s![dimensions.input..])
             .assign(&initial_hidden);
         Self {
             w,
@@ -41,9 +50,9 @@ impl LstmCell {
             c: initial_cell.clone(),
             initial_hidden,
             initial_cell,
-            ifgo: Array1::zeros(4 * hidden_size),
-            input_size,
-            hidden_size,
+            ifgo: Array1::zeros(dimensions.gates),
+            input_size: dimensions.input,
+            hidden_size: dimensions.hidden,
         }
     }
 
@@ -104,31 +113,20 @@ impl Lstm {
         weights: &[f32],
         metadata: DspMetadata,
     ) -> Result<Self, NamError> {
-        let num_layers = config["num_layers"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("num_layers".into()))?
-            as usize;
-        if num_layers == 0 {
-            return Err(NamError::InvalidConfig(
-                "LSTM num_layers must be greater than zero".into(),
-            ));
-        }
-        let input_size = config["input_size"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("input_size".into()))?
-            as usize;
-        let hidden_size = config["hidden_size"]
-            .as_u64()
-            .ok_or_else(|| NamError::MissingField("hidden_size".into()))?
-            as usize;
+        let num_layers = positive_config_usize(&config["num_layers"], "num_layers")?;
+        let input_size = positive_config_usize(&config["input_size"], "input_size")?;
+        let hidden_size = positive_config_usize(&config["hidden_size"], "hidden_size")?;
+        let gate_size = checked_dimension_mul("LSTM gate", 4, hidden_size)?;
 
         let mut iter = WeightIter::new(weights);
-        let mut cells = Vec::with_capacity(num_layers);
+        let mut cells = Vec::new();
 
         for i in 0..num_layers {
             let layer_input_size = if i == 0 { input_size } else { hidden_size };
-            let w = iter.take_matrix(4 * hidden_size, layer_input_size + hidden_size)?;
-            let b = iter.take_vector(4 * hidden_size)?;
+            let combined_size =
+                checked_dimension_add("LSTM input and hidden", layer_input_size, hidden_size)?;
+            let w = iter.take_matrix(gate_size, combined_size)?;
+            let b = iter.take_vector(gate_size)?;
             let initial_hidden = iter.take_vector(hidden_size)?;
             let initial_cell = iter.take_vector(hidden_size)?;
 
@@ -137,8 +135,12 @@ impl Lstm {
                 b,
                 initial_hidden,
                 initial_cell,
-                layer_input_size,
-                hidden_size,
+                LstmDimensions {
+                    input: layer_input_size,
+                    hidden: hidden_size,
+                    combined: combined_size,
+                    gates: gate_size,
+                },
             ));
         }
 
@@ -436,6 +438,31 @@ mod tests {
             panic!("zero-layer LSTM should fail");
         };
         assert!(format!("{err}").contains("num_layers"));
+    }
+
+    #[test]
+    fn test_lstm_rejects_gate_dimension_overflow() {
+        let config = serde_json::json!({
+            "input_size": 1,
+            "hidden_size": u64::MAX,
+            "num_layers": 1
+        });
+
+        let result = Lstm::from_config(&config, &[], DspMetadata::default());
+
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            result,
+            Err(NamError::DimensionOverflow {
+                context: "LSTM gate",
+                ..
+            })
+        ));
+        #[cfg(not(target_pointer_width = "64"))]
+        assert!(matches!(
+            result,
+            Err(NamError::ConfigIntegerOutOfRange { .. })
+        ));
     }
 
     #[test]

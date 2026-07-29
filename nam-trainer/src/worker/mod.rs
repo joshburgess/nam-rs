@@ -1392,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_allows_a_cooperative_child_to_exit() {
+    fn system_worker_sends_cooperative_cancellation() {
         let Some(python) = python_for_tests() else {
             return;
         };
@@ -1405,13 +1405,13 @@ mod tests {
             .spawn()
             .unwrap();
         let child_stdin = child.stdin.take();
-        let cancelled = AtomicBool::new(true);
         let mut process = SystemWorkerProcess {
             child,
             stdin: child_stdin,
         };
 
-        let exit_code = wait_for_child(&mut process, &cancelled, &SystemClock);
+        process.request_cancel().unwrap();
+        let exit_code = process.wait().unwrap();
 
         assert_eq!(exit_code, Some(0));
     }

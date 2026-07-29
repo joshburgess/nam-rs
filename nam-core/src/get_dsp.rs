@@ -60,9 +60,13 @@ fn get_dsp_from_value_inner(
         .ok_or_else(|| NamError::MissingField("weights".into()))?
         .iter()
         .enumerate()
-        .map(|(idx, v)| {
+        .map(|(index, v)| {
             v.as_f64().map(|value| value as f32).ok_or_else(|| {
-                NamError::InvalidConfig(format!("weight at index {idx} is not a number"))
+                NamError::InvalidConfigArrayElement {
+                    field: "weights".into(),
+                    index,
+                    expected: "a number",
+                }
             })
         })
         .collect::<Result<_, _>>()?;
@@ -178,9 +182,9 @@ impl Sequential {
             .as_array()
             .ok_or_else(|| NamError::MissingField("config.models".into()))?;
         if model_entries.is_empty() {
-            return Err(NamError::InvalidConfig(
-                "Sequential models must be non-empty".into(),
-            ));
+            return Err(NamError::EmptyConfigArray {
+                field: "config.models".into(),
+            });
         }
 
         let mut models = Vec::with_capacity(model_entries.len());
@@ -300,9 +304,9 @@ impl SlimmableContainer {
             .ok_or_else(|| NamError::MissingField("config.submodels".into()))?;
 
         if submodels_json.is_empty() {
-            return Err(NamError::InvalidConfig(
-                "SlimmableContainer: submodels array is empty".into(),
-            ));
+            return Err(NamError::EmptyConfigArray {
+                field: "config.submodels".into(),
+            });
         }
 
         let mut submodels = Vec::with_capacity(submodels_json.len());
@@ -355,9 +359,10 @@ impl Dsp for SlimmableContainer {
 
     fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
         if !value.is_finite() {
-            return Err(NamError::InvalidConfig(
-                "Slimming value must be finite".into(),
-            ));
+            return Err(NamError::InvalidConfigField {
+                field: "slimming".into(),
+                reason: "must be finite",
+            });
         }
         let ratio = value.clamp(0.0, 1.0);
         let idx = self
@@ -493,7 +498,14 @@ mod tests {
         let Err(err) = get_dsp_from_json(json) else {
             panic!("non-numeric weight should fail");
         };
-        assert!(format!("{err}").contains("not a number"));
+        assert!(matches!(
+            err,
+            NamError::InvalidConfigArrayElement {
+                field,
+                index: 0,
+                ..
+            } if field == "weights"
+        ));
     }
 
     #[test]
@@ -1126,7 +1138,10 @@ mod tests {
         let Err(err) = get_dsp_from_json(json) else {
             panic!("Sequential with no models should fail");
         };
-        assert!(format!("{}", err).contains("non-empty"));
+        assert!(matches!(
+            err,
+            NamError::EmptyConfigArray { field } if field == "config.models"
+        ));
     }
 
     #[test]

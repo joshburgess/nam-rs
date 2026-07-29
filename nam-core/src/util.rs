@@ -1,6 +1,55 @@
 use crate::dsp::ActivationMode;
 use crate::error::NamError;
 
+pub fn config_usize(value: &serde_json::Value, field: &str) -> Result<usize, NamError> {
+    if value.is_null() {
+        return Err(NamError::MissingField(field.into()));
+    }
+    let value = value.as_u64().ok_or_else(|| NamError::InvalidConfigType {
+        field: field.into(),
+        expected: "a non-negative integer",
+    })?;
+    usize::try_from(value).map_err(|_| NamError::ConfigIntegerOutOfRange {
+        field: field.into(),
+        value,
+    })
+}
+
+pub fn positive_config_usize(value: &serde_json::Value, field: &str) -> Result<usize, NamError> {
+    let value = config_usize(value, field)?;
+    if value == 0 {
+        return Err(NamError::InvalidConfigField {
+            field: field.into(),
+            reason: "must be greater than zero",
+        });
+    }
+    Ok(value)
+}
+
+pub fn checked_dimension_add(
+    context: &'static str,
+    left: usize,
+    right: usize,
+) -> Result<usize, NamError> {
+    left.checked_add(right).ok_or(NamError::DimensionOverflow {
+        context,
+        left,
+        right,
+    })
+}
+
+pub fn checked_dimension_mul(
+    context: &'static str,
+    left: usize,
+    right: usize,
+) -> Result<usize, NamError> {
+    left.checked_mul(right).ok_or(NamError::DimensionOverflow {
+        context,
+        left,
+        right,
+    })
+}
+
 /// Fast tanh polynomial approximation matching C++ NAM implementation.
 /// Max error ~3e-4 vs std::tanh.
 #[inline]
@@ -70,11 +119,7 @@ impl<'a> WeightIter<'a> {
         rows: usize,
         cols: usize,
     ) -> Result<ndarray::Array2<f32>, NamError> {
-        let len = rows.checked_mul(cols).ok_or(NamError::DimensionOverflow {
-            context: "weight matrix",
-            left: rows,
-            right: cols,
-        })?;
+        let len = checked_dimension_mul("weight matrix", rows, cols)?;
         let data = self.take(len)?;
         Ok(ndarray::Array2::from_shape_vec(
             (rows, cols),
