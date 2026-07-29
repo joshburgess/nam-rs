@@ -123,6 +123,58 @@ Neither prototype met the repository requirement of at least 10% improvement
 for the complete callback on a supported platform. Both were removed. The
 scalar fallback remains the default small-matrix implementation.
 
+### Conv1d matrix-path evaluation
+
+On 2026-07-29, symbolized native Linux x86-64 Callgrind profiles and Apple M4
+Criterion measurements were used to split the standard A1 Conv1d path.
+
+The native x86-64 profiles measured the complete callback at every maintained
+size:
+
+| Frames | Instructions | Conv1d inclusive | Matrix input packing | Bias arithmetic |
+|-------:|-------------:|-----------------:|---------------------:|----------------:|
+| 32 | 2,048,948 | 22.05% | 5.15% | 0.92% |
+| 64 | 4,110,634 | 22.46% | 5.13% | 0.91% |
+| 128 | 8,237,169 | 22.69% | 5.12% | 0.91% |
+| 256 | 16,477,384 | 22.68% | 5.12% | 0.91% |
+
+The remaining Conv1d cost consists of direct `nano-gemm` multiplication,
+output accumulation, ring-buffer writes, tap selection, validation, and loop
+overhead. The immutable column-major weights are not repacked in the callback.
+Inputs are transposed once per tap into reset-sized 8-column panels.
+`nano-gemm` creates a small dispatch plan per panel, accounting for about 1.3%
+of the complete 64-frame callback.
+
+A prototype concatenated the three immutable tap matrices at model load,
+packed all three input views into one scratch layout, and evaluated one
+combined-inner GEMM per convolution. It remained allocation-free and passed
+the matrix oracle, exact callback-partition and reset tests, and both upstream
+A2 render fixtures. It increased the complete A1 callback time:
+
+| Frames | Apple M4 baseline | Fused taps | Change |
+|-------:|------------------:|-----------:|-------:|
+| 32 | 58.591 us | 62.377 us | 6.46% slower |
+| 64 | 115.30 us | 123.74 us | 7.32% slower |
+| 128 | 228.87 us | 245.32 us | 7.19% slower |
+| 256 | 454.67 us | 479.47 us | 5.45% slower |
+
+The same x86-64 binary was measured under Rosetta to exercise the non-AArch64
+backend before rejection:
+
+| Frames | Baseline | Fused taps | Change |
+|-------:|---------:|-----------:|-------:|
+| 32 | 151.38 us | 152.39 us | 0.67% slower |
+| 64 | 298.63 us | 300.35 us | 0.58% slower |
+| 128 | 595.34 us | 597.74 us | 0.40% slower |
+| 256 | 1.1895 ms | 1.2103 ms | 1.75% slower |
+
+The longer accumulator dependency chain and more complex tap-aware packing
+cost more than the saved output passes. The prototype was removed. Packing,
+plan construction, and bias together provide less than 10% theoretical
+full-callback headroom, so isolated changes to those operations cannot meet
+the retention gate. A future attempt would need a complete architecture-
+specific packed-weight kernel that also replaces most of the multiplication.
+
 ## Key Insights
 
 ### 1. The bottleneck is small-matrix GEMM
@@ -153,8 +205,9 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 The allocation-free backend covers the batched matrix path. The measured NEON
 and AVX2/FMA small-matrix prototypes did not clear the retention threshold.
-Further A1 work should begin with a new full-callback profile and target a path
-with more than 10% achievable headroom.
+The fused Conv1d tap prototype also regressed on both backend families.
+Further A1 work requires a complete packed-weight matrix kernel or a different
+path with more than 10% achievable full-callback headroom.
 
 ## Real-world impact of the performance gap
 
