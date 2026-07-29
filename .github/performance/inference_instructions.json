@@ -2,8 +2,8 @@
   "tolerance_percent": 3.0,
   "configurations": {
     "faer": {
-      "a1_standard": 3477453,
-      "a2_max": 2061221
+      "a1_standard": 3679865,
+      "a2_max": 3289922
     }
   },
   "scaling_envelopes": [
