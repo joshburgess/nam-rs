@@ -30,11 +30,11 @@ thiserror = "2"
 approx = "0.5"
 criterion = "0.5"
 hound = "3.5"
-iai-callgrind = { version = "0.16", features = ["client_requests_defs"] }
+iai-callgrind = { version = "0.14", features = ["client_requests_defs"] }
 proptest = "1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-iai-callgrind = { version = "0.16", features = ["client_requests"] }
+iai-callgrind = { version = "0.14", features = ["client_requests"] }
 
 [[bench]]
 name = "inference"

@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
 use iai_callgrind::{
-    client_requests::callgrind, library_benchmark, library_benchmark_group, main, Callgrind,
-    EntryPoint, LibraryBenchmarkConfig,
+    client_requests::callgrind, library_benchmark, library_benchmark_group, main, EntryPoint,
+    LibraryBenchmarkConfig,
 };
 use nam_plugin::benchmark::CallbackCase;
 use std::hint::black_box;
@@ -25,13 +25,12 @@ fn callback(mut case: CallbackCase) {
 library_benchmark_group!(name = callback_group; benchmarks = callback);
 main!(
     config = LibraryBenchmarkConfig::default()
+        .callgrind_args(["collect-atstart=no"])
         .env(
             "GLIBC_TUNABLES",
             "glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-AVX,-AVX2,-FMA,-AVX512,-AVX512F,-AVX512CD,-AVX512BW,-AVX512DQ,-AVX512VL",
         )
         .env("LD_HWCAP_MASK", "0")
-        .tool(
-            Callgrind::with_args(["--collect-atstart=no"]).entry_point(EntryPoint::None),
-        );
+        .entry_point(EntryPoint::None);
     library_benchmark_groups = callback_group
 );

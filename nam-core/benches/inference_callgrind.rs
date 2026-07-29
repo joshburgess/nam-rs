@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
 use iai_callgrind::{
-    client_requests::callgrind, library_benchmark, library_benchmark_group, main, Callgrind,
-    EntryPoint, LibraryBenchmarkConfig,
+    client_requests::callgrind, library_benchmark, library_benchmark_group, main, EntryPoint,
+    LibraryBenchmarkConfig,
 };
 use std::hint::black_box;
 use std::path::Path;
@@ -44,13 +44,12 @@ fn inference((mut model, input, mut output): InferenceCase) {
 library_benchmark_group!(name = inference_group; benchmarks = inference);
 main!(
     config = LibraryBenchmarkConfig::default()
+        .callgrind_args(["collect-atstart=no"])
         .env(
             "GLIBC_TUNABLES",
             "glibc.cpu.hwcaps=-SSSE3,-SSE4_1,-SSE4_2,-AVX,-AVX2,-FMA,-AVX512,-AVX512F,-AVX512CD,-AVX512BW,-AVX512DQ,-AVX512VL",
         )
         .env("LD_HWCAP_MASK", "0")
-        .tool(
-            Callgrind::with_args(["--collect-atstart=no"]).entry_point(EntryPoint::None),
-        );
+        .entry_point(EntryPoint::None);
     library_benchmark_groups = inference_group
 );

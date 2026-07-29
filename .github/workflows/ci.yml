@@ -246,7 +246,7 @@ jobs:
           ./configure --prefix=/usr/local
           make -j2
           sudo make install
-          cargo install iai-callgrind-runner --version 0.16.1 --locked
+          cargo install iai-callgrind-runner --version 0.14.2 --locked
 
       - name: Measure A1 and A2 inference
         run: >-
@@ -292,7 +292,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Install Callgrind runner
-        run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+        run: cargo install iai-callgrind-runner --version 0.14.2 --locked
 
       - name: Measure complete callback and resampling
         run: >-
