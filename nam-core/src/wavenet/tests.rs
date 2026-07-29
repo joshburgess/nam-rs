@@ -290,7 +290,8 @@ proptest! {
         let alpha = 0.75f32;
         let beta = -0.25f32;
 
-        let layout = MatrixLayout::new(m, k).unwrap();
+        let mut layout = MatrixLayout::new(m, k).unwrap();
+        layout.set_max_buffer_size(n);
         prop_assert!(layout.multiply(n, alpha, &a, &b, stride, beta, &mut actual));
         for column in 0..n {
             for row in 0..m {
@@ -554,6 +555,58 @@ fn test_reset_clears_state() {
             i,
             out_reset[i],
             out_fresh[i]
+        );
+    }
+}
+
+fn render_fixture_with_partitions(
+    model_name: &str,
+    input: &[Sample],
+    partitions: &[usize],
+) -> Vec<Sample> {
+    let mut model = load_wavenet(model_name).unwrap();
+    model.reset(48_000.0, input.len());
+    let mut output = vec![Sample::default(); input.len()];
+    let mut offset = 0usize;
+    let mut partition = 0usize;
+    while offset < input.len() {
+        let frames = partitions[partition % partitions.len()].min(input.len() - offset);
+        model.process(
+            &input[offset..offset + frames],
+            &mut output[offset..offset + frames],
+        );
+        offset += frames;
+        partition += 1;
+    }
+    output
+}
+
+#[test]
+fn standard_wavenets_preserve_streaming_and_reset_behavior() {
+    let input = (0..256)
+        .map(|index| ((index as Sample + 1.0) * 0.017).sin() * 0.25)
+        .collect::<Vec<_>>();
+    let disturbance = vec![0.5 as Sample; 128];
+
+    for model_name in ["wavenet_a1_standard.nam", "wavenet_a2_max.nam"] {
+        let whole = render_fixture_with_partitions(model_name, &input, &[input.len()]);
+        let partitioned = render_fixture_with_partitions(model_name, &input, &[17, 31, 5, 64]);
+        assert_eq!(
+            partitioned, whole,
+            "{model_name} changed output across callback partitions"
+        );
+
+        let mut reused = load_wavenet(model_name).unwrap();
+        reused.reset(48_000.0, 256);
+        let mut discarded = vec![Sample::default(); disturbance.len()];
+        reused.process(&disturbance, &mut discarded);
+        reused.reset(48_000.0, 256);
+        let mut after_reset = vec![Sample::default(); input.len()];
+        reused.process(&input, &mut after_reset);
+
+        assert_eq!(
+            after_reset, whole,
+            "{model_name} reset did not restore fresh state"
         );
     }
 }

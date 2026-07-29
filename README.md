@@ -121,20 +121,8 @@ cargo build --release --features fast-kernels
 | Standard WaveNet (16/8ch, 20 layers) | 63ms | 73ms | 1.16x |
 | a2_max (all advanced features) | 58ms | 69ms | 1.19x |
 
-### With `fast-kernels` + `faer` features (best performance)
-
-```bash
-cargo build --release --features fast-kernels,faer
-```
-
-| Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
-|-------|----------------|-----------------|--------|
-| Small WaveNet | 5ms | 7ms | 1.4x |
-| LSTM | 5ms | 6ms | 1.2x |
-| Standard WaveNet (16/8ch, 20 layers) | 63ms | 68ms | **1.08x** |
-| a2_max (all advanced features) | 58ms | 70ms | 1.21x |
-
-The `faer` feature replaces the default `matrixmultiply` GEMM with [faer](https://github.com/sarah-ek/faer-rs)'s GEMM kernel, which is better tuned for the small matrix sizes (8x16) used in WaveNet's SGEMM path. It closes the Standard WaveNet gap from 16% to 8%. It has minimal effect on a2_max since that model's matrices are too small for the SGEMM path.
+The `faer` feature remains available for build compatibility. WaveNet now uses
+the same allocation-free matrix backend with or without that feature.
 
 All models run well within real-time at any buffer size.
 

@@ -40,16 +40,21 @@ Criterion benchmarks A1 standard and A2 max at 32, 64, 128, and 256-sample
 callbacks. It also compares direct and FFT Linear processing from 256 through
 16,384 taps.
 
-The July 2026 Apple Silicon run produced:
+The allocation-free WaveNet run on Apple Silicon produced:
 
-| Callback | A1 standard | A2 max |
-|---------:|------------:|-------:|
-| 32 samples | 71.4 us | 39.5 us |
-| 64 samples | 134.4 us | 78.3 us |
-| 128 samples | 268.6 us | 151.9 us |
-| 256 samples | 537.5 us | 278.2 us |
+| Callback | Default A1 | Default A2 | `fast-kernels` A1 | `fast-kernels` A2 |
+|---------:|-----------:|-----------:|------------------:|------------------:|
+| 32 samples | 58.2 us | 31.7 us | 37.7 us | 19.5 us |
+| 64 samples | 115.4 us | 62.4 us | 72.9 us | 38.0 us |
+| 128 samples | 229.6 us | 119.1 us | 143.4 us | 75.6 us |
+| 256 samples | 456.8 us | 245.7 us | 286.7 us | 151.2 us |
 
-The Linux CI Callgrind job enforces:
+Against the immediately preceding backend, the default build stayed within
+4.0% at every measured size. The `fast-kernels` build stayed within 7.0%.
+The new path preserves the bit-identical A2 render on Apple Silicon.
+
+Linux CI enforces these Callgrind budgets independently for the default,
+`faer`, and `fast-kernels` builds:
 
 - A1 and A2 instruction baselines at 64 samples.
 - Per-sample scaling envelopes at 16, 32, 128, and 256 samples.
@@ -65,6 +70,7 @@ The Linux CI Callgrind job enforces:
 |-------------|--------|-----------------|
 | Block-based processing | Per-sample → block GEMM. a2_max: 0.75 → 4.77e-06 diff | Massive improvement |
 | matrixmultiply::sgemm | 3x speedup on standard WaveNet (1200ms → 399ms) | None on small models, small change on a2_max |
+| Reset-sized matrix scratch and allocation-free 8x8 kernels | Removed 82 A1 and 14 A2 allocations per 128-sample callback | Preserves bit-identical A2 output on Apple Silicon |
 | sgemm threshold=64 | Better than threshold=32 for a2_max (350ms → 257ms) | None |
 | target-cpu=native | ~2x improvement early on | None |
 | Slice-based bounds elimination | Minor improvement | None |
@@ -86,7 +92,11 @@ The Linux CI Callgrind job enforces:
 
 ### 1. The bottleneck is small-matrix GEMM
 
-The standard WaveNet's hot path is 16x16 and 8x8 matrix-vector multiplies (with 64 frames batched). These are too small for general-purpose BLAS to be optimal (packing overhead dominates) but too large for scalar code to be competitive. Eigen solves this with hand-written SIMD micro-kernels sized exactly for these dimensions. `matrixmultiply` gets close but not equal.
+The standard WaveNet's hot path is 16x16 and 8x8 matrix-vector multiplies with
+multiple frames batched. These are too small for general-purpose BLAS to be
+optimal, but too large for scalar code to be competitive. The current backend
+uses reset-sized packing scratch and an 8x8 NEON kernel on AArch64. Other
+architectures use allocation-free `nano-gemm` microkernels.
 
 ### 2. Accuracy and performance trade off through FP accumulation order
 
@@ -104,21 +114,12 @@ Despite C++ getting 1.5-2x speedup from fast_tanh, in my Rust implementation tan
 
 For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loops are competitive with or faster than C++. The gap only appears at channels ≥ 16 where Eigen's SIMD micro-kernels have a significant advantage.
 
-## What would close the remaining gap
+## Remaining performance work
 
-The only approach that could close the 1.4x gap on the standard WaveNet without accuracy regression would be writing hand-tuned SIMD micro-kernels for the specific matrix sizes used by NAM:
-
-- 16x16 weight × 16-element input (Conv1d and Layer1x1 in array 0)
-- 8x8 weight × 8-element input (Conv1d and Layer1x1 in array 1)
-- 16x8 and 8x16 for cross-array operations
-
-This would require:
-- Platform-specific code (SSE4/AVX2 for x86, NEON for ARM)
-- Register blocking: process 4-8 output elements per inner loop iteration
-- No packing overhead (matrices fit in L1 cache)
-- Matching Eigen's exact accumulation order to preserve accuracy
-
-Estimated effort: 500-1000 lines of unsafe SIMD intrinsics per platform. The payoff would be matching C++ performance exactly, but the code would be harder to maintain and platform-specific.
+The allocation-free backend covers the batched matrix path. Further A1 work is
+limited to the smaller matrix path. A platform-specific SIMD implementation is
+only justified if profiles show that path is material and benchmarks clear the
+repository's performance threshold without changing render accuracy.
 
 ## Real-world impact of the performance gap
 

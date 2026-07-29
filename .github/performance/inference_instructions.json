@@ -1,7 +1,15 @@
 {
   "tolerance_percent": 3.0,
   "configurations": {
+    "default": {
+      "a1_standard": 3679865,
+      "a2_max": 3289922
+    },
     "faer": {
+      "a1_standard": 3679865,
+      "a2_max": 3289922
+    },
+    "fast-kernels": {
       "a1_standard": 3679865,
       "a2_max": 3289922
     }

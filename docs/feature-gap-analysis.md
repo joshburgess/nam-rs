@@ -69,8 +69,23 @@ The post-A2 Core changes covered by this audit are the LSTM real-time fix
 ## Real-Time and Performance Parity
 
 Complete plugin-callback allocation tests exercise real two-layer LSTM,
-Sequential, packed A2, and FFT Linear models. Model construction, buffer-size
-changes, and prewarming remain outside the audio callback.
+Sequential, standard A1 WaveNet, maximum A2 WaveNet, packed A2, and FFT Linear
+models. WaveNet matrix scratch is sized during `reset()` and reused by every
+convolution in the callback. Model construction, buffer-size changes, and
+prewarming remain outside the audio callback.
+
+At 128 samples, the old SGEMM backends produced these allocation counts per
+complete callback:
+
+| Build | A1 standard | A2 max |
+|-------|------------:|-------:|
+| Default | 82 | 14 |
+| `fast-kernels` | 82 | 14 |
+| `faer` | 77 | 0 |
+| `faer,fast-kernels` | 77 | 0 |
+
+All four builds now report zero allocations for both models. CI runs the same
+callback tests for every backend feature combination.
 
 The Linear implementation follows Core's zero-latency hybrid design: the first
 partition is evaluated directly and longer tails use partitioned FFT

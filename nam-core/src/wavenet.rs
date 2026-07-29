@@ -274,6 +274,7 @@ impl Conv1x1 {
     }
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
+        self.matrix_layout.set_max_buffer_size(max_buffer_size);
         self.output_buf.resize(self.out_channels, max_buffer_size);
     }
 
@@ -604,6 +605,7 @@ impl Conv1d {
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
         let rf = self.receptive_field();
+        self.matrix_layout.set_max_buffer_size(max_buffer_size);
         self.input_buffer.set_max_lookback(rf);
         self.input_buffer.reset(self.in_channels, max_buffer_size);
         self.output_buf.resize(self.out_channels, max_buffer_size);

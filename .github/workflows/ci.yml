@@ -139,6 +139,9 @@ jobs:
       - name: Test randomized backend equivalence
         run: cargo test -p nam-core --lib backend_equivalence ${{ matrix.args }}
 
+      - name: Test allocation-free WaveNet callbacks
+        run: cargo test -p nam-plugin --lib complete_callback_with_a ${{ matrix.args }}
+
   fuzz-targets:
     name: Fuzz Target Smoke Tests
     runs-on: ubuntu-latest
@@ -240,8 +243,17 @@ jobs:
           path: lcov.info
 
   inference-instruction-baseline:
-    name: Inference Instructions (faer)
+    name: Inference Instructions (${{ matrix.name }})
     runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - name: default
+            feature_args: ""
+          - name: faer
+            feature_args: "--features faer"
+          - name: fast-kernels
+            feature_args: "--features fast-kernels"
     env:
       IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
     steps:
@@ -267,20 +279,20 @@ jobs:
       - name: Measure A1, A2, and Linear inference
         run: >-
           cargo bench -p nam-core --bench inference_callgrind
-          --no-default-features --features faer
+          --no-default-features ${{ matrix.feature_args }}
           -- --save-summary=json --allow-aslr=yes
 
       - name: Enforce instruction budget
         run: >-
           python3 scripts/check_instruction_budget.py
-          faer
+          ${{ matrix.name }}
           target/iai
           .github/performance/inference_instructions.json
 
       - name: Upload instruction profiles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: inference-instructions-faer
+          name: inference-instructions-${{ matrix.name }}
           path: target/iai
 
   plugin-callback-instruction-budget:

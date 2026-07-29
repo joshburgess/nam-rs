@@ -590,6 +590,30 @@ fn complete_callback_with_sequential_model_does_not_allocate() {
     assert!(audio.iter().all(|sample| sample.is_finite()));
 }
 
+fn assert_wavenet_callback_does_not_allocate(model_name: &str) {
+    let buffer_size = 128;
+    let mut plugin = plugin_with_model_fixture(model_name, buffer_size);
+    let mut audio = vec![0.25f32; buffer_size];
+    let mut buffer = mono_buffer(&mut audio);
+
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0, "{model_name} complete callback allocated");
+    assert!(audio.iter().all(|sample| sample.is_finite()));
+}
+
+#[test]
+fn complete_callback_with_a1_wavenet_does_not_allocate() {
+    assert_wavenet_callback_does_not_allocate("wavenet_a1_standard.nam");
+}
+
+#[test]
+fn complete_callback_with_a2_wavenet_does_not_allocate() {
+    assert_wavenet_callback_does_not_allocate("wavenet_a2_max.nam");
+}
+
 #[test]
 fn complete_callback_with_fft_linear_model_does_not_allocate() {
     let buffer_size = 512;
