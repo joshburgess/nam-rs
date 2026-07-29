@@ -1,6 +1,20 @@
 # Feature Gap Analysis: nam-rs vs C++ NeuralAmpModelerCore
 
-Last updated: 2026-06-26
+Comparison date: 2026-07-29
+
+## Comparison Basis
+
+This audit compares nam-rs against:
+
+- `neural-amp-modeler` A2 release
+  [`v0.13.0`](https://github.com/sdatkinson/neural-amp-modeler/tree/f26112906de06ec6b796ad6d1982e29eed83144e)
+- `NeuralAmpModelerCore` main at
+  [`3cde95c354d5ba6da01316cad90b05cfc4855053`](https://github.com/sdatkinson/NeuralAmpModelerCore/tree/3cde95c354d5ba6da01316cad90b05cfc4855053)
+
+The post-A2 Core changes covered by this audit are the LSTM real-time fix
+(`c9ac48e`), A2 prewarming fix (`763a079`), slimmable breakpoint API
+(`1108b60`), WaveNet head dilation (`4c0ee78`), and FFT Linear processing
+(`b352966`).
 
 ## Feature Support Matrix
 
@@ -13,13 +27,13 @@ Last updated: 2026-06-26
 | **WaveNet (FiLM)** | Fully supported | All 8 FiLM positions with shift and groups |
 | **WaveNet (grouped convs)** | Fully supported | groups_input, groups_input_mixin, layer1x1 groups, head1x1 groups |
 | **WaveNet (head1x1)** | Fully supported | Optional head output projection |
-| **WaveNet (top-level head)** | Supported | Upstream A2 `config.head` with activation and kernel sizes |
+| **WaveNet (top-level head)** | Supported | Upstream A2 `config.head` with activation, kernel sizes, and `head_dilation` |
 | **WaveNet (bottleneck != channels)** | Fully supported | |
 | **WaveNet (condition_dsp)** | Fully supported | Nested model as condition processor |
 | **WaveNet A2 config aliases** | Supported | `layers_configs`, `head`, `head_1x1_config`, `layer_1x1_config`, `film_params` |
-| **Sequential** | Supported | Runtime chaining for exported submodels with concatenated weights, including biased Linear submodels |
-| **LSTM** | Fully supported | All 4 official presets |
-| **Linear** | Fully supported | FIR filter with optional upstream `bias` export |
+| **Sequential** | Supported | Runtime chaining for exported submodels with concatenated weights, including biased Linear submodels and fixed-capacity real-time scratch storage |
+| **LSTM** | Fully supported | All 4 official presets, including allocation-free multi-layer inference |
+| **Linear** | Fully supported | FIR filter with optional upstream `bias` export and zero-latency partitioned FFT processing for long filters |
 | **ConvNet** | Fully supported | With optional batch normalization |
 | **Tanh, ReLU, Sigmoid, SiLU** | Supported | |
 | **HardTanh, LeakyReLU** | Supported | |
@@ -28,9 +42,10 @@ Last updated: 2026-06-26
 | **PReLU** | Supported | Per-channel slopes |
 | **Metadata** | Supported | Preserves raw metadata and exposes common upstream fields: loudness, gain, sample_rate, user gear fields, dBu levels, validation ESR |
 | **Version 0.5-0.7** | Supported | Warns on versions beyond 0.7 |
-| SlimmableWaveNet | Supported | Standalone channel-width selection is exposed through `Dsp::set_slimming` |
-| SlimmableContainer | Supported | Loads embedded models, defaults to the highest-quality submodel, and supports `Dsp::set_slimming` selection |
-| Packed A2 trainer option | Partial | Rust trainer exposes a Packed A2 option, sends explicit data-check and `ny` settings, upgrades installed NAM packages, filters worker kwargs against the installed upstream NAM signature, and includes an opt-in upstream full-config backend for `config_data`/`config_model`/`config_learning` packed training; upstream-generated packed export fixtures validate runtime export shape and render parity |
+| SlimmableWaveNet | Supported | `Dsp::set_slimming` selects channel width and `Dsp::slimming_breakpoints` exposes every valid transition |
+| SlimmableContainer | Supported | Loads embedded models, defaults to the highest-quality submodel, validates full breakpoint coverage, and exposes runtime transitions |
+| Packed A2 plugin control | Supported | Persisted model-size parameter applies supported breakpoints during loading, parameter changes, reset, and allocation-free audio processing |
+| Packed A2 trainer option | Supported | Requires `neural-amp-modeler >= 0.13.0`, reports actionable dependency errors, and supports the upstream full-config packed training path |
 | FastTanh / fast sigmoid approximation | Supported | Global performance-mode toggle applies to WaveNet activations and LSTM gates/state tanh |
 
 ## Models That Load and Process Correctly
@@ -49,15 +64,27 @@ Last updated: 2026-06-26
 | `upstream_packed_a2_export.nam` | Upstream `PackedWaveNet.export_container` output | Loads from disk, validates exact `SlimmableContainer` shape, and matches upstream reference render through the largest submodel |
 | `upstream_full_packed_a2_trained.nam` | Upstream `nam.train.full.main` packed-training output | Loads from disk and validates trained packed export shape, including compensated `head_scale` weights |
 | `sequential_linear.nam` | Sequential compositional model | Loads from disk, chains exported submodels, and covers biased Linear weight splitting |
+| `upstream_head_dilation.nam` | Post-A2 WaveNet layer-head dilation | Matches a render produced by Core commit `4c0ee78` within 2e-06 |
 
-## Remaining Gaps
+## Real-Time and Performance Parity
 
-### Slimmable Runtime Selection
+Complete plugin-callback allocation tests exercise real two-layer LSTM,
+Sequential, packed A2, and FFT Linear models. Model construction, buffer-size
+changes, and prewarming remain outside the audio callback.
 
-Packed A2 training exports runtime `.nam` files as `SlimmableContainer` objects containing ordinary `WaveNet` submodels. This path is supported: all embedded submodels are loaded, the highest-quality submodel is used by default, and `Dsp::set_slimming` selects the active submodel by `max_value`.
+The Linear implementation follows Core's zero-latency hybrid design: the first
+partition is evaluated directly and longer tails use partitioned FFT
+convolution. Automatic selection retains direct processing through 256 taps.
+On an Apple Silicon development machine, Criterion measured these 64-sample
+callback times:
 
-Standalone `SlimmableWaveNet` channel slicing is also supported through `Dsp::set_slimming`. The standalone path follows upstream's restricted slimmable contract and rejects unsupported feature combinations at load time, including `condition_dsp`, FiLM, grouped convolutions, head1x1, multi-array configs, and non-1x1 layer-array heads.
+| Filter taps | Direct | FFT |
+|------------:|-------:|----:|
+| 512 | 28.4 us | 13.6 us |
+| 1,536 | 89.9 us | 13.5 us |
+| 4,096 | 240.5 us | 28.7 us |
+| 16,384 | 967.2 us | 59.3 us |
 
-### Block-Based Matrix Processing
+## Remaining Gap
 
 See `optimization-plan.md`. The per-sample scalar processing produces mathematically equivalent but floating-point-divergent results from C++ Eigen block processing for the a2_max model. Converting to block-based processing would achieve bit-identical output and improve performance.

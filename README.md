@@ -202,16 +202,18 @@ A future Rust `#[fast_math]` function attribute (discussed in RFCs but not on th
 | Sequential compositional models | Supported |
 | LSTM (all presets) | Supported |
 | ConvNet | Supported |
-| Linear | Supported, including optional bias |
+| Linear | Supported, including optional bias and FFT processing for long filters |
 | FiLM conditioning (all 8 positions) | Supported |
 | Gated/blended activations | Supported |
 | Grouped convolutions | Supported |
 | head1x1 output projection | Supported |
 | Nested condition_dsp | Supported |
-| Top-level WaveNet head | Supported |
+| Top-level WaveNet head | Supported, including `head_dilation` |
 | A2 config aliases (`layers_configs`, `head_1x1_config`, `film_params`) | Supported |
-| SlimmableWaveNet | Supported for standalone channel-width selection via `Dsp::set_slimming` |
-| SlimmableContainer | Supported |
+| SlimmableWaveNet | Supported through `Dsp::set_slimming` with breakpoint introspection |
+| SlimmableContainer | Supported with validated breakpoint introspection |
+| Packed A2 plugin model size | Supported as a persisted, real-time-safe parameter |
+| Packed A2 training | Supported with `neural-amp-modeler >= 0.13.0` |
 | All activations (Tanh, ReLU, Sigmoid, SiLU, Softsign, Softsigmoid, HardSwish, PReLU, etc.) | Supported |
 | Upstream metadata | Supported, including raw metadata preservation and common typed fields |
 | Version 0.5-0.7 model files | Supported |
