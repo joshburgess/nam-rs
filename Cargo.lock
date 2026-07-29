@@ -2927,6 +2927,8 @@ dependencies = [
  "clap",
  "hound",
  "nam-core",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
