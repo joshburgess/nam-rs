@@ -50,7 +50,7 @@ main!(
         )
         .env("LD_HWCAP_MASK", "0")
         .tool(
-            Callgrind::with_args(["--collect-at-start=no"]).entry_point(EntryPoint::None),
+            Callgrind::with_args(["--collect-atstart=no"]).entry_point(EntryPoint::None),
         );
     library_benchmark_groups = inference_group
 );
