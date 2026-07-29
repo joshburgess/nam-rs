@@ -35,8 +35,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-deps-v1-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --workspace
@@ -65,8 +64,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-deps-v1-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -341,8 +339,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-trainer-gui-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-trainer-gui-deps-v1-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check trainer formatting
         run: cargo fmt --all -- --check
@@ -388,8 +385,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-artifacts-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-artifact-deps-v1-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Bundle plugin
         run: cargo xtask bundle nam-plugin --release
