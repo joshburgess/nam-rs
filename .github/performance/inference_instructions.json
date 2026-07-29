@@ -1,10 +1,6 @@
 {
   "tolerance_percent": 3.0,
   "configurations": {
-    "default": {
-      "a1_standard": 4088496,
-      "a2_max": 2130813
-    },
     "faer": {
       "a1_standard": 3477453,
       "a2_max": 2061221

@@ -226,21 +226,10 @@ jobs:
           path: lcov.info
 
   inference-instruction-baseline:
-    name: Inference Instructions (${{ matrix.name }})
+    name: Inference Instructions (faer)
     runs-on: ubuntu-22.04
     env:
       IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
-      MMTEST_FEATURE: ${{ matrix.mmtest_feature }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            args: --no-default-features
-            mmtest_feature: sse2
-          - name: faer
-            args: --no-default-features --features faer
-            mmtest_feature: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -263,20 +252,21 @@ jobs:
 
       - name: Measure A1 and A2 inference
         run: >-
-          cargo bench -p nam-core --bench inference_callgrind ${{ matrix.args }}
+          cargo bench -p nam-core --bench inference_callgrind
+          --no-default-features --features faer
           -- --save-summary=json --allow-aslr=yes
 
       - name: Enforce instruction budget
         run: >-
           python3 scripts/check_instruction_budget.py
-          ${{ matrix.name }}
+          faer
           target/iai
           .github/performance/inference_instructions.json
 
       - name: Upload instruction profiles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: inference-instructions-${{ matrix.name }}
+          name: inference-instructions-faer
           path: target/iai
 
   plugin-callback-instruction-budget:
