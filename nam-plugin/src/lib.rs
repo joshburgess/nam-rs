@@ -166,17 +166,25 @@ impl Default for GuiState {
 
 impl Default for NamPlugin {
     fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl NamPlugin {
+    fn new(spawn_model_reaper: bool) -> Self {
         let loaded_models = Arc::new(ArrayQueue::new(1));
         let retired_models = Arc::new(ArrayQueue::new(4));
-        let retired_models_weak = Arc::downgrade(&retired_models);
-        let _ = thread::Builder::new()
-            .name("nam-model-reaper".to_string())
-            .spawn(move || {
-                while let Some(retired_models) = retired_models_weak.upgrade() {
-                    while retired_models.pop().is_some() {}
-                    thread::park_timeout(Duration::from_millis(10));
-                }
-            });
+        if spawn_model_reaper {
+            let retired_models_weak = Arc::downgrade(&retired_models);
+            let _ = thread::Builder::new()
+                .name("nam-model-reaper".to_string())
+                .spawn(move || {
+                    while let Some(retired_models) = retired_models_weak.upgrade() {
+                        while retired_models.pop().is_some() {}
+                        thread::park_timeout(Duration::from_millis(10));
+                    }
+                });
+        }
 
         Self {
             params: Arc::new(NamParams::default()),
@@ -407,7 +415,7 @@ pub mod benchmark {
             } else {
                 Some(ResamplerState::new(host_rate, model_rate, buffer_size)?)
             };
-            let mut plugin = NamPlugin::default();
+            let mut plugin = NamPlugin::new(false);
             plugin.model = Some(LoadedModel {
                 generation: 1,
                 dsp: Box::new(PassthroughDsp),
