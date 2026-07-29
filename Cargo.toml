@@ -26,3 +26,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+block = { path = "third-party/block-0.1.6" }
+proc-macro-error2 = { path = "third-party/proc-macro-error2-2.0.1" }
