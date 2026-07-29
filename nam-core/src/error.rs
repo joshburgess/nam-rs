@@ -20,6 +20,19 @@ pub enum NamError {
     #[error("Invalid config: {0}")]
     InvalidConfig(String),
 
+    #[error("Weight range overflow: position {position}, requested {requested}")]
+    WeightRangeOverflow { position: usize, requested: usize },
+
+    #[error("{context} dimensions overflow: {left} x {right}")]
+    DimensionOverflow {
+        context: &'static str,
+        left: usize,
+        right: usize,
+    },
+
+    #[error("Matrix shape error: {0}")]
+    MatrixShape(#[from] ndarray::ShapeError),
+
     #[error("Weight count mismatch: expected {expected}, got {actual}")]
     WeightMismatch { expected: usize, actual: usize },
 
@@ -48,6 +61,14 @@ mod tests {
         };
         assert!(format!("{}", e).contains("100"));
         assert!(format!("{}", e).contains("50"));
+
+        let e = NamError::DimensionOverflow {
+            context: "matrix",
+            left: usize::MAX,
+            right: 2,
+        };
+        assert!(format!("{}", e).contains("matrix"));
+        assert!(format!("{}", e).contains(&usize::MAX.to_string()));
 
         let e = NamError::UnknownActivation("Mish".into());
         assert!(format!("{}", e).contains("Mish"));

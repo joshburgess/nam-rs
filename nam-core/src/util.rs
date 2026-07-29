@@ -47,14 +47,21 @@ impl<'a> WeightIter<'a> {
     }
 
     pub fn take(&mut self, n: usize) -> Result<&'a [f32], NamError> {
-        if self.pos + n > self.weights.len() {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(NamError::WeightRangeOverflow {
+                position: self.pos,
+                requested: n,
+            })?;
+        if end > self.weights.len() {
             return Err(NamError::WeightMismatch {
-                expected: self.pos + n,
+                expected: end,
                 actual: self.weights.len(),
             });
         }
-        let slice = &self.weights[self.pos..self.pos + n];
-        self.pos += n;
+        let slice = &self.weights[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -63,9 +70,16 @@ impl<'a> WeightIter<'a> {
         rows: usize,
         cols: usize,
     ) -> Result<ndarray::Array2<f32>, NamError> {
-        let data = self.take(rows * cols)?;
-        ndarray::Array2::from_shape_vec((rows, cols), data.to_vec())
-            .map_err(|e| NamError::InvalidConfig(format!("matrix shape error: {}", e)))
+        let len = rows.checked_mul(cols).ok_or(NamError::DimensionOverflow {
+            context: "weight matrix",
+            left: rows,
+            right: cols,
+        })?;
+        let data = self.take(len)?;
+        Ok(ndarray::Array2::from_shape_vec(
+            (rows, cols),
+            data.to_vec(),
+        )?)
     }
 
     pub fn take_vector(&mut self, len: usize) -> Result<ndarray::Array1<f32>, NamError> {
@@ -104,6 +118,29 @@ mod tests {
         let data = vec![1.0, 2.0];
         let mut iter = WeightIter::new(&data);
         assert!(iter.take(3).is_err());
+    }
+
+    #[test]
+    fn test_weight_iter_rejects_range_overflow() {
+        let data = [1.0];
+        let mut iter = WeightIter::new(&data);
+        iter.take(1).unwrap();
+        assert!(matches!(
+            iter.take(usize::MAX),
+            Err(NamError::WeightRangeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn test_weight_iter_rejects_matrix_size_overflow() {
+        let mut iter = WeightIter::new(&[]);
+        assert!(matches!(
+            iter.take_matrix(usize::MAX, 2),
+            Err(NamError::DimensionOverflow {
+                context: "weight matrix",
+                ..
+            })
+        ));
     }
 
     #[test]

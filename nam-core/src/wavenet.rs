@@ -218,8 +218,13 @@ impl Conv1x1 {
         groups: usize,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
-        let matrix_layout = MatrixLayout::new(out_channels, in_channels)
-            .map_err(|error| NamError::InvalidConfig(error.to_string()))?;
+        let matrix_layout = MatrixLayout::new(out_channels, in_channels).map_err(|_| {
+            NamError::DimensionOverflow {
+                context: "1x1 convolution weight matrix",
+                left: out_channels,
+                right: in_channels,
+            }
+        })?;
         let out_per_group = out_channels / groups;
         let in_per_group = in_channels / groups;
 
@@ -549,8 +554,13 @@ impl Conv1d {
         has_bias: bool,
         iter: &mut WeightIter,
     ) -> Result<Self, NamError> {
-        let matrix_layout = MatrixLayout::new(out_channels, in_channels)
-            .map_err(|error| NamError::InvalidConfig(error.to_string()))?;
+        let matrix_layout = MatrixLayout::new(out_channels, in_channels).map_err(|_| {
+            NamError::DimensionOverflow {
+                context: "convolution weight matrix",
+                left: out_channels,
+                right: in_channels,
+            }
+        })?;
         let is_depthwise = groups == in_channels && in_channels == out_channels;
         #[cfg(feature = "fast-kernels")]
         let flat_weight_len = kernel_size
@@ -559,8 +569,14 @@ impl Conv1d {
             } else {
                 matrix_layout.left_len()
             })
-            .ok_or_else(|| {
-                NamError::InvalidConfig("convolution weight dimensions overflow".into())
+            .ok_or(NamError::DimensionOverflow {
+                context: "convolution weights",
+                left: kernel_size,
+                right: if is_depthwise {
+                    out_channels
+                } else {
+                    matrix_layout.left_len()
+                },
             })?;
 
         let weights = if is_depthwise {
