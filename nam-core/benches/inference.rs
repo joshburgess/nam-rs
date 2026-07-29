@@ -77,6 +77,10 @@ fn bench_wavenet_standard_bufsizes(c: &mut Criterion) {
     bench_model_buffer_sizes(c, "wavenet_standard_bufsizes", "wavenet_a1_standard.nam");
 }
 
+fn bench_a2_max_bufsizes(c: &mut Criterion) {
+    bench_model_buffer_sizes(c, "wavenet_a2_max_bufsizes", "wavenet_a2_max.nam");
+}
+
 fn linear_model(receptive_field: usize, implementation: &str) -> Box<dyn nam_core::Dsp> {
     let weights = (0..receptive_field)
         .map(|index| ((index + 1) as f32 * 0.013).sin() * 0.001)
@@ -127,6 +131,7 @@ criterion_group!(
     bench_lstm,
     bench_a2_max,
     bench_wavenet_standard_bufsizes,
+    bench_a2_max_bufsizes,
     bench_linear_implementations,
 );
 criterion_main!(benches);

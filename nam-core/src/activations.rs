@@ -75,16 +75,15 @@ impl Activation {
                 }
             }
             Activation::Silu => {
-                let sig = if use_fast {
-                    fast_sigmoid(x)
+                if use_fast {
+                    x * fast_sigmoid(x)
                 } else {
-                    1.0 / (1.0 + (-x).exp())
-                };
-                x * sig
+                    x / (1.0 + (-x).exp())
+                }
             }
             Activation::Softsign => x / (1.0 + x.abs()),
             Activation::Softsigmoid => 0.5 * (1.0 + x / (1.0 + x.abs())),
-            Activation::HardSwish => x * (x + 3.0).clamp(0.0, 6.0) * (1.0 / 6.0),
+            Activation::HardSwish => (x * (1.0 / 6.0)) * (x + 3.0).clamp(0.0, 6.0),
             Activation::LeakyHardTanh {
                 min_val,
                 max_val,
@@ -306,6 +305,13 @@ mod tests {
         assert!((act.apply_scalar(x) - expected).abs() < 1e-6);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn silu_matches_upstream_fast_math_order() {
+        let input = f32::from_bits(0xbfd0_b296);
+        assert_eq!(Activation::Silu.apply_scalar(input).to_bits(), 0xbe88_b66a);
+    }
+
     #[cfg(feature = "fast-kernels")]
     #[test]
     fn c_activation_ids_are_unique_and_complete() {
@@ -465,6 +471,16 @@ mod tests {
         assert_eq!(act.apply_scalar(0.0), 0.0);
         // x = 1: 1 * (1+3)/6 = 4/6 = 0.6667
         assert!((act.apply_scalar(1.0) - (4.0 / 6.0)).abs() < 1e-6);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn hardswish_matches_upstream_fast_math_order() {
+        let input = f32::from_bits(0x3faf_d1c4);
+        assert_eq!(
+            Activation::HardSwish.apply_scalar(input).to_bits(),
+            0x3f80_290a
+        );
     }
 
     #[test]

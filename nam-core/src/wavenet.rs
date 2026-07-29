@@ -344,8 +344,7 @@ impl Conv1x1 {
         }
     }
 
-    /// Small-matrix GEMM with fused bias for common channel counts.
-    /// Specializes for 3x3, 1→3, 3→1 to allow the compiler to fully unroll.
+    /// Evaluate small matrix products in Eigen's product-then-bias order.
     #[inline]
     fn process_block_small_gemm(
         &mut self,
@@ -378,124 +377,18 @@ impl Conv1x1 {
         }
 
         #[cfg(not(feature = "fast-kernels"))]
-        match (out_ch, in_ch) {
-            (3, 3) => {
-                let w00 = w[0];
-                let w10 = w[1];
-                let w20 = w[2];
-                let w01 = w[3];
-                let w11 = w[4];
-                let w21 = w[5];
-                let w02 = w[6];
-                let w12 = w[7];
-                let w22 = w[8];
-                if let Some(ref b) = bias {
-                    let b0 = b[0];
-                    let b1 = b[1];
-                    let b2 = b[2];
-                    for f in 0..num_frames {
-                        let ic = f * input_stride;
-                        let oc = f * 3;
-                        let i0 = input_data[ic];
-                        let i1 = input_data[ic + 1];
-                        let i2 = input_data[ic + 2];
-                        out[oc] = w00.mul_add(i0, w01.mul_add(i1, w02.mul_add(i2, b0)));
-                        out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12.mul_add(i2, b1)));
-                        out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22.mul_add(i2, b2)));
-                    }
-                } else {
-                    for f in 0..num_frames {
-                        let ic = f * input_stride;
-                        let oc = f * 3;
-                        let i0 = input_data[ic];
-                        let i1 = input_data[ic + 1];
-                        let i2 = input_data[ic + 2];
-                        out[oc] = w00.mul_add(i0, w01.mul_add(i1, w02 * i2));
-                        out[oc + 1] = w10.mul_add(i0, w11.mul_add(i1, w12 * i2));
-                        out[oc + 2] = w20.mul_add(i0, w21.mul_add(i1, w22 * i2));
-                    }
+        for frame in 0..num_frames {
+            let input_column = frame * input_stride;
+            let output_column = frame * out_ch;
+            for output_channel in 0..out_ch {
+                // Keep the first product rounded before the bias is added.
+                let mut product = w[output_channel].mul_add(input_data[input_column], 0.0);
+                for input_channel in 1..in_ch {
+                    product = w[input_channel * out_ch + output_channel]
+                        .mul_add(input_data[input_column + input_channel], product);
                 }
-            }
-            (3, 1) => {
-                let w0 = w[0];
-                let w1 = w[1];
-                let w2 = w[2];
-                if let Some(ref b) = bias {
-                    let b0 = b[0];
-                    let b1 = b[1];
-                    let b2 = b[2];
-                    for f in 0..num_frames {
-                        let v = input_data[f * input_stride];
-                        let oc = f * 3;
-                        out[oc] = w0.mul_add(v, b0);
-                        out[oc + 1] = w1.mul_add(v, b1);
-                        out[oc + 2] = w2.mul_add(v, b2);
-                    }
-                } else {
-                    for f in 0..num_frames {
-                        let v = input_data[f * input_stride];
-                        let oc = f * 3;
-                        out[oc] = w0 * v;
-                        out[oc + 1] = w1 * v;
-                        out[oc + 2] = w2 * v;
-                    }
-                }
-            }
-            (1, 3) => {
-                let w0 = w[0];
-                let w1 = w[1];
-                let w2 = w[2];
-                if let Some(ref b) = bias {
-                    let b0 = b[0];
-                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
-                        let ic = f * input_stride;
-                        *o = w0.mul_add(
-                            input_data[ic],
-                            w1.mul_add(input_data[ic + 1], w2.mul_add(input_data[ic + 2], b0)),
-                        );
-                    }
-                } else {
-                    for (f, o) in out.iter_mut().enumerate().take(num_frames) {
-                        let ic = f * input_stride;
-                        *o = w0.mul_add(
-                            input_data[ic],
-                            w1.mul_add(input_data[ic + 1], w2 * input_data[ic + 2]),
-                        );
-                    }
-                }
-            }
-            _ => {
-                {
-                    // General small-matrix path with fused bias
-                    // Uses mul_add (FMA) to match Eigen's SIMD FMA behavior
-                    if let Some(ref b) = bias {
-                        for f in 0..num_frames {
-                            let in_col_start = f * input_stride;
-                            let out_col_start = f * out_ch;
-                            for o in 0..out_ch {
-                                let mut sum = b[o];
-                                for i in 0..in_ch {
-                                    sum = w[i * out_ch + o]
-                                        .mul_add(input_data[in_col_start + i], sum);
-                                }
-                                out[out_col_start + o] = sum;
-                            }
-                        }
-                    } else {
-                        for f in 0..num_frames {
-                            let in_col_start = f * input_stride;
-                            let out_col_start = f * out_ch;
-                            for o in 0..out_ch {
-                                let mut sum = 0.0f32;
-                                for i in 0..in_ch {
-                                    sum = w[i * out_ch + o]
-                                        .mul_add(input_data[in_col_start + i], sum);
-                                }
-                                out[out_col_start + o] = sum;
-                            }
-                        }
-                    }
-                }
+                out[output_column + output_channel] =
+                    product + bias.as_ref().map_or(0.0, |values| values[output_channel]);
             }
         }
     }
@@ -789,13 +682,10 @@ impl Conv1d {
             return;
         }
 
-        // Initialize output with bias (fused: eliminates separate bias-add pass)
+        // Eigen accumulates every convolution tap before adding the bias.
         // (unreachable when fast-kernels feature is enabled, the block above returns early)
         #[allow(unreachable_code)]
-        for f in 0..num_frames {
-            let off = f * out_ch;
-            self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
-        }
+        self.output_buf.data[..out_ch * num_frames].fill(0.0);
 
         match &self.weights {
             Conv1dWeights::Depthwise(dw) => {
@@ -844,7 +734,17 @@ impl Conv1d {
                     let lookback = (-offset_signed) as usize;
                     let tap_data = self.input_buffer.read_ptr(num_frames, lookback);
 
-                    if use_sgemm {
+                    if out_ch == 1 && in_ch == 4 {
+                        for frame in 0..num_frames {
+                            let input = frame * 4;
+                            // Preserve Eigen's pairwise reduction and product rounding.
+                            let product = (w[0].mul_add(tap_data[input], 0.0)
+                                + w[1].mul_add(tap_data[input + 1], 0.0))
+                                + (w[2].mul_add(tap_data[input + 2], 0.0)
+                                    + w[3].mul_add(tap_data[input + 3], 0.0));
+                            self.output_buf.data[frame] += product;
+                        }
+                    } else if use_sgemm {
                         self.matrix_layout.multiply(
                             num_frames,
                             1.0,
@@ -869,6 +769,13 @@ impl Conv1d {
                         }
                     }
                 }
+            }
+        }
+
+        for frame in 0..num_frames {
+            let offset = frame * out_ch;
+            for channel in 0..out_ch {
+                self.output_buf.data[offset + channel] += self.bias[channel];
             }
         }
 
@@ -1633,7 +1540,7 @@ impl WaveNetLayer {
                                 use_fast_tanh,
                             );
                             self.z_buf.data[z_off + c] =
-                                alpha * activated + (1.0 - alpha) * pre_act;
+                                alpha.mul_add(activated - pre_act, pre_act);
                         }
                     }
                     zero_inactive_rows(&mut self.z_buf.data, z_rows, active_bottleneck, num_frames);
@@ -1669,7 +1576,7 @@ impl WaveNetLayer {
                                             use_fast_tanh,
                                         );
                                     self.z_buf.data[z_off + c] =
-                                        alpha * activated + (1.0 - alpha) * pre_act;
+                                        alpha.mul_add(activated - pre_act, pre_act);
                                 }
                             }
                         }
@@ -1691,7 +1598,7 @@ impl WaveNetLayer {
                                     use_fast_tanh,
                                 );
                                 self.z_buf.data[z_off + c] =
-                                    alpha * activated + (1.0 - alpha) * pre_act;
+                                    alpha.mul_add(activated - pre_act, pre_act);
                             }
                         }
                     } // end cfg(not(fast-kernels))
@@ -2301,6 +2208,7 @@ pub struct WaveNet {
     // Block processing buffers
     condition_input: ColMajorMatrix,
     condition_output: ColMajorMatrix,
+    multi_channel_scratch: Vec<Sample>,
     max_buffer_size: usize,
     activation_mode: ActivationMode,
 }
@@ -2945,6 +2853,7 @@ impl WaveNet {
             condition_dsp,
             condition_input: ColMajorMatrix::new(in_channels, 1),
             condition_output: ColMajorMatrix::new(cond_out_ch.max(condition_size), 1),
+            multi_channel_scratch: Vec::new(),
             max_buffer_size: 0,
             activation_mode: ActivationMode::Accurate,
         })
@@ -2967,6 +2876,8 @@ impl WaveNet {
             .resize(self.in_channels, max_buffer_size);
         let cond_rows = self.condition_output.rows;
         self.condition_output.resize(cond_rows, max_buffer_size);
+        self.multi_channel_scratch
+            .resize(max_buffer_size, Sample::default());
 
         for la in &mut self.layer_arrays {
             la.set_max_buffer_size(max_buffer_size);
@@ -3245,10 +3156,10 @@ impl Dsp for WaveNet {
         out_channels: usize,
         num_frames: usize,
     ) {
-        // Process the full block through the WaveNet
-        // We need a dummy output buffer for process_block's mono output
-        let mut dummy_output = vec![Sample::default(); num_frames];
-        self.process_block(input, &mut dummy_output);
+        self.ensure_buffer_size(num_frames);
+        let mut scratch = std::mem::take(&mut self.multi_channel_scratch);
+        self.process_block(input, &mut scratch[..num_frames]);
+        self.multi_channel_scratch = scratch;
 
         // Extract multi-channel head output from the last layer array
         let last = self.layer_arrays.len() - 1;

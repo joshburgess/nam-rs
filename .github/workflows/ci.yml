@@ -45,6 +45,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Test release A2 render parity
+        if: runner.os == 'macOS'
+        run: >-
+          cargo test --release -p nam-core --lib
+          get_dsp::tests::test_regression_wavenet_a2_max
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -258,7 +264,7 @@ jobs:
           sudo make install
           cargo install iai-callgrind-runner --version 0.14.2 --locked
 
-      - name: Measure A1 and A2 inference
+      - name: Measure A1, A2, and Linear inference
         run: >-
           cargo bench -p nam-core --bench inference_callgrind
           --no-default-features --features faer

@@ -17,6 +17,20 @@
     {
       "reference": "a1_standard",
       "reference_samples": 64,
+      "benchmark": "a1_standard_32",
+      "benchmark_samples": 32,
+      "max_relative_instructions_per_sample": 1.4
+    },
+    {
+      "reference": "a1_standard",
+      "reference_samples": 64,
+      "benchmark": "a1_standard_128",
+      "benchmark_samples": 128,
+      "max_relative_instructions_per_sample": 1.1
+    },
+    {
+      "reference": "a1_standard",
+      "reference_samples": 64,
       "benchmark": "a1_standard_256",
       "benchmark_samples": 256,
       "max_relative_instructions_per_sample": 1.15
@@ -31,12 +45,28 @@
     {
       "reference": "a2_max",
       "reference_samples": 64,
+      "benchmark": "a2_max_32",
+      "benchmark_samples": 32,
+      "max_relative_instructions_per_sample": 1.4
+    },
+    {
+      "reference": "a2_max",
+      "reference_samples": 64,
+      "benchmark": "a2_max_128",
+      "benchmark_samples": 128,
+      "max_relative_instructions_per_sample": 1.1
+    },
+    {
+      "reference": "a2_max",
+      "reference_samples": 64,
       "benchmark": "a2_max_256",
       "benchmark_samples": 256,
       "max_relative_instructions_per_sample": 1.15
     }
   ],
   "absolute_limits": {
-    "lstm_64": 10000000
+    "lstm_64": 10000000,
+    "linear_fft_4096_64": 8000000,
+    "linear_fft_16384_64": 15000000
   }
 }

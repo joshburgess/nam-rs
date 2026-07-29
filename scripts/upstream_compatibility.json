@@ -1,0 +1,40 @@
+{
+  "comparison_date": "2026-07-29",
+  "neural_amp_modeler": {
+    "release": "v0.13.0",
+    "commit": "f26112906de06ec6b796ad6d1982e29eed83144e"
+  },
+  "neural_amp_modeler_core": {
+    "commit": "3cde95c354d5ba6da01316cad90b05cfc4855053"
+  },
+  "fixtures": [
+    {
+      "name": "wavenet",
+      "model": "nam-core/test_fixtures/models/wavenet.nam",
+      "input": "nam-core/test_fixtures/audio/test_input.wav",
+      "reference": "nam-core/test_fixtures/audio/wavenet_cpp_ref.wav",
+      "require_bit_exact": true
+    },
+    {
+      "name": "wavenet_condition_dsp",
+      "model": "nam-core/test_fixtures/models/wavenet_condition_dsp.nam",
+      "input": "nam-core/test_fixtures/audio/test_input.wav",
+      "reference": "nam-core/test_fixtures/audio/wavenet_condition_dsp_cpp_ref.wav",
+      "require_bit_exact": true
+    },
+    {
+      "name": "wavenet_a1_standard",
+      "model": "nam-core/test_fixtures/models/wavenet_a1_standard.nam",
+      "input": "nam-core/test_fixtures/audio/test_input.wav",
+      "reference": "nam-core/test_fixtures/audio/wavenet_a1_standard_cpp_ref.wav",
+      "require_bit_exact": true
+    },
+    {
+      "name": "wavenet_a2_max",
+      "model": "nam-core/test_fixtures/models/wavenet_a2_max.nam",
+      "input": "nam-core/test_fixtures/audio/test_input.wav",
+      "reference": "nam-core/test_fixtures/audio/wavenet_a2_max_cpp_ref.wav",
+      "require_bit_exact": true
+    }
+  ]
+}

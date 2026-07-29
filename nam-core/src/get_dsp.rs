@@ -961,10 +961,21 @@ mod tests {
     #[test]
     fn test_regression_wavenet_a2_max() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
-            #[cfg(feature = "fast-kernels")]
-            let limit = 1.0e-05;
-            #[cfg(not(feature = "fast-kernels"))]
-            let limit = 8.0e-06;
+            #[cfg(all(feature = "fast-kernels", not(feature = "faer")))]
+            let limit = 2.0e-06;
+            #[cfg(feature = "faer")]
+            let limit = 4.0e-06;
+            #[cfg(all(
+                not(any(feature = "fast-kernels", feature = "faer")),
+                target_arch = "aarch64",
+                target_os = "macos"
+            ))]
+            let limit = 0.0;
+            #[cfg(all(
+                not(any(feature = "fast-kernels", feature = "faer")),
+                not(all(target_arch = "aarch64", target_os = "macos"))
+            ))]
+            let limit = 4.0e-06;
             assert!(
                 max_diff <= limit,
                 "wavenet_a2_max: accuracy regressed, max_diff={max_diff:.2e} (limit {limit:.1e})"

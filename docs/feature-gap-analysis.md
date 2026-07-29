@@ -52,12 +52,12 @@ The post-A2 Core changes covered by this audit are the LSTM real-time fix
 
 | Model File | Features Used | Status |
 |------------|---------------|--------|
-| `wavenet.nam` | Standard WaveNet | Matches C++ to 8.2e-08 |
-| `wavenet_a1_standard.nam` | Standard (16/8ch, 20 layers) | Matches C++ to 2.1e-06 |
-| `my_model.nam` | Standard WaveNet | Matches C++ to 2.1e-06 |
-| `lstm.nam` | Standard LSTM | Matches C++ to 2.1e-07 |
-| `wavenet_condition_dsp.nam` | Nested condition DSP | Matches C++ to 8.9e-08 |
-| `wavenet_a2_max.nam` | All advanced features | Loads and runs; FP accumulation divergence (see optimization-plan.md) |
+| `wavenet.nam` | Standard WaveNet | Bit-identical to the pinned Core render |
+| `wavenet_a1_standard.nam` | Standard (16/8ch, 20 layers) | Matches C++ to 5.96e-08 |
+| `my_model.nam` | Standard WaveNet | Matches C++ to 5.96e-08 |
+| `lstm.nam` | Standard LSTM | Matches C++ to 8.94e-08 |
+| `wavenet_condition_dsp.nam` | Nested condition DSP | Bit-identical to the pinned Core render |
+| `wavenet_a2_max.nam` | All advanced features | Bit-identical to the pinned Apple Silicon Core render with the default matrix backend |
 | `slimmable_wavenet.nam` | Slimmable architecture | Loads, processes, and supports runtime width selection |
 | `slimmable_container.nam` | Multi-model container | Loads, processes, and supports runtime submodel selection |
 | `a2_slimmable_container_upstream_style.nam` | Upstream-style packed A2 container | Loads from disk, defaults to the largest submodel, and supports runtime submodel selection |
@@ -85,6 +85,22 @@ callback times:
 | 4,096 | 240.5 us | 28.7 us |
 | 16,384 | 967.2 us | 59.3 us |
 
+## Repeatable Upstream Audit
+
+The fixture manifest at `scripts/upstream_compatibility.json` records the
+comparison date, training release, Core commit, and every bit-exact render
+fixture. With the pinned Core checkout built, reproduce the audit with:
+
+```sh
+python3 scripts/audit_upstream_compatibility.py \
+  --core /path/to/NeuralAmpModelerCore
+```
+
+Use `--update` only when intentionally regenerating fixtures from that exact
+commit. The script rejects any other Core revision before rendering.
+
 ## Remaining Gap
 
-See `optimization-plan.md`. The per-sample scalar processing produces mathematically equivalent but floating-point-divergent results from C++ Eigen block processing for the a2_max model. Converting to block-based processing would achieve bit-identical output and improve performance.
+No known post-A2 model-format or inference capability gap remains at the pinned
+comparison commits. Performance work remains ongoing, especially small-matrix
+throughput on standard A1 models, but it does not block model compatibility.

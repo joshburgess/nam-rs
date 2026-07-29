@@ -26,14 +26,56 @@ fn setup_model(filename: &str, buffer_size: usize) -> InferenceCase {
     )
 }
 
+fn setup_linear_fft(receptive_field: usize) -> InferenceCase {
+    let weights = (0..receptive_field)
+        .map(|index| ((index + 1) as f32 * 0.013).sin() * 0.001)
+        .collect::<Vec<_>>();
+    let json = serde_json::json!({
+        "version": "0.7.0",
+        "architecture": "Linear",
+        "config": {
+            "receptive_field": receptive_field,
+            "implementation": "fft"
+        },
+        "weights": weights
+    })
+    .to_string();
+    let mut model = nam_core::get_dsp::get_dsp_from_json(&json).unwrap();
+    let buffer_size = 64;
+    model.reset(48_000.0, buffer_size);
+
+    let fft_block_size = if receptive_field <= 2_048 {
+        256
+    } else if receptive_field <= 8_192 {
+        512
+    } else {
+        1_024
+    };
+    let prefill = vec![nam_core::Sample::default(); fft_block_size - buffer_size];
+    let mut prefill_output = vec![nam_core::Sample::default(); prefill.len()];
+    model.process(&prefill, &mut prefill_output);
+
+    (
+        model,
+        vec![nam_core::Sample::default(); buffer_size],
+        vec![nam_core::Sample::default(); buffer_size],
+    )
+}
+
 #[library_benchmark]
 #[bench::a1_standard_16(setup_model("wavenet_a1_standard.nam", 16))]
+#[bench::a1_standard_32(setup_model("wavenet_a1_standard.nam", 32))]
 #[bench::a1_standard(setup_model("wavenet_a1_standard.nam", 64))]
+#[bench::a1_standard_128(setup_model("wavenet_a1_standard.nam", 128))]
 #[bench::a1_standard_256(setup_model("wavenet_a1_standard.nam", 256))]
 #[bench::a2_max_16(setup_model("wavenet_a2_max.nam", 16))]
+#[bench::a2_max_32(setup_model("wavenet_a2_max.nam", 32))]
 #[bench::a2_max(setup_model("wavenet_a2_max.nam", 64))]
+#[bench::a2_max_128(setup_model("wavenet_a2_max.nam", 128))]
 #[bench::a2_max_256(setup_model("wavenet_a2_max.nam", 256))]
 #[bench::lstm_64(setup_model("lstm.nam", 64))]
+#[bench::linear_fft_4096_64(setup_linear_fft(4_096))]
+#[bench::linear_fft_16384_64(setup_linear_fft(16_384))]
 fn inference((mut model, input, mut output): InferenceCase) {
     callgrind::toggle_collect();
     model.process(black_box(&input), black_box(&mut output));

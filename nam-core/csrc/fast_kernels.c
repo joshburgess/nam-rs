@@ -32,11 +32,11 @@ void fast_conv1d_depthwise(
     size_t kernel_size,
     size_t num_frames
 ) {
-    /* Initialize output with bias */
+    /* Accumulate taps before adding bias to match Eigen. */
     for (size_t f = 0; f < num_frames; f++) {
         size_t off = f * ch;
         for (size_t c = 0; c < ch; c++) {
-            output[off + c] = bias[c];
+            output[off + c] = 0.0f;
         }
     }
 
@@ -51,11 +51,17 @@ void fast_conv1d_depthwise(
             }
         }
     }
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t off = f * ch;
+        for (size_t c = 0; c < ch; c++) {
+            output[off + c] += bias[c];
+        }
+    }
 }
 
 /* ── Full Conv1d block processing (general/small-matrix case) ───────────
  * For the small dot-product path (out_ch * in_ch < SGEMM threshold).
- * Processes all kernel taps with fused bias in one call.
+ * Processes all kernel taps and then adds bias in one call.
  *
  * weights: [kernel_size][in_ch * out_ch] col-major per tap
  *          weights[k * (out_ch * in_ch) + i * out_ch + o]
@@ -73,11 +79,11 @@ void fast_conv1d_small_gemv(
     size_t kernel_size,
     size_t num_frames
 ) {
-    /* Initialize output with bias */
+    /* Accumulate taps before adding bias to match Eigen. */
     for (size_t f = 0; f < num_frames; f++) {
         size_t off = f * out_ch;
         for (size_t o = 0; o < out_ch; o++) {
-            output[off + o] = bias[o];
+            output[off + o] = 0.0f;
         }
     }
 
@@ -89,6 +95,13 @@ void fast_conv1d_small_gemv(
         for (size_t f = 0; f < num_frames; f++) {
             size_t in_off = f * in_ch;
             size_t out_off = f * out_ch;
+            if (out_ch == 1 && in_ch == 4) {
+                float product =
+                    (w[0] * tap[in_off] + w[1] * tap[in_off + 1])
+                    + (w[2] * tap[in_off + 2] + w[3] * tap[in_off + 3]);
+                output[out_off] += product;
+                continue;
+            }
             for (size_t o = 0; o < out_ch; o++) {
                 float sum = 0.0f;
                 for (size_t i = 0; i < in_ch; i++) {
@@ -96,6 +109,12 @@ void fast_conv1d_small_gemv(
                 }
                 output[out_off + o] += sum;
             }
+        }
+    }
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t off = f * out_ch;
+        for (size_t o = 0; o < out_ch; o++) {
+            output[off + o] += bias[o];
         }
     }
 }
@@ -198,11 +217,11 @@ void fast_conv1x1_small(
         size_t in_off = f * input_stride;
         size_t out_off = f * out_ch;
         for (size_t o = 0; o < out_ch; o++) {
-            float sum = bias ? bias[o] : 0.0f;
-            for (size_t i = 0; i < in_ch; i++) {
+            float sum = weights[o] * input[in_off];
+            for (size_t i = 1; i < in_ch; i++) {
                 sum += weights[i * out_ch + o] * input[in_off + i];
             }
-            output[out_off + o] = sum;
+            output[out_off + o] = sum + (bias ? bias[o] : 0.0f);
         }
     }
 }
@@ -311,13 +330,12 @@ static inline float apply_activation(float x, int type, int use_fast_tanh) {
             }
             return tanhf(x);
         case 1: { /* SiLU = x * sigmoid(x) */
-            float sig = 1.0f / (1.0f + expf(-x));
-            return x * sig;
+            return x / (1.0f + expf(-x));
         }
         case 2: { /* Hardswish = x * clamp(x+3, 0, 6) / 6 */
             float t = x + 3.0f;
             float clamped = t < 0.0f ? 0.0f : (t > 6.0f ? 6.0f : t);
-            return x * clamped * (1.0f / 6.0f);
+            return (x * (1.0f / 6.0f)) * clamped;
         }
         case 3: /* Softsign = x / (1 + |x|) */
             return x / (1.0f + fabsf(x));
@@ -368,7 +386,7 @@ void fast_blended_activation(
             float pre_act = z[z_off + c];
             float activated = apply_activation(pre_act, primary_type, use_fast_tanh);
             float alpha = apply_activation(z[z_off + bottleneck + c], secondary_type, use_fast_tanh);
-            z[z_off + c] = alpha * activated + (1.0f - alpha) * pre_act;
+            z[z_off + c] = fmaf(alpha, activated - pre_act, pre_act);
         }
     }
 }
