@@ -271,7 +271,7 @@ jobs:
 
   plugin-callback-instruction-budget:
     name: Plugin Callback Instructions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     env:
       IAI_CALLGRIND_VALGRIND_INCLUDE: /usr/local/include
     steps:
