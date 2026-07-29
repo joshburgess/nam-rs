@@ -6,9 +6,11 @@ use crate::util::{
 };
 
 mod matrix_backend;
+#[cfg(not(feature = "fast-kernels"))]
 mod small_matrix_backend;
 
 use matrix_backend::{MatrixLayout, SGEMM_MIN_SIZE};
+#[cfg(not(feature = "fast-kernels"))]
 use small_matrix_backend::{Conv1x1Dimensions, SmallMatrixBackend};
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
@@ -217,6 +219,7 @@ struct Conv1x1 {
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
+    #[cfg(not(feature = "fast-kernels"))]
     small_matrix_backend: SmallMatrixBackend,
     #[allow(dead_code)]
     groups: usize,
@@ -271,6 +274,7 @@ impl Conv1x1 {
             out_channels,
             in_channels,
             matrix_layout,
+            #[cfg(not(feature = "fast-kernels"))]
             small_matrix_backend: SmallMatrixBackend::detect(),
             groups,
             output_buf: ColMajorMatrix::new(out_channels, 1),
@@ -441,6 +445,7 @@ struct Conv1d {
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
+    #[cfg(not(feature = "fast-kernels"))]
     small_matrix_backend: SmallMatrixBackend,
     #[allow(dead_code)]
     groups: usize,
@@ -609,6 +614,7 @@ impl Conv1d {
             out_channels,
             in_channels,
             matrix_layout,
+            #[cfg(not(feature = "fast-kernels"))]
             small_matrix_backend: SmallMatrixBackend::detect(),
             groups,
             input_buffer: RingBuffer2D::new(),
@@ -779,6 +785,7 @@ impl Conv1d {
                             &mut self.output_buf.data,
                         );
                     } else {
+                        #[cfg(not(feature = "fast-kernels"))]
                         if out_ch == 1
                             && self.small_matrix_backend.conv1d_one_output_tap(
                                 &mut self.output_buf.data,
