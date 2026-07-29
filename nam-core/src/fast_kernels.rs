@@ -1,3 +1,8 @@
+//! Validate every extent before crossing into the C kernels
+//!
+//! Invalid layouts are no-ops. Valid calls pass exclusive output ranges and
+//! initialized input ranges matching the C `restrict` and size contracts.
+
 mod ffi {
     #[allow(dead_code)]
     extern "C" {
@@ -163,8 +168,8 @@ pub(crate) fn conv1x1_small(
         return;
     }
     let bias = bias.map_or(core::ptr::null(), <[f32]>::as_ptr);
-    // SAFETY: All pointer ranges were validated above, and mutable output is
-    // exclusively borrowed for the duration of the call.
+    // SAFETY: The validated extents cover every C access. Rust's mutable output
+    // borrow cannot alias the shared inputs required by the C `restrict` contract
     unsafe {
         ffi::conv1x1_small(
             output.as_mut_ptr(),
@@ -197,8 +202,8 @@ pub(crate) fn conv1d_depthwise(
         return;
     }
     let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
-    // SAFETY: Every tap and all dense buffers were validated above. The pointer
-    // array remains alive and immutable for the duration of the call.
+    // SAFETY: Every tap and dense buffer covers the C loop bounds. The pointer
+    // array remains alive for the call, and mutable output cannot alias any input
     unsafe {
         ffi::conv1d_depthwise(
             output.as_mut_ptr(),
@@ -232,7 +237,8 @@ pub(crate) fn conv1d_small_gemv(
         return;
     }
     let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
-    // SAFETY: Every pointer range and matrix dimension was validated above.
+    // SAFETY: Every pointer range covers the validated matrix dimensions, and
+    // mutable output cannot alias the tap, weight, or bias inputs
     unsafe {
         ffi::conv1d_small_gemv(
             output.as_mut_ptr(),
@@ -257,7 +263,8 @@ pub(crate) fn add_activate(
     if !has_len(output, len) || !has_len(left, len) || !has_len(right, len) {
         return;
     }
-    // SAFETY: The three disjoint borrows cover `len` elements.
+    // SAFETY: All slices cover `len`, and Rust's mutable borrow makes the output
+    // disjoint from both inputs as required by C `restrict`
     unsafe {
         ffi::add_activate(
             output.as_mut_ptr(),
@@ -273,7 +280,7 @@ pub(crate) fn vec_add(output: &mut [f32], left: &[f32], right: &[f32], len: usiz
     if !has_len(output, len) || !has_len(left, len) || !has_len(right, len) {
         return;
     }
-    // SAFETY: The three disjoint borrows cover `len` elements.
+    // SAFETY: All slices cover `len`, and mutable output cannot alias either input
     unsafe { ffi::vec_add(output.as_mut_ptr(), left.as_ptr(), right.as_ptr(), len) }
 }
 
@@ -281,7 +288,7 @@ pub(crate) fn vec_add_inplace(left: &mut [f32], right: &[f32], len: usize) {
     if !has_len(left, len) || !has_len(right, len) {
         return;
     }
-    // SAFETY: Both disjoint borrows cover `len` elements.
+    // SAFETY: Both slices cover `len`, and mutable `left` cannot alias `right`
     unsafe { ffi::vec_add_inplace(left.as_mut_ptr(), right.as_ptr(), len) }
 }
 
@@ -290,7 +297,7 @@ pub(crate) fn add_bias(output: &mut [f32], bias: &[f32], channels: usize, num_fr
     if !has_len(output, product(channels, num_frames)) || !has_len(bias, channels) {
         return;
     }
-    // SAFETY: Both buffers cover the validated matrix dimensions.
+    // SAFETY: Both buffers cover the matrix dimensions, and mutable output cannot alias bias
     unsafe { ffi::add_bias(output.as_mut_ptr(), bias.as_ptr(), channels, num_frames) }
 }
 
@@ -330,7 +337,8 @@ pub(crate) fn film_scale_shift(
     {
         return;
     }
-    // SAFETY: All strided matrix extents were validated above.
+    // SAFETY: Every strided range covers the C loop bounds, and mutable output
+    // cannot alias the input or scale-and-shift parameters
     unsafe {
         ffi::film_scale_shift(
             output.as_mut_ptr(),
@@ -361,7 +369,8 @@ pub(crate) fn film_scale(
     {
         return;
     }
-    // SAFETY: All strided matrix extents were validated above.
+    // SAFETY: Every strided range covers the C loop bounds, and mutable output
+    // cannot alias the input or scale parameters
     unsafe {
         ffi::film_scale(
             output.as_mut_ptr(),
@@ -395,7 +404,8 @@ pub(crate) fn film_inplace_scale_shift(
     ) {
         return;
     }
-    // SAFETY: The mutable data and scale matrix extents were validated above.
+    // SAFETY: Both strided ranges cover the C loop bounds, and mutable data cannot
+    // alias the scale-and-shift parameters
     unsafe {
         ffi::film_inplace_scale_shift(
             data.as_mut_ptr(),
@@ -419,7 +429,8 @@ pub(crate) fn film_inplace_scale(
     if !film_lengths(data, data_stride, scale, scale_rows, dim, dim, num_frames) {
         return;
     }
-    // SAFETY: The mutable data and scale matrix extents were validated above.
+    // SAFETY: Both strided ranges cover the C loop bounds, and mutable data cannot
+    // alias the scale parameters
     unsafe {
         ffi::film_inplace_scale(
             data.as_mut_ptr(),
@@ -444,7 +455,7 @@ pub(crate) fn gated_activation(
     if rows < product(bottleneck, 2) || !has_len(data, product(rows, num_frames)) {
         return;
     }
-    // SAFETY: The matrix extent and both bottleneck regions were validated above.
+    // SAFETY: Data covers every frame and both bottleneck regions used by C
     unsafe {
         ffi::gated_activation(
             data.as_mut_ptr(),
@@ -470,7 +481,7 @@ pub(crate) fn blended_activation(
     if rows < product(bottleneck, 2) || !has_len(data, product(rows, num_frames)) {
         return;
     }
-    // SAFETY: The matrix extent and both bottleneck regions were validated above.
+    // SAFETY: Data covers every frame and both bottleneck regions used by C
     unsafe {
         ffi::blended_activation(
             data.as_mut_ptr(),
@@ -493,7 +504,7 @@ pub(crate) fn activation_inplace(
     if !has_len(data, len) {
         return;
     }
-    // SAFETY: The mutable slice covers `len` initialized elements.
+    // SAFETY: Data contains `len` initialized elements under an exclusive borrow
     unsafe {
         ffi::activation_inplace(
             data.as_mut_ptr(),
@@ -509,7 +520,7 @@ pub(crate) fn tanh_inplace(data: &mut [f32], len: usize) {
     if !has_len(data, len) {
         return;
     }
-    // SAFETY: The mutable slice covers `len` initialized elements.
+    // SAFETY: Data contains `len` initialized elements under an exclusive borrow
     unsafe { ffi::tanh_inplace(data.as_mut_ptr(), len) }
 }
 
@@ -518,7 +529,7 @@ pub(crate) fn tanh_poly_inplace(data: &mut [f32], len: usize) {
     if !has_len(data, len) {
         return;
     }
-    // SAFETY: The mutable slice covers `len` initialized elements.
+    // SAFETY: Data contains `len` initialized elements under an exclusive borrow
     unsafe { ffi::tanh_poly_inplace(data.as_mut_ptr(), len) }
 }
 
@@ -536,6 +547,31 @@ mod tests {
         let mut output = [7.0; 2];
         super::film_scale(&mut output, &[1.0; 2], &[1.0; 2], 2, 1, 2, 2, 1);
         assert_eq!(output, [7.0; 2]);
+    }
+
+    #[test]
+    fn safe_facade_rejects_short_depthwise_taps() {
+        let mut output = [7.0; 2];
+        super::conv1d_depthwise(&mut output, &[&[1.0]], &[1.0; 2], &[0.0; 2], 2, 1);
+        assert_eq!(output, [7.0; 2]);
+    }
+
+    #[test]
+    fn safe_facade_rejects_short_film_parameters() {
+        let mut output = [7.0; 4];
+        super::film_scale_shift(&mut output, &[1.0; 4], &[1.0; 3], 2, 2, 2, 4, 2);
+        assert_eq!(output, [7.0; 4]);
+    }
+
+    #[test]
+    fn safe_facade_rejects_overflowed_dimensions() {
+        let mut output = [7.0];
+        super::conv1x1_small(&mut output, &[1.0], &[1.0], None, usize::MAX, 2, 2, 1);
+        assert_eq!(output, [7.0]);
+
+        let mut activation = [7.0];
+        super::gated_activation(&mut activation, usize::MAX, usize::MAX, 1, 0, 6, false);
+        assert_eq!(activation, [7.0]);
     }
 
     proptest! {

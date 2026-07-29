@@ -299,15 +299,27 @@ impl NamPlugin {
             return ProcessStatus::Normal;
         }
 
+        let channel_data = buffer.as_slice();
+        if channel_data.len() != 1 || channel_data[0].len() != num_samples {
+            for channel in channel_data {
+                channel.fill(0.0);
+            }
+            self.report_audio_error(AudioProcessError::CallbackLayout);
+            return ProcessStatus::Normal;
+        }
+        let channel = &mut channel_data[0];
+        if num_samples > self.input_buf.len() || num_samples > self.output_buf.len() {
+            channel.fill(0.0);
+            self.report_audio_error(AudioProcessError::CallbackCapacity);
+            return ProcessStatus::Normal;
+        }
+
         self.install_pending_model();
         let model = match self.model.as_mut() {
             Some(model) => model,
             None => return ProcessStatus::Normal,
         };
         model.dsp.set_activation_mode(activation_mode);
-
-        let channel_data = buffer.as_slice();
-        let channel = &mut channel_data[0];
 
         for (input, &sample) in self.input_buf[..num_samples].iter_mut().zip(channel.iter()) {
             let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
@@ -336,13 +348,7 @@ impl NamPlugin {
         {
             process_error = AudioProcessError::NonFiniteOutput;
         }
-        let reported_error = AudioProcessError::from_raw(self.audio_error.load(Ordering::Acquire));
-        if process_error == AudioProcessError::NonFiniteOutput
-            || reported_error != AudioProcessError::NonFiniteOutput
-        {
-            self.audio_error
-                .store(process_error as u8, Ordering::Release);
-        }
+        self.report_audio_error(process_error);
 
         for (sample, &output) in channel.iter_mut().zip(&self.output_buf[..num_samples]) {
             let out_gain = util::db_to_gain_fast(self.params.output_gain.smoothed.next());
@@ -350,6 +356,16 @@ impl NamPlugin {
         }
 
         ProcessStatus::Normal
+    }
+
+    fn report_audio_error(&self, process_error: AudioProcessError) {
+        let reported_error = AudioProcessError::from_raw(self.audio_error.load(Ordering::Acquire));
+        if process_error == AudioProcessError::NonFiniteOutput
+            || reported_error != AudioProcessError::NonFiniteOutput
+        {
+            self.audio_error
+                .store(process_error as u8, Ordering::Release);
+        }
     }
 }
 

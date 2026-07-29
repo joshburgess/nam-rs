@@ -12,6 +12,8 @@ pub(super) enum AudioProcessError {
     ToModel = 4,
     ToHost = 5,
     NonFiniteOutput = 6,
+    CallbackLayout = 7,
+    CallbackCapacity = 8,
 }
 
 impl AudioProcessError {
@@ -26,6 +28,8 @@ impl AudioProcessError {
             Self::NonFiniteOutput => {
                 "The loaded model produced non-finite audio; affected samples were muted"
             }
+            Self::CallbackLayout => "The host supplied an invalid audio channel layout",
+            Self::CallbackCapacity => "The host audio block exceeded the initialized capacity",
         }
     }
 
@@ -37,6 +41,8 @@ impl AudioProcessError {
             4 => Self::ToModel,
             5 => Self::ToHost,
             6 => Self::NonFiniteOutput,
+            7 => Self::CallbackLayout,
+            8 => Self::CallbackCapacity,
             _ => Self::None,
         }
     }

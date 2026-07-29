@@ -99,8 +99,8 @@ fn loaded_model(generation: u64) -> LoadedModel {
 
 fn mono_buffer(samples: &mut [f32]) -> Buffer<'_> {
     let mut buffer = Buffer::default();
-    // SAFETY: The buffer does not outlive `samples`, and every channel has `samples.len()`
-    // elements.
+    // SAFETY: `samples` remains exclusively borrowed for the buffer's lifetime, and the
+    // declared sample count equals the only channel's length
     unsafe {
         buffer.set_slices(samples.len(), |channels| channels.push(samples));
     }
@@ -174,6 +174,54 @@ fn callback_resets_resampling_before_non_finite_output_can_poison_it() {
     assert_eq!(
         AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
         AudioProcessError::NonFiniteOutput
+    );
+}
+
+#[test]
+fn callback_mutes_oversized_host_blocks_without_allocating() {
+    let mut plugin = plugin_with_passthrough_model(32);
+    let mut audio = [0.25f32; 64];
+    let mut buffer = mono_buffer(&mut audio);
+
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+    drop(buffer);
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0);
+    assert!(audio.iter().all(|&sample| sample == 0.0));
+    assert_eq!(
+        AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+        AudioProcessError::CallbackCapacity
+    );
+}
+
+#[test]
+fn callback_mutes_invalid_channel_layouts_without_allocating() {
+    let mut plugin = plugin_with_passthrough_model(32);
+    let mut left = [0.25f32; 32];
+    let mut right = [0.25f32; 32];
+    let mut buffer = Buffer::default();
+    // SAFETY: Both slices remain exclusively borrowed for the buffer's lifetime and
+    // match the declared sample count
+    unsafe {
+        buffer.set_slices(left.len(), |channels| {
+            channels.push(&mut left);
+            channels.push(&mut right);
+        });
+    }
+
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+    drop(buffer);
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0);
+    assert!(left.iter().all(|&sample| sample == 0.0));
+    assert!(right.iter().all(|&sample| sample == 0.0));
+    assert_eq!(
+        AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
+        AudioProcessError::CallbackLayout
     );
 }
 
