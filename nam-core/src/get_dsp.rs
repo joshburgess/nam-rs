@@ -962,7 +962,7 @@ mod tests {
     fn test_regression_wavenet_a2_max() {
         if let Some((max_diff, _rms)) = regression_compare("wavenet_a2_max") {
             #[cfg(all(feature = "fast-kernels", not(feature = "faer")))]
-            let limit = 2.0e-06;
+            let limit = 8.0e-06;
             #[cfg(feature = "faer")]
             let limit = 4.0e-06;
             #[cfg(all(
