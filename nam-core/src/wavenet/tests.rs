@@ -125,6 +125,39 @@ fn test_slimmable_wavenet_set_slimming_changes_output() {
     );
 }
 
+fn slimmable_wavenet_with_channels(allowed_channels: &[usize]) -> Result<WaveNet, NamError> {
+    let path = Path::new("test_fixtures/models/slimmable_wavenet.nam");
+    let content = std::fs::read_to_string(path).unwrap();
+    let mut root: serde_json::Value = serde_json::from_str(&content).unwrap();
+    root["config"]["layers"][0]["slimmable"]["kwargs"]["allowed_channels"] =
+        serde_json::json!(allowed_channels);
+    let weights = root["weights"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap() as f32)
+        .collect::<Vec<_>>();
+    WaveNet::from_config(&root["config"], &weights, DspMetadata::default())
+}
+
+#[test]
+fn test_slimmable_wavenet_breakpoints() {
+    let model = slimmable_wavenet_with_channels(&[1, 2, 3]).unwrap();
+
+    assert_eq!(model.slimming_breakpoints(), vec![1.0 / 3.0, 2.0 / 3.0]);
+}
+
+#[test]
+fn test_slimmable_wavenet_validates_allowed_channel_contract() {
+    for allowed_channels in [&[1, 1, 3][..], &[2, 1, 3], &[1, 2]] {
+        let result = slimmable_wavenet_with_channels(allowed_channels);
+        assert!(
+            matches!(result, Err(NamError::InvalidConfigField { .. })),
+            "invalid allowed_channels were accepted: {allowed_channels:?}"
+        );
+    }
+}
+
 #[test]
 fn test_all_example_models_load() {
     let models = [
@@ -572,6 +605,93 @@ fn test_a1_standard_receptive_field() {
     }
     let model = crate::get_dsp(path).unwrap();
     assert_eq!(model.prewarm_samples(), 4093);
+}
+
+fn head_dilation_config(head: serde_json::Value) -> (serde_json::Value, Vec<f32>) {
+    let head_kernel_size = head
+        .get("kernel_size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as usize;
+    let config = serde_json::json!({
+        "layers": [{
+            "input_size": 1,
+            "condition_size": 1,
+            "head": head,
+            "channels": 1,
+            "kernel_sizes": [1],
+            "dilations": [1],
+            "activation": "ReLU",
+            "bottleneck": 1,
+            "head1x1": {"active": false, "out_channels": 1, "groups": 1},
+            "layer1x1": {"active": true, "groups": 1}
+        }],
+        "head_scale": 1.0
+    });
+    let weights = vec![0.25; 1 + 5 + head_kernel_size + 1];
+    (config, weights)
+}
+
+#[test]
+fn test_head_dilation_defaults_to_one() {
+    let (config, weights) = head_dilation_config(serde_json::json!({
+        "out_channels": 1,
+        "kernel_size": 3,
+        "bias": false
+    }));
+
+    let model = WaveNet::from_config(&config, &weights, DspMetadata::default()).unwrap();
+
+    assert_eq!(model.prewarm_samples(), 3);
+}
+
+#[test]
+fn test_head_dilation_contributes_to_receptive_field() {
+    let (config, weights) = head_dilation_config(serde_json::json!({
+        "out_channels": 1,
+        "kernel_size": 3,
+        "head_dilation": 4,
+        "bias": false
+    }));
+
+    let model = WaveNet::from_config(&config, &weights, DspMetadata::default()).unwrap();
+
+    assert_eq!(model.prewarm_samples(), 9);
+}
+
+#[test]
+fn test_head_dilation_must_be_positive() {
+    let (config, weights) = head_dilation_config(serde_json::json!({
+        "out_channels": 1,
+        "kernel_size": 3,
+        "head_dilation": 0,
+        "bias": false
+    }));
+
+    let result = WaveNet::from_config(&config, &weights, DspMetadata::default());
+
+    assert!(matches!(
+        result,
+        Err(NamError::InvalidConfigField { field, .. })
+            if field == "layer_array.head_dilation"
+    ));
+}
+
+#[test]
+fn test_head_dilation_type_is_validated() {
+    let (config, weights) = head_dilation_config(serde_json::json!({
+        "out_channels": 1,
+        "kernel_size": 3,
+        "head_dilation": 1.5,
+        "bias": false
+    }));
+
+    let result = WaveNet::from_config(&config, &weights, DspMetadata::default());
+
+    assert!(matches!(
+        result,
+        Err(NamError::InvalidConfigType { field, .. })
+            if field == "layer_array.head_dilation"
+    ));
 }
 
 #[test]

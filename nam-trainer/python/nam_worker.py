@@ -13,7 +13,9 @@ inject a custom callback, since core.train() doesn't expose a callback parameter
 """
 
 import json
+import importlib.metadata
 import os
+import re
 import sys
 import traceback
 import inspect
@@ -26,6 +28,7 @@ RUN_ID = "uninitialized"
 EVENT_SEQUENCE = 0
 CURRENT_FILE_INDEX = None
 CANCEL_REQUESTED = threading.Event()
+MIN_PACKED_A2_VERSION = (0, 13, 0)
 
 # Force matplotlib to use the non-interactive Agg backend BEFORE anything
 # imports it. The worker runs as a headless child process (CREATE_NO_WINDOW
@@ -33,6 +36,17 @@ CANCEL_REQUESTED = threading.Event()
 # display. This must happen before pytorch_lightning or nam import
 # matplotlib.
 os.environ["MPLBACKEND"] = "Agg"
+
+
+def supports_packed_a2_version(version):
+    match = re.fullmatch(
+        r"(\d+)\.(\d+)\.(\d+)(?:\.post\d+)?(?:\+[A-Za-z0-9][A-Za-z0-9._-]*)?",
+        version,
+    )
+    return bool(
+        match
+        and tuple(int(part) for part in match.groups()) >= MIN_PACKED_A2_VERSION
+    )
 
 
 def emit(event: dict):
@@ -146,6 +160,23 @@ def main():
             ),
         })
         sys.exit(1)
+
+    if request.get("packed", False):
+        try:
+            nam_version = importlib.metadata.version("neural-amp-modeler")
+        except importlib.metadata.PackageNotFoundError:
+            nam_version = "unknown"
+        if not supports_packed_a2_version(nam_version):
+            emit({
+                "type": "error",
+                "error_kind": "dependency",
+                "message": (
+                    "Packed A2 training requires neural-amp-modeler >= 0.13.0 "
+                    f"(installed: {nam_version}). Upgrade with: "
+                    "pip install --upgrade 'neural-amp-modeler>=0.13.0'"
+                ),
+            })
+            sys.exit(1)
 
     # Custom callback for JSON progress reporting. We use
     # on_validation_epoch_end so both training and validation metrics

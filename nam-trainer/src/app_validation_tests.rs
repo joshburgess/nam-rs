@@ -172,6 +172,90 @@ fn parse_environment_report_reads_package_and_api_fields() {
 }
 
 #[test]
+fn packed_a2_version_gate_accepts_supported_releases() {
+    for version in [
+        "0.13.0",
+        "0.14.2",
+        "1.0.0",
+        "0.13.0.post1",
+        "0.13.0+local",
+        "0.13.0.post1+local",
+    ] {
+        assert!(
+            super::packed_a2_version_is_supported(version),
+            "supported version was rejected: {version}"
+        );
+    }
+}
+
+#[test]
+fn packed_a2_version_gate_rejects_old_unknown_and_prerelease_versions() {
+    for version in [
+        "0.12.9",
+        "editable/unknown",
+        "0.13",
+        "0.13.0rc1",
+        "0.13.0.dev1",
+    ] {
+        assert!(
+            !super::packed_a2_version_is_supported(version),
+            "unsupported version was accepted: {version}"
+        );
+    }
+}
+
+#[test]
+fn packed_a2_training_requires_current_package_and_apis() {
+    let mut app = test_app();
+    app.input_path = Some("input.wav".into());
+    app.output_paths = vec!["output.wav".into()];
+    app.destination_dir = Some("models".into());
+    app.config.architecture = Architecture::Packed;
+    app.python_status = super::PythonStatus::Ok {
+        version: "3.12.0".into(),
+        devices: vec![super::TrainingDevice {
+            id: "cpu".into(),
+            name: "CPU".into(),
+        }],
+        warnings: Vec::new(),
+        report: super::EnvironmentReport {
+            nam_version: Some("0.12.0".into()),
+            torch_version: Some("2.7.0".into()),
+            packed_full_config_supported: true,
+        },
+    };
+
+    assert!(!app.can_train());
+    let error = app.packed_a2_requirement_error().unwrap();
+    assert!(error.contains("neural-amp-modeler >= 0.13.0"));
+    assert!(error.contains("pip install --upgrade"));
+
+    if let super::PythonStatus::Ok { report, .. } = &mut app.python_status {
+        report.nam_version = Some("0.13.0".into());
+    }
+    assert!(app.can_train());
+
+    if let super::PythonStatus::Ok { report, .. } = &mut app.python_status {
+        report.packed_full_config_supported = false;
+    }
+    assert!(!app.can_train());
+}
+
+#[test]
+fn direct_packed_a2_start_is_gated_before_artifact_creation() {
+    let mut app = test_app();
+    app.config.architecture = Architecture::Packed;
+    app.start_training();
+
+    assert!(app
+        .training_log
+        .iter()
+        .any(|line| line.contains("neural-amp-modeler >= 0.13.0")));
+    assert!(matches!(app.run.state(), super::TrainingState::Error(_)));
+    assert!(app.run.data().artifacts.is_none());
+}
+
+#[test]
 fn save_training_log_writes_log_next_to_model() {
     let (_temp, dir) = unique_test_dir("training_log");
     std::fs::create_dir_all(&dir).unwrap();

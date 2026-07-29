@@ -2944,6 +2944,7 @@ dependencies = [
  "matrixmultiply",
  "ndarray",
  "proptest",
+ "rustfft",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2961,6 +2962,7 @@ dependencies = [
  "proptest",
  "rfd",
  "rubato",
+ "serde_json",
 ]
 
 [[package]]

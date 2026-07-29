@@ -144,7 +144,9 @@ impl RingBuffer2D {
         self.max_buffer_size = max_buffer_size;
         // Storage size: 2 * max_lookback + max_buffer_size (matching C++)
         self.storage_cols = 2 * self.max_lookback + max_buffer_size;
-        self.storage = vec![0.0; channels * self.storage_cols];
+        let needed = channels * self.storage_cols;
+        self.storage.resize(needed, 0.0);
+        self.storage[..needed].fill(0.0);
         self.write_pos = self.max_lookback;
     }
 
@@ -167,9 +169,12 @@ impl RingBuffer2D {
     /// Returns a pointer to the start; data is column-major with stride = channels.
     #[inline]
     fn read_ptr(&self, _num_frames: usize, lookback: usize) -> &[f32] {
-        let read_pos = self.write_pos - lookback;
-        let start = read_pos * self.channels;
+        let start = self.read_offset(lookback);
         &self.storage[start..]
+    }
+
+    fn read_offset(&self, lookback: usize) -> usize {
+        (self.write_pos - lookback) * self.channels
     }
 
     fn advance(&mut self, num_frames: usize) {
@@ -530,6 +535,8 @@ struct Conv1d {
     /// Flattened weights for C FFI: all taps concatenated.
     #[cfg(feature = "fast-kernels")]
     flat_weights: Vec<f32>,
+    #[cfg(feature = "fast-kernels")]
+    tap_offsets: Vec<usize>,
 }
 
 impl Conv1d {
@@ -692,6 +699,8 @@ impl Conv1d {
             output_buf: ColMajorMatrix::new(out_channels, 1),
             #[cfg(feature = "fast-kernels")]
             flat_weights,
+            #[cfg(feature = "fast-kernels")]
+            tap_offsets: vec![0; kernel_size],
         })
     }
 
@@ -723,19 +732,18 @@ impl Conv1d {
         // Fast-kernels path: single C FFI call for the entire Conv1d
         #[cfg(feature = "fast-kernels")]
         {
-            let tap_slices: Vec<&[f32]> = (0..ks)
-                .map(|k| {
-                    let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
-                    let lookback = (-offset_signed) as usize;
-                    self.input_buffer.read_ptr(num_frames, lookback)
-                })
-                .collect();
+            for k in 0..ks {
+                let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
+                let lookback = (-offset_signed) as usize;
+                self.tap_offsets[k] = self.input_buffer.read_offset(lookback);
+            }
             let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
             match &self.weights {
                 Conv1dWeights::Depthwise(_) => {
                     crate::fast_kernels::conv1d_depthwise(
                         &mut self.output_buf.data,
-                        &tap_slices,
+                        &self.input_buffer.storage,
+                        &self.tap_offsets,
                         &self.flat_weights,
                         &self.bias,
                         out_ch,
@@ -745,12 +753,15 @@ impl Conv1d {
                 Conv1dWeights::General(_) if !use_sgemm => {
                     crate::fast_kernels::conv1d_small_gemv(
                         &mut self.output_buf.data,
-                        &tap_slices,
+                        &self.input_buffer.storage,
+                        &self.tap_offsets,
                         &self.flat_weights,
                         &self.bias,
-                        out_ch,
-                        in_ch,
-                        num_frames,
+                        crate::fast_kernels::Conv1dDimensions {
+                            out_channels: out_ch,
+                            in_channels: in_ch,
+                            num_frames,
+                        },
                     );
                 }
                 Conv1dWeights::General(weights_colmajor) => {
@@ -759,13 +770,12 @@ impl Conv1d {
                         let off = f * out_ch;
                         self.output_buf.data[off..off + out_ch].copy_from_slice(&self.bias);
                     }
-                    for k in 0..ks {
-                        let w = &weights_colmajor[k];
+                    for (k, w) in weights_colmajor.iter().enumerate().take(ks) {
                         self.matrix_layout.multiply(
                             num_frames,
                             1.0,
                             w,
-                            tap_slices[k],
+                            &self.input_buffer.storage[self.tap_offsets[k]..],
                             in_ch,
                             1.0,
                             &mut self.output_buf.data,
@@ -1918,6 +1928,20 @@ impl SlimmableConfig {
                 field: "slimmable.kwargs.allowed_channels".into(),
             });
         }
+        for pair in allowed_channels.windows(2) {
+            if pair[1] <= pair[0] {
+                return Err(NamError::InvalidConfigField {
+                    field: "slimmable.kwargs.allowed_channels".into(),
+                    reason: "must be strictly increasing",
+                });
+            }
+        }
+        if allowed_channels[allowed_channels.len() - 1] != channels {
+            return Err(NamError::InvalidConfigField {
+                field: "slimmable.kwargs.allowed_channels".into(),
+                reason: "the last entry must equal the full channel count",
+            });
+        }
         let active_channels = allowed_channels[allowed_channels.len() - 1];
         Ok(Some(Self {
             allowed_channels,
@@ -2322,6 +2346,7 @@ fn normalize_layer_array_config(layer: &mut serde_json::Value) -> Result<(), Nam
         let out_channels = head.get("out_channels").cloned();
         let bias = head.get("bias").cloned();
         let kernel_size = head.get("kernel_size").cloned();
+        let head_dilation = head.get("head_dilation").cloned();
         if !layer_obj.contains_key("head_size") {
             if let Some(out_channels) = out_channels {
                 layer_obj.insert("head_size".into(), out_channels);
@@ -2335,6 +2360,11 @@ fn normalize_layer_array_config(layer: &mut serde_json::Value) -> Result<(), Nam
         if !layer_obj.contains_key("head_kernel_size") {
             if let Some(kernel_size) = kernel_size {
                 layer_obj.insert("head_kernel_size".into(), kernel_size);
+            }
+        }
+        if !layer_obj.contains_key("head_dilation") {
+            if let Some(head_dilation) = head_dilation {
+                layer_obj.insert("head_dilation".into(), head_dilation);
             }
         }
     }
@@ -2627,6 +2657,16 @@ impl WaveNet {
                 .map(|value| positive_config_usize(value, "layer_array.head_kernel_size"))
                 .transpose()?
                 .unwrap_or(1);
+            let head_dilation = la_json
+                .get("head_dilation")
+                .map(|value| positive_config_usize(value, "layer_array.head_dilation"))
+                .transpose()?
+                .unwrap_or(1);
+            checked_dimension_mul(
+                "convolution receptive field",
+                head_dilation,
+                head_kernel_size - 1,
+            )?;
             let slimmable = SlimmableConfig::from_json(la_json.get("slimmable"), channels)?;
 
             // Groups
@@ -2764,10 +2804,10 @@ impl WaveNet {
                         reason: "must be inactive for slimmable layers",
                     });
                 }
-                if head_kernel_size != 1 {
+                if head_kernel_size != 1 || head_dilation != 1 {
                     return Err(NamError::InvalidConfigField {
-                        field: "head_kernel_size".into(),
-                        reason: "must be one for slimmable layers",
+                        field: "head".into(),
+                        reason: "kernel size and dilation must be one for slimmable layers",
                     });
                 }
             }
@@ -2814,7 +2854,7 @@ impl WaveNet {
                 head_out_size,
                 head_size,
                 head_kernel_size,
-                1,
+                head_dilation,
                 1,
                 head_bias,
                 &mut iter,
@@ -2948,6 +2988,21 @@ impl WaveNet {
                 operation: "slimmable width selection on a non-slimmable WaveNet",
             })
         }
+    }
+
+    pub fn slimming_breakpoints(&self) -> Vec<f64> {
+        let mut breakpoints = self
+            .layer_arrays
+            .iter()
+            .filter_map(|layer_array| layer_array.slimmable.as_ref())
+            .flat_map(|slimmable| {
+                (1..slimmable.allowed_channels.len())
+                    .map(|index| index as f64 / slimmable.allowed_channels.len() as f64)
+            })
+            .collect::<Vec<_>>();
+        breakpoints.sort_by(f64::total_cmp);
+        breakpoints.dedup();
+        breakpoints
     }
 
     /// Block processing matching C++ WaveNet::process
@@ -3224,6 +3279,10 @@ impl Dsp for WaveNet {
 
     fn set_slimming(&mut self, value: f64) -> Result<(), NamError> {
         WaveNet::set_slimming(self, value)
+    }
+
+    fn slimming_breakpoints(&self) -> Vec<f64> {
+        WaveNet::slimming_breakpoints(self)
     }
 
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {

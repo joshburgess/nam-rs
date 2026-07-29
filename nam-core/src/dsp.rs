@@ -91,13 +91,14 @@ pub trait Dsp: Send {
 
     /// Warm up by processing silence.
     fn prewarm(&mut self) {
-        let n = self.prewarm_samples();
-        if n == 0 {
-            return;
+        let mut remaining = self.prewarm_samples();
+        let silence = [Sample::default(); 64];
+        let mut discard = [Sample::default(); 64];
+        while remaining > 0 {
+            let chunk_size = remaining.min(silence.len());
+            self.process(&silence[..chunk_size], &mut discard[..chunk_size]);
+            remaining -= chunk_size;
         }
-        let silence = vec![Sample::default(); n];
-        let mut discard = vec![Sample::default(); n];
-        self.process(&silence, &mut discard);
     }
 
     fn metadata(&self) -> &DspMetadata;
@@ -109,6 +110,11 @@ pub trait Dsp: Send {
         Err(NamError::UnsupportedOperation {
             operation: "slimmable width selection",
         })
+    }
+
+    /// Return sorted internal size-selection breakpoints. The bounds 0.0 and 1.0 are implied.
+    fn slimming_breakpoints(&self) -> Vec<f64> {
+        Vec::new()
     }
 
     /// Number of output channels. Default is 1 (mono).

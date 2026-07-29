@@ -800,6 +800,9 @@ fn show_train_controls(app: &mut TrainerApp, ui: &mut egui::Ui) {
                     if !missing.is_empty() {
                         ui.add_space(4.0);
                         ui.colored_label(DIM, format!("Select {} to begin", missing.join(", ")));
+                    } else if let Some(error) = app.packed_a2_requirement_error() {
+                        ui.add_space(4.0);
+                        ui.colored_label(RED, error);
                     }
                 }
             }

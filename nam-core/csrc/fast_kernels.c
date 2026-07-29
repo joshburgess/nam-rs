@@ -17,13 +17,15 @@
  * Processes all kernel taps and adds bias in one call.
  *
  * weights: [kernel_size][ch] flattened as weights[k * ch + c]
- * tap_ptrs: array of pointers to ring buffer data for each tap
+ * input: ring-buffer storage
+ * tap_offsets: element offsets into input for each tap
  * bias: [ch]
  * output: [num_frames * ch], written (not accumulated)
  */
 void fast_conv1d_depthwise(
     float *restrict output,
-    const float *const *restrict tap_ptrs,
+    const float *restrict input,
+    const size_t *restrict tap_offsets,
     const float *restrict weights,
     const float *restrict bias,
     size_t ch,
@@ -40,7 +42,7 @@ void fast_conv1d_depthwise(
 
     /* Accumulate all taps */
     for (size_t k = 0; k < kernel_size; k++) {
-        const float *tap = tap_ptrs[k];
+        const float *tap = input + tap_offsets[k];
         const float *w = weights + k * ch;
         for (size_t f = 0; f < num_frames; f++) {
             size_t off = f * ch;
@@ -57,11 +59,13 @@ void fast_conv1d_depthwise(
  *
  * weights: [kernel_size][in_ch * out_ch] col-major per tap
  *          weights[k * (out_ch * in_ch) + i * out_ch + o]
- * tap_ptrs: array of pointers to input data for each tap
+ * input: ring-buffer storage
+ * tap_offsets: element offsets into input for each tap
  */
 void fast_conv1d_small_gemv(
     float *restrict output,
-    const float *const *restrict tap_ptrs,
+    const float *restrict input,
+    const size_t *restrict tap_offsets,
     const float *restrict weights,
     const float *restrict bias,
     size_t out_ch,
@@ -80,7 +84,7 @@ void fast_conv1d_small_gemv(
     /* Accumulate all taps */
     size_t w_stride = out_ch * in_ch;
     for (size_t k = 0; k < kernel_size; k++) {
-        const float *tap = tap_ptrs[k];
+        const float *tap = input + tap_offsets[k];
         const float *w = weights + k * w_stride;
         for (size_t f = 0; f < num_frames; f++) {
             size_t in_off = f * in_ch;

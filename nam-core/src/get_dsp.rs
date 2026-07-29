@@ -204,7 +204,7 @@ impl Sequential {
         }
 
         let scratch = if models.len() > 1 {
-            vec![Vec::new(); models.len() - 1]
+            vec![vec![Sample::default(); 1]; models.len() - 1]
         } else {
             Vec::new()
         };
@@ -224,19 +224,20 @@ impl Dsp for Sequential {
             return;
         }
 
-        let len = input.len();
-        for buf in &mut self.scratch {
-            buf.resize(len, Sample::default());
+        let chunk_size = self.scratch[0].len().max(1);
+        for (input_chunk, output_chunk) in
+            input.chunks(chunk_size).zip(output.chunks_mut(chunk_size))
+        {
+            let len = input_chunk.len();
+            self.models[0].process(input_chunk, &mut self.scratch[0][..len]);
+            for i in 1..self.models.len() - 1 {
+                let (prev, next) = self.scratch.split_at_mut(i);
+                self.models[i].process(&prev[i - 1][..len], &mut next[0][..len]);
+            }
+            let last_input = &self.scratch[self.scratch.len() - 1][..len];
+            let last_model = self.models.len() - 1;
+            self.models[last_model].process(last_input, output_chunk);
         }
-
-        self.models[0].process(input, &mut self.scratch[0]);
-        for i in 1..self.models.len() - 1 {
-            let (prev, next) = self.scratch.split_at_mut(i);
-            self.models[i].process(&prev[i - 1], &mut next[0]);
-        }
-        let last_input = &self.scratch[self.scratch.len() - 1];
-        let last_model = self.models.len() - 1;
-        self.models[last_model].process(last_input, output);
     }
 
     fn reset(&mut self, sample_rate: f64, max_buffer_size: usize) {
@@ -244,6 +245,7 @@ impl Dsp for Sequential {
             model.reset(sample_rate, max_buffer_size);
         }
         for buf in &mut self.scratch {
+            buf.resize(max_buffer_size.max(1), Sample::default());
             buf.fill(Sample::default());
         }
     }
@@ -256,13 +258,14 @@ impl Dsp for Sequential {
     }
 
     fn prewarm(&mut self) {
-        let n = self.prewarm_samples();
-        if n == 0 {
-            return;
+        let mut remaining = self.prewarm_samples();
+        let silence = [Sample::default(); 64];
+        let mut discard = [Sample::default(); 64];
+        while remaining > 0 {
+            let chunk_size = remaining.min(silence.len());
+            self.process(&silence[..chunk_size], &mut discard[..chunk_size]);
+            remaining -= chunk_size;
         }
-        let silence = vec![Sample::default(); n];
-        let mut discard = vec![Sample::default(); n];
-        self.process(&silence, &mut discard);
     }
 
     fn metadata(&self) -> &DspMetadata {
@@ -285,6 +288,8 @@ struct SlimmableContainer {
     submodels: Vec<(f64, Box<dyn Dsp>)>, // (max_value, model)
     active_index: usize,
     metadata: DspMetadata,
+    sample_rate: f64,
+    max_buffer_size: usize,
 }
 
 impl SlimmableContainer {
@@ -302,23 +307,50 @@ impl SlimmableContainer {
             });
         }
 
-        let mut submodels = Vec::with_capacity(submodels_json.len());
-        for entry in submodels_json {
+        let mut submodels: Vec<(f64, Box<dyn Dsp>)> = Vec::with_capacity(submodels_json.len());
+        for (index, entry) in submodels_json.iter().enumerate() {
             let max_value = entry["max_value"]
                 .as_f64()
                 .ok_or_else(|| NamError::MissingField("submodel max_value".into()))?;
+            if !max_value.is_finite() || max_value <= 0.0 {
+                return Err(NamError::InvalidConfigField {
+                    field: "config.submodels[].max_value".into(),
+                    reason: "must be finite and greater than zero",
+                });
+            }
+            if index > 0 && max_value <= submodels[index - 1].0 {
+                return Err(NamError::InvalidConfigField {
+                    field: "config.submodels[].max_value".into(),
+                    reason: "must be strictly increasing",
+                });
+            }
+            if index + 1 < submodels_json.len() && max_value >= 1.0 {
+                return Err(NamError::InvalidConfigField {
+                    field: "config.submodels[].max_value".into(),
+                    reason: "internal breakpoints must be less than one",
+                });
+            }
             let model_json = entry
                 .get("model")
                 .ok_or_else(|| NamError::MissingField("submodel model".into()))?;
             let model = get_dsp_from_value(model_json)?;
             submodels.push((max_value, model));
         }
+        if submodels[submodels.len() - 1].0 != 1.0 {
+            return Err(NamError::InvalidConfigField {
+                field: "config.submodels[].max_value".into(),
+                reason: "the last submodel must end at one",
+            });
+        }
 
         let active_index = submodels.len() - 1;
+        let sample_rate = metadata.expected_sample_rate.unwrap_or(48_000.0);
         Ok(Box::new(SlimmableContainer {
             submodels,
             active_index,
             metadata,
+            sample_rate,
+            max_buffer_size: 1,
         }))
     }
 }
@@ -329,8 +361,10 @@ impl Dsp for SlimmableContainer {
     }
 
     fn reset(&mut self, sample_rate: f64, max_buffer_size: usize) {
+        self.sample_rate = sample_rate;
+        self.max_buffer_size = max_buffer_size.max(1);
         for (_, model) in &mut self.submodels {
-            model.reset(sample_rate, max_buffer_size);
+            model.reset(self.sample_rate, self.max_buffer_size);
         }
     }
 
@@ -361,10 +395,23 @@ impl Dsp for SlimmableContainer {
         let idx = self
             .submodels
             .iter()
-            .position(|(max_value, _)| ratio <= *max_value)
+            .position(|(max_value, _)| ratio < *max_value)
             .unwrap_or(self.submodels.len() - 1);
+        if idx == self.active_index {
+            return Ok(());
+        }
+        self.submodels[idx]
+            .1
+            .reset(self.sample_rate, self.max_buffer_size);
         self.active_index = idx;
         Ok(())
+    }
+
+    fn slimming_breakpoints(&self) -> Vec<f64> {
+        self.submodels[..self.submodels.len() - 1]
+            .iter()
+            .map(|(max_value, _)| *max_value)
+            .collect()
     }
 
     fn metadata(&self) -> &DspMetadata {
@@ -1102,6 +1149,57 @@ mod tests {
         );
     }
 
+    fn linear_container(max_values: &[f64]) -> serde_json::Value {
+        let submodels = max_values
+            .iter()
+            .map(|max_value| {
+                serde_json::json!({
+                    "max_value": max_value,
+                    "model": {
+                        "version": "0.7.0",
+                        "architecture": "Linear",
+                        "config": {"receptive_field": 1},
+                        "weights": [1.0],
+                        "sample_rate": 48000
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "version": "0.7.0",
+            "architecture": "SlimmableContainer",
+            "config": {"submodels": submodels},
+            "weights": [],
+            "sample_rate": 48000
+        })
+    }
+
+    #[test]
+    fn test_slimmable_container_breakpoints() {
+        let model = get_dsp_from_value(&linear_container(&[0.25, 0.75, 1.0])).unwrap();
+
+        assert_eq!(model.slimming_breakpoints(), vec![0.25, 0.75]);
+    }
+
+    #[test]
+    fn test_slimmable_container_validates_breakpoint_contract() {
+        for max_values in [
+            vec![0.5, 0.5, 1.0],
+            vec![0.75, 0.5, 1.0],
+            vec![0.0, 1.0],
+            vec![-0.25, 1.0],
+            vec![1.0, 2.0],
+            vec![0.5, 0.9],
+            vec![0.5, 2.0],
+        ] {
+            let result = get_dsp_from_value(&linear_container(&max_values));
+            assert!(
+                matches!(result, Err(NamError::InvalidConfigField { .. })),
+                "invalid max_values were accepted: {max_values:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_get_dsp_sequential_linear_fixture() {
         let path = Path::new("test_fixtures/models/sequential_linear.nam");
@@ -1304,6 +1402,22 @@ mod tests {
                 "upstream_packed_a2_export: max_diff={:.2e}, rms_diff={:.2e}",
                 max_diff,
                 rms_diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_upstream_head_dilation_reference_render() {
+        let model_path = Path::new("test_fixtures/models/upstream_head_dilation.nam");
+        let input_path = Path::new("test_fixtures/audio/upstream_packed_a2_input.wav");
+        let ref_path = Path::new("test_fixtures/audio/upstream_head_dilation_ref.wav");
+
+        if let Some((max_diff, rms_diff)) =
+            compare_model_to_reference(model_path, input_path, ref_path, false)
+        {
+            assert!(
+                max_diff <= 2.0e-6,
+                "upstream_head_dilation: max_diff={max_diff:.2e}, rms_diff={rms_diff:.2e}"
             );
         }
     }

@@ -966,6 +966,10 @@ fn parse_worker_events(stdout: &[u8]) -> Vec<serde_json::Value> {
 
 fn write_fake_python_modules(root: &std::path::Path) {
     write_file(
+        &root.join("neural_amp_modeler-0.13.0.dist-info/METADATA"),
+        "Metadata-Version: 2.1\nName: neural-amp-modeler\nVersion: 0.13.0\n",
+    );
+    write_file(
         &root.join("pytorch_lightning.py"),
         r#"
 class Callback:

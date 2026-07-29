@@ -9,7 +9,8 @@ mod ffi {
         #[link_name = "fast_conv1d_depthwise"]
         pub(super) fn conv1d_depthwise(
             output: *mut f32,
-            tap_ptrs: *const *const f32,
+            input: *const f32,
+            tap_offsets: *const usize,
             weights: *const f32,
             bias: *const f32,
             ch: usize,
@@ -19,7 +20,8 @@ mod ffi {
         #[link_name = "fast_conv1d_small_gemv"]
         pub(super) fn conv1d_small_gemv(
             output: *mut f32,
-            tap_ptrs: *const *const f32,
+            input: *const f32,
+            tap_offsets: *const usize,
             weights: *const f32,
             bias: *const f32,
             out_ch: usize,
@@ -131,6 +133,12 @@ mod ffi {
     }
 }
 
+pub(crate) struct Conv1dDimensions {
+    pub(crate) out_channels: usize,
+    pub(crate) in_channels: usize,
+    pub(crate) num_frames: usize,
+}
+
 fn product(left: usize, right: usize) -> usize {
     left.saturating_mul(right)
 }
@@ -186,28 +194,32 @@ pub(crate) fn conv1x1_small(
 
 pub(crate) fn conv1d_depthwise(
     output: &mut [f32],
-    taps: &[&[f32]],
+    input: &[f32],
+    tap_offsets: &[usize],
     weights: &[f32],
     bias: &[f32],
     channels: usize,
     num_frames: usize,
 ) {
-    let kernel_size = taps.len();
+    let kernel_size = tap_offsets.len();
     let frame_elements = product(channels, num_frames);
-    if taps.iter().any(|tap| !has_len(tap, frame_elements))
-        || !has_len(output, frame_elements)
+    if tap_offsets.iter().any(|offset| {
+        offset
+            .checked_add(frame_elements)
+            .is_none_or(|end| end > input.len())
+    }) || !has_len(output, frame_elements)
         || !has_len(weights, product(channels, kernel_size))
         || !has_len(bias, channels)
     {
         return;
     }
-    let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
-    // SAFETY: Every tap and dense buffer covers the C loop bounds. The pointer
-    // array remains alive for the call, and mutable output cannot alias any input
+    // SAFETY: Every offset and dense buffer covers the C loop bounds, and mutable
+    // output cannot alias the immutable ring-buffer input
     unsafe {
         ffi::conv1d_depthwise(
             output.as_mut_ptr(),
-            tap_ptrs.as_ptr(),
+            input.as_ptr(),
+            tap_offsets.as_ptr(),
             weights.as_ptr(),
             bias.as_ptr(),
             channels,
@@ -219,30 +231,37 @@ pub(crate) fn conv1d_depthwise(
 
 pub(crate) fn conv1d_small_gemv(
     output: &mut [f32],
-    taps: &[&[f32]],
+    input: &[f32],
+    tap_offsets: &[usize],
     weights: &[f32],
     bias: &[f32],
-    out_channels: usize,
-    in_channels: usize,
-    num_frames: usize,
+    dimensions: Conv1dDimensions,
 ) {
-    let kernel_size = taps.len();
+    let Conv1dDimensions {
+        out_channels,
+        in_channels,
+        num_frames,
+    } = dimensions;
+    let kernel_size = tap_offsets.len();
     let input_elements = product(in_channels, num_frames);
     let matrix_elements = product(out_channels, in_channels);
-    if taps.iter().any(|tap| !has_len(tap, input_elements))
-        || !has_len(output, product(out_channels, num_frames))
+    if tap_offsets.iter().any(|offset| {
+        offset
+            .checked_add(input_elements)
+            .is_none_or(|end| end > input.len())
+    }) || !has_len(output, product(out_channels, num_frames))
         || !has_len(weights, product(matrix_elements, kernel_size))
         || !has_len(bias, out_channels)
     {
         return;
     }
-    let tap_ptrs = taps.iter().map(|tap| tap.as_ptr()).collect::<Vec<_>>();
-    // SAFETY: Every pointer range covers the validated matrix dimensions, and
-    // mutable output cannot alias the tap, weight, or bias inputs
+    // SAFETY: Every offset covers the validated matrix dimensions, and mutable
+    // output cannot alias the input, weight, or bias buffers
     unsafe {
         ffi::conv1d_small_gemv(
             output.as_mut_ptr(),
-            tap_ptrs.as_ptr(),
+            input.as_ptr(),
+            tap_offsets.as_ptr(),
             weights.as_ptr(),
             bias.as_ptr(),
             out_channels,
@@ -552,7 +571,7 @@ mod tests {
     #[test]
     fn safe_facade_rejects_short_depthwise_taps() {
         let mut output = [7.0; 2];
-        super::conv1d_depthwise(&mut output, &[&[1.0]], &[1.0; 2], &[0.0; 2], 2, 1);
+        super::conv1d_depthwise(&mut output, &[1.0], &[0], &[1.0; 2], &[0.0; 2], 2, 1);
         assert_eq!(output, [7.0; 2]);
     }
 

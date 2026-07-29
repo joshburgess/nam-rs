@@ -82,6 +82,19 @@ struct LoadedModel {
     generation: u64,
     dsp: Box<dyn nam_core::Dsp>,
     resampler: Option<ResamplerState>,
+    applied_model_size: Option<f32>,
+}
+
+impl LoadedModel {
+    fn apply_model_size(&mut self, requested: f32) {
+        if self
+            .applied_model_size
+            .is_some_and(|applied| applied != requested)
+            && self.dsp.set_slimming(f64::from(requested)).is_ok()
+        {
+            self.applied_model_size = Some(requested);
+        }
+    }
 }
 
 struct NamPlugin {
@@ -151,6 +164,9 @@ struct NamParams {
 
     #[id = "fast_mode"]
     pub fast_mode: BoolParam,
+
+    #[id = "model_size"]
+    pub model_size: FloatParam,
 
     #[persist = "model_path"]
     pub model_path: Mutex<String>,
@@ -236,6 +252,14 @@ impl Default for NamParams {
 
             fast_mode: BoolParam::new("Fast Mode", false),
 
+            model_size: FloatParam::new(
+                "Model Size",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.01)
+            .with_value_to_string(formatters::v2s_f32_percentage(0)),
+
             model_path: Mutex::new(String::new()),
         }
     }
@@ -320,6 +344,7 @@ impl NamPlugin {
             None => return ProcessStatus::Normal,
         };
         model.dsp.set_activation_mode(activation_mode);
+        model.apply_model_size(self.params.model_size.value());
 
         for (input, &sample) in self.input_buf[..num_samples].iter_mut().zip(channel.iter()) {
             let in_gain = util::db_to_gain_fast(self.params.input_gain.smoothed.next());
@@ -436,6 +461,7 @@ pub mod benchmark {
                 generation: 1,
                 dsp: Box::new(PassthroughDsp),
                 resampler,
+                applied_model_size: None,
             });
             plugin.latest_generation.store(1, Ordering::Release);
             plugin.installed_generation.store(1, Ordering::Release);
@@ -513,6 +539,11 @@ impl Plugin for NamPlugin {
                         } else {
                             nam_core::ActivationMode::Accurate
                         });
+                        let requested_model_size = params.model_size.value();
+                        let applied_model_size = dsp
+                            .set_slimming(f64::from(requested_model_size))
+                            .is_ok()
+                            .then_some(requested_model_size);
                         let model_rate = dsp.metadata().expected_sample_rate.unwrap_or(sample_rate);
                         dsp.reset(model_rate, max_buf);
                         dsp.prewarm();
@@ -545,6 +576,7 @@ impl Plugin for NamPlugin {
                             generation,
                             dsp,
                             resampler,
+                            applied_model_size,
                         };
                         loop {
                             if !plugin_alive.load(Ordering::Acquire)
@@ -701,6 +733,9 @@ impl Plugin for NamPlugin {
                         ui.label("Output Gain");
                         ui.add(widgets::ParamSlider::for_param(&params.output_gain, setter));
 
+                        ui.label("Model Size");
+                        ui.add(widgets::ParamSlider::for_param(&params.model_size, setter));
+
                         ui.separator();
 
                         let mut fast = params.fast_mode.value();
@@ -755,6 +790,7 @@ impl Plugin for NamPlugin {
         self.audio_error
             .store(AudioProcessError::None as u8, Ordering::Release);
         if let Some(model) = self.model.as_mut() {
+            model.apply_model_size(self.params.model_size.value());
             let model_rate = model
                 .dsp
                 .metadata()

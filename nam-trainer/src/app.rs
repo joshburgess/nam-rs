@@ -277,6 +277,7 @@ pub struct DetectionResult {
 
 /// Minimum Python version required by neural-amp-modeler.
 pub const NAM_MIN_PYTHON: (u32, u32) = (3, 10);
+pub const NAM_MIN_PACKED_A2: (u32, u32, u32) = (0, 13, 0);
 pub const DEFAULT_OUTPUT_SAMPLES_PER_DATUM: u32 = 8192;
 const MAX_TRAINING_LOG_LINES: usize = 2_000;
 const MAX_INSTALL_LOG_LINES: usize = 1_000;
@@ -1009,6 +1010,29 @@ impl TrainerApp {
             && !self.output_paths.is_empty()
             && self.destination_dir.is_some()
             && self.run.state() == TrainingState::Idle
+            && self.packed_a2_requirement_error().is_none()
+    }
+
+    pub(crate) fn packed_a2_requirement_error(&self) -> Option<String> {
+        if self.config.architecture != Architecture::Packed {
+            return None;
+        }
+        let (version, api_supported) = match &self.python_status {
+            PythonStatus::Ok { report, .. } => (
+                report.nam_version.as_deref().unwrap_or("unknown"),
+                report.packed_full_config_supported,
+            ),
+            _ => ("unknown", false),
+        };
+        if api_supported && packed_a2_version_is_supported(version) {
+            return None;
+        }
+        let (major, minor, patch) = NAM_MIN_PACKED_A2;
+        Some(format!(
+            "Packed A2 training requires neural-amp-modeler >= {major}.{minor}.{patch} \
+             (installed: {version}). Upgrade with: pip install --upgrade \
+             'neural-amp-modeler>={major}.{minor}.{patch}'"
+        ))
     }
 
     pub fn cancel_training(&mut self) {
@@ -1132,6 +1156,33 @@ impl TrainerApp {
         #[cfg(not(test))]
         self.persist_settings();
     }
+}
+
+fn packed_a2_version_is_supported(version: &str) -> bool {
+    let stable = version
+        .split_once('+')
+        .map_or(version, |(release, _)| release);
+    let stable = stable
+        .split_once(".post")
+        .map_or(stable, |(release, _)| release);
+    if stable
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let mut parts = stable.split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u32>().ok()),
+        parts.next().and_then(|part| part.parse::<u32>().ok()),
+        parts.next().and_then(|part| part.parse::<u32>().ok()),
+        parts.next(),
+    );
+    matches!(
+        parsed,
+        (Some(major), Some(minor), Some(patch), None)
+            if (major, minor, patch) >= NAM_MIN_PACKED_A2
+    )
 }
 
 impl Drop for TrainerApp {

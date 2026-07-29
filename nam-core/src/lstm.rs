@@ -58,13 +58,13 @@ impl LstmCell {
 
     /// Process one sample through this cell.
     #[inline]
-    fn process(&mut self, input: &Array1<f32>, activation_mode: ActivationMode) {
+    fn process(&mut self, input: ndarray::ArrayView1<'_, f32>, activation_mode: ActivationMode) {
         let h = self.hidden_size;
 
         // Copy input into xh
         self.xh
             .slice_mut(ndarray::s![..self.input_size])
-            .assign(input);
+            .assign(&input);
 
         // ifgo = W @ xh + b
         ndarray::linalg::general_mat_vec_mul(1.0, &self.w, &self.xh, 0.0, &mut self.ifgo);
@@ -171,10 +171,11 @@ impl Dsp for Lstm {
             self.input_buf[0] = crate::dsp::sample_to_f32(sample);
 
             // Forward through LSTM layers
-            self.cells[0].process(&self.input_buf, self.activation_mode);
+            self.cells[0].process(self.input_buf.view(), self.activation_mode);
             for layer in 1..self.cells.len() {
-                let prev_hidden = self.cells[layer - 1].hidden_state().to_owned();
-                self.cells[layer].process(&prev_hidden, self.activation_mode);
+                let (processed, pending) = self.cells.split_at_mut(layer);
+                let prev_hidden = processed[layer - 1].hidden_state();
+                pending[0].process(prev_hidden, self.activation_mode);
             }
 
             if let Some(final_cell) = self.cells.last() {

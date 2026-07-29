@@ -13,6 +13,19 @@ result = {
     "cuda_install": None,
 }
 
+MIN_PACKED_A2_VERSION = (0, 13, 0)
+
+
+def supports_packed_a2_version(version):
+    match = re.fullmatch(
+        r"(\d+)\.(\d+)\.(\d+)(?:\.post\d+)?(?:\+[A-Za-z0-9][A-Za-z0-9._-]*)?",
+        version,
+    )
+    return bool(
+        match
+        and tuple(int(part) for part in match.groups()) >= MIN_PACKED_A2_VERSION
+    )
+
 
 def detect_nvidia():
     """Return (gpu_names, cuda_version_str) from nvidia-smi, or (None, None)."""
@@ -65,7 +78,7 @@ try:
         result["nam_version"] = importlib.metadata.version("neural-amp-modeler")
     except importlib.metadata.PackageNotFoundError:
         result["nam_version"] = "editable/unknown"
-    result["packed_full_config_supported"] = all(
+    packed_apis_available = all(
         hasattr(core, name)
         for name in (
             "_detect_input_version",
@@ -75,6 +88,15 @@ try:
             "_get_configs",
         )
     ) and hasattr(nam_full, "main")
+    result["packed_full_config_supported"] = (
+        packed_apis_available
+        and supports_packed_a2_version(result["nam_version"])
+    )
+    if not result["packed_full_config_supported"]:
+        result["warnings"].append(
+            "Packed A2 training requires neural-amp-modeler >= 0.13.0. "
+            "Upgrade with: pip install --upgrade 'neural-amp-modeler>=0.13.0'"
+        )
 except ImportError:
     pass
 

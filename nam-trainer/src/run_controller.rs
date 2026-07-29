@@ -10,6 +10,12 @@ pub(crate) enum RunFinalization {
 
 impl TrainerApp {
     pub(crate) fn start_training(&mut self) {
+        if let Some(error) = self.packed_a2_requirement_error() {
+            self.push_training_log(format!("Error: {error}"));
+            self.run
+                .finish_error("Upgrade neural-amp-modeler before Packed A2 training.");
+            return;
+        }
         let run = match crate::app::prepare_training_run(self) {
             Ok(run) => run,
             Err(error) => {

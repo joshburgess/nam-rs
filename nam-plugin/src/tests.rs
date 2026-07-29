@@ -94,6 +94,7 @@ fn loaded_model(generation: u64) -> LoadedModel {
         generation,
         dsp: Box::new(PassthroughDsp),
         resampler: None,
+        applied_model_size: None,
     }
 }
 
@@ -118,6 +119,23 @@ fn plugin_with_passthrough_model(buffer_size: usize) -> NamPlugin {
     plugin
 }
 
+fn plugin_with_model_fixture(model_name: &str, buffer_size: usize) -> NamPlugin {
+    let path = std::path::Path::new("../nam-core/test_fixtures/models").join(model_name);
+    let mut dsp = nam_core::get_dsp(&path).unwrap();
+    let applied_model_size = dsp.set_slimming(1.0).is_ok().then_some(1.0);
+    dsp.reset(48_000.0, buffer_size);
+    dsp.prewarm();
+
+    let mut plugin = plugin_with_passthrough_model(buffer_size);
+    plugin.model = Some(LoadedModel {
+        generation: 1,
+        dsp,
+        resampler: None,
+        applied_model_size,
+    });
+    plugin
+}
+
 #[test]
 fn callback_mutes_non_finite_model_output_without_allocating() {
     let buffer_size = 64;
@@ -126,6 +144,7 @@ fn callback_mutes_non_finite_model_output_without_allocating() {
         generation: 1,
         dsp: Box::new(NonFiniteDsp),
         resampler: None,
+        applied_model_size: None,
     });
     let mut audio = vec![1.0f32; buffer_size];
     let mut buffer = mono_buffer(&mut audio);
@@ -542,6 +561,167 @@ fn complete_steady_state_callback_does_not_allocate() {
 }
 
 #[test]
+fn complete_callback_with_multilayer_lstm_does_not_allocate() {
+    let buffer_size = 128;
+    let mut plugin = plugin_with_model_fixture("lstm_2_layer.nam", buffer_size);
+    let mut audio = vec![0.25f32; buffer_size];
+    let mut buffer = mono_buffer(&mut audio);
+
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0, "multi-layer LSTM callback allocated");
+    assert!(audio.iter().all(|sample| sample.is_finite()));
+}
+
+#[test]
+fn complete_callback_with_sequential_model_does_not_allocate() {
+    let buffer_size = 128;
+    let mut plugin = plugin_with_model_fixture("sequential_linear.nam", buffer_size);
+    let mut audio = vec![0.25f32; buffer_size];
+    let mut buffer = mono_buffer(&mut audio);
+
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0, "Sequential callback allocated");
+    assert!(audio.iter().all(|sample| sample.is_finite()));
+}
+
+#[test]
+fn complete_callback_with_fft_linear_model_does_not_allocate() {
+    let buffer_size = 512;
+    let weights = (0..4_096)
+        .map(|index| ((index + 1) as f32 * 0.013).sin() * 0.001)
+        .collect::<Vec<_>>();
+    let model_json = serde_json::json!({
+        "version": "0.7.0",
+        "architecture": "Linear",
+        "config": {
+            "receptive_field": weights.len(),
+            "implementation": "fft"
+        },
+        "weights": weights,
+        "sample_rate": 48000
+    })
+    .to_string();
+    let mut dsp = nam_core::get_dsp::get_dsp_from_json(&model_json).unwrap();
+    dsp.reset(48_000.0, buffer_size);
+
+    let mut plugin = plugin_with_passthrough_model(buffer_size);
+    plugin.model = Some(LoadedModel {
+        generation: 1,
+        dsp,
+        resampler: None,
+        applied_model_size: None,
+    });
+
+    for block_size in [1, 7, 64, 257, buffer_size] {
+        let mut audio = vec![0.1f32; block_size];
+        let mut buffer = mono_buffer(&mut audio);
+        let (status, allocations) =
+            allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+        assert_eq!(status, ProcessStatus::Normal);
+        assert_eq!(
+            allocations, 0,
+            "FFT Linear callback allocated for {block_size} samples"
+        );
+        assert!(audio.iter().all(|sample| sample.is_finite()));
+    }
+}
+
+fn params_with_model_size(value: f32) -> Arc<NamParams> {
+    Arc::new(NamParams {
+        model_size: FloatParam::new(
+            "Model Size",
+            value,
+            FloatRange::Linear { min: 0.0, max: 1.0 },
+        )
+        .with_step_size(0.01),
+        ..NamParams::default()
+    })
+}
+
+#[test]
+fn packed_a2_model_size_parameter_is_persisted() {
+    let params = NamParams::default();
+    let parameter_ids = params
+        .param_map()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect::<Vec<_>>();
+
+    assert!(parameter_ids.iter().any(|id| id == "model_size"));
+    assert_eq!(params.model_size.value(), 1.0);
+}
+
+#[test]
+fn packed_a2_model_size_changes_and_resets_without_allocating() {
+    let buffer_size = 128;
+    let mut plugin = plugin_with_model_fixture("upstream_packed_a2_export.nam", buffer_size);
+    let mut full_size_audio = vec![0.1f32; buffer_size];
+    assert_eq!(
+        plugin.process_buffer(&mut mono_buffer(&mut full_size_audio)),
+        ProcessStatus::Normal
+    );
+
+    plugin.params = params_with_model_size(0.25);
+    if let Some(model) = plugin.model.as_mut() {
+        model.applied_model_size = None;
+    }
+    let mut warm_audio = vec![0.1f32; buffer_size];
+    plugin.process_buffer(&mut mono_buffer(&mut warm_audio));
+    if let Some(model) = plugin.model.as_mut() {
+        model.applied_model_size = Some(1.0);
+    }
+    let (_, change_allocations) = allocation_tracking::count_allocations(|| {
+        if let Some(model) = plugin.model.as_mut() {
+            model.apply_model_size(0.25);
+        }
+    });
+    assert_eq!(
+        change_allocations, 0,
+        "model-size parameter change allocated"
+    );
+    let mut small_size_audio = vec![0.1f32; buffer_size];
+    let mut small_size_buffer = mono_buffer(&mut small_size_audio);
+    let (status, allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut small_size_buffer));
+    drop(small_size_buffer);
+
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(allocations, 0, "small packed-model callback allocated");
+    assert_eq!(
+        plugin
+            .model
+            .as_ref()
+            .and_then(|model| model.applied_model_size),
+        Some(0.25)
+    );
+    assert_ne!(small_size_audio, full_size_audio);
+
+    let (_, dsp_reset_allocations) = allocation_tracking::count_allocations(|| {
+        if let Some(model) = plugin.model.as_mut() {
+            model.dsp.reset(48_000.0, buffer_size);
+        }
+    });
+    assert_eq!(dsp_reset_allocations, 0, "packed-model DSP reset allocated");
+    Plugin::reset(&mut plugin);
+    let mut reset_audio = vec![0.1f32; buffer_size];
+    let mut reset_buffer = mono_buffer(&mut reset_audio);
+    let (reset_status, reset_callback_allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut reset_buffer));
+    assert_eq!(reset_status, ProcessStatus::Normal);
+    assert_eq!(
+        reset_callback_allocations, 0,
+        "callback after model-size state reset allocated"
+    );
+    assert!(reset_audio.iter().all(|sample| sample.is_finite()));
+}
+
+#[test]
 fn plugin_instances_keep_independent_activation_modes() {
     fn probe_plugin() -> NamPlugin {
         let mut plugin = plugin_with_passthrough_model(1);
@@ -551,6 +731,7 @@ fn plugin_instances_keep_independent_activation_modes() {
                 mode: nam_core::ActivationMode::Accurate,
             }),
             resampler: None,
+            applied_model_size: None,
         });
         plugin
     }
