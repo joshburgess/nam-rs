@@ -2458,9 +2458,6 @@ impl WaveNet {
         metadata: DspMetadata,
         condition_dsp: Option<Box<dyn Dsp>>,
     ) -> Result<Self, NamError> {
-        #[cfg(feature = "fast-kernels")]
-        let _ = crate::fast_kernels::init_vector_math();
-
         let normalized_config = normalize_wavenet_config(config)?;
         let config = &normalized_config;
         let layers_json = config["layers"]
@@ -2878,6 +2875,9 @@ impl WaveNet {
         } else {
             in_channels
         };
+
+        #[cfg(feature = "fast-kernels")]
+        let _ = crate::fast_kernels::init_vector_math();
 
         Ok(Self {
             layer_arrays,
