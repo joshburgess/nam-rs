@@ -1042,6 +1042,25 @@ fn test_conv1d_general_when_not_depthwise() {
     assert!(matches!(conv.weights, Conv1dWeights::General(_)));
 }
 
+#[cfg(feature = "fast-kernels")]
+#[test]
+fn test_grouped_conv1d_preserves_compact_tap_major_weights() {
+    let mut weights_data = (1..=24).map(|value| value as f32).collect::<Vec<_>>();
+    weights_data.extend([0.0; 12]);
+    let mut iter = crate::util::WeightIter::new(&weights_data);
+    let conv = Conv1d::from_weights(3, 12, 2, 1, 3, &mut iter).unwrap();
+
+    assert_eq!(
+        conv.compact_grouped_weights.as_deref(),
+        Some(
+            &[
+                1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0, 23.0, 2.0, 4.0, 6.0,
+                8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0,
+            ][..]
+        )
+    );
+}
+
 #[test]
 fn test_conv1d_depthwise_identity() {
     // 2-channel depthwise with kernel_size=1, weights=[1,1]

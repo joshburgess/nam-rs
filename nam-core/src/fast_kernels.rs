@@ -31,6 +31,15 @@ mod ffi {
             kernel_size: usize,
             num_frames: usize,
         );
+        #[link_name = "fast_conv1d_grouped_12x3_k2"]
+        pub(super) fn conv1d_grouped_12x3_k2(
+            output: *mut f32,
+            input: *const f32,
+            tap_offsets: *const usize,
+            weights: *const f32,
+            bias: *const f32,
+            num_frames: usize,
+        );
         #[link_name = "fast_add_activate"]
         pub(super) fn add_activate(
             output: *mut f32,
@@ -369,6 +378,46 @@ pub(crate) fn conv1d_small_gemv(
             num_frames,
         );
     }
+}
+
+pub(crate) fn conv1d_grouped_12x3_k2(
+    output: &mut [f32],
+    input: &[f32],
+    tap_offsets: &[usize],
+    weights: &[f32],
+    bias: &[f32],
+    num_frames: usize,
+) -> bool {
+    const OUT_CHANNELS: usize = 12;
+    const IN_CHANNELS: usize = 3;
+    const KERNEL_SIZE: usize = 2;
+
+    let input_elements = product(IN_CHANNELS, num_frames);
+    if tap_offsets.len() != KERNEL_SIZE
+        || tap_offsets.iter().any(|offset| {
+            offset
+                .checked_add(input_elements)
+                .is_none_or(|end| end > input.len())
+        })
+        || !has_len(output, product(OUT_CHANNELS, num_frames))
+        || !has_len(weights, OUT_CHANNELS * KERNEL_SIZE)
+        || !has_len(bias, OUT_CHANNELS)
+    {
+        return false;
+    }
+    // SAFETY: Both tap ranges and every fixed-size output, weight, and bias
+    // access are covered by the validated slice extents
+    unsafe {
+        ffi::conv1d_grouped_12x3_k2(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            tap_offsets.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            num_frames,
+        );
+    }
+    true
 }
 
 pub(crate) fn add_activate(
@@ -982,6 +1031,72 @@ mod tests {
             },
         );
         assert_eq!(output, [7.0; 4]);
+    }
+
+    #[test]
+    fn safe_facade_rejects_short_grouped_conv1d_buffers() {
+        let mut output = [7.0; 12];
+        let processed = super::conv1d_grouped_12x3_k2(
+            &mut output,
+            &[1.0; 6],
+            &[0, 3],
+            &[1.0; 24],
+            &[0.0; 12],
+            2,
+        );
+        assert!(!processed);
+        assert_eq!(output, [7.0; 12]);
+    }
+
+    #[test]
+    fn grouped_12x3_k2_conv1d_matches_scalar_reference() {
+        let num_frames = 19;
+        let tap_elements = 3 * num_frames;
+        let input = (0..tap_elements * 2)
+            .map(|index| ((index + 1) as f32 * 0.017).sin())
+            .collect::<Vec<_>>();
+        let tap_offsets = [0, tap_elements];
+        let weights = (0..24)
+            .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25)
+            .collect::<Vec<_>>();
+        let bias = (0..12)
+            .map(|index| index as f32 * 0.01 - 0.03)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; 12 * num_frames];
+
+        for (tap, &tap_offset) in tap_offsets.iter().enumerate() {
+            for frame in 0..num_frames {
+                for group in 0..3 {
+                    for output in 0..4 {
+                        let output_channel = group * 4 + output;
+                        expected[frame * 12 + output_channel] += weights[tap * 12 + output_channel]
+                            * input[tap_offset + frame * 3 + group];
+                    }
+                }
+            }
+        }
+        for frame in 0..num_frames {
+            for output in 0..12 {
+                expected[frame * 12 + output] += bias[output];
+            }
+        }
+
+        let mut actual = vec![0.0f32; expected.len()];
+        assert!(super::conv1d_grouped_12x3_k2(
+            &mut actual,
+            &input,
+            &tap_offsets,
+            &weights,
+            &bias,
+            num_frames,
+        ));
+
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2.0e-6,
+                "grouped 12x3/k2 output {index}: expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[test]

@@ -360,8 +360,7 @@ and 256 frames.
 Explicit 8x4 and 4x4 kernels retain the input-channel, tap, and bias
 accumulation order of the generic implementation. The 8x4 kernel reduced
 shape-level time by 77.6% to 78.2%. The 4x4/k3 path improved by 79.4% to
-81.3%. The grouped 12x3/k2 fallback remained unchanged within the benchmark's
-noise threshold.
+81.3%.
 
 The upstream fused 4x4/k3 design was also evaluated. It improved the retained
 per-tap kernel by 6.8% to 12.3% at 16 through 64 frames, but regressed it by
@@ -380,6 +379,31 @@ The complete callback clears the 10% retention gate at every measured size.
 Direct scalar oracles cover all benchmarked shapes and short-buffer
 rejection. Complete model tests preserve render accuracy, streaming and reset
 behavior, and allocation freedom.
+
+The next profile found that the grouped 12x3/k2 condition convolution still
+expanded its weights into a dense block-diagonal matrix. Its generic inner
+loop accounted for 14.9% to 16.2% of the complete callback from 16 through
+256 frames.
+
+The loader now retains tap-major compact weights for grouped convolutions.
+The common 12x3/k2 path evaluates three independent 4x1 groups, avoiding the
+zero blocks, output-clear pass, and separate bias pass. A corrected
+microbenchmark uses the fixture's grouped sparsity and weight order. The
+compact kernel reduced its time by 97.4% to 97.6%.
+
+Matched Apple M4 Criterion runs measured the complete A2 callback:
+
+| Frames | Dense grouped path | Compact grouped path | Improvement |
+|-------:|-------------------:|---------------------:|------------:|
+| 16 | 7.184 us | 6.343 us | 11.7% |
+| 32 | 14.074 us | 12.085 us | 14.1% |
+| 64 | 27.106 us | 23.670 us | 12.7% |
+| 128 | 53.812 us | 46.916 us | 12.8% |
+| 256 | 106.58 us | 93.364 us | 12.4% |
+
+The conservative confidence bound exceeds 10% at every size. Direct tests
+cover compact loader order, scalar equivalence, and invalid buffer extents.
+Complete render, streaming, reset, and plugin allocation tests also pass.
 
 ### Accurate Linux activation backend
 

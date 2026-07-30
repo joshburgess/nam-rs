@@ -41,4 +41,22 @@ pub mod benchmark {
             },
         );
     }
+
+    pub fn conv1d_grouped_12x3_k2(
+        output: &mut [f32],
+        input: &[f32],
+        tap_offsets: &[usize],
+        weights: &[f32],
+        bias: &[f32],
+        num_frames: usize,
+    ) -> bool {
+        crate::fast_kernels::conv1d_grouped_12x3_k2(
+            output,
+            input,
+            tap_offsets,
+            weights,
+            bias,
+            num_frames,
+        )
+    }
 }

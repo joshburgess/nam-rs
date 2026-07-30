@@ -229,6 +229,48 @@ void fast_conv1d_small_gemv(
     }
 }
 
+void fast_conv1d_grouped_12x3_k2(
+    float *restrict output,
+    const float *restrict input,
+    const size_t *restrict tap_offsets,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t num_frames
+) {
+    const float *tap0 = input + tap_offsets[0];
+    const float *tap1 = input + tap_offsets[1];
+    const float *w0 = weights;
+    const float *w1 = weights + 12;
+
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * 3;
+        size_t out_off = f * 12;
+        float input00 = tap0[in_off];
+        float input01 = tap0[in_off + 1];
+        float input02 = tap0[in_off + 2];
+        float input10 = tap1[in_off];
+        float input11 = tap1[in_off + 1];
+        float input12 = tap1[in_off + 2];
+
+        for (size_t o = 0; o < 4; o++) {
+            float sum = w0[o] * input00;
+            sum += w1[o] * input10;
+            sum += bias[o];
+            output[out_off + o] = sum;
+
+            sum = w0[4 + o] * input01;
+            sum += w1[4 + o] * input11;
+            sum += bias[4 + o];
+            output[out_off + 4 + o] = sum;
+
+            sum = w0[8 + o] * input02;
+            sum += w1[8 + o] * input12;
+            sum += bias[8 + o];
+            output[out_off + 8 + o] = sum;
+        }
+    }
+}
+
 /* ── Vector add: c[i] = a[i] + b[i] ────────────────────────────────────
  */
 void fast_vec_add(

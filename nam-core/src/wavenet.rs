@@ -433,6 +433,8 @@ struct Conv1d {
     #[cfg(feature = "fast-kernels")]
     flat_weights: Vec<f32>,
     #[cfg(feature = "fast-kernels")]
+    compact_grouped_weights: Option<Vec<f32>>,
+    #[cfg(feature = "fast-kernels")]
     tap_offsets: Vec<usize>,
 }
 
@@ -514,6 +516,8 @@ impl Conv1d {
         #[cfg(not(feature = "fast-kernels"))]
         let _ = flat_weight_len;
 
+        #[cfg(feature = "fast-kernels")]
+        let mut compact_grouped_weights = None;
         let weights = if is_depthwise {
             // Depthwise: one weight per channel per kernel tap
             // C++ weight order: for each channel c, for each kernel tap k
@@ -537,6 +541,9 @@ impl Conv1d {
             let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
                 .map(|_| vec![0.0f32; matrix_layout.left_len()])
                 .collect();
+            #[cfg(feature = "fast-kernels")]
+            let mut compact_tap_weights = (groups > 1)
+                .then(|| vec![0.0f32; kernel_size * out_per_group * in_per_group * groups]);
 
             // C++ weight order: for group, for out_per_group, for in_per_group, for kernel_tap
             for g in 0..groups {
@@ -548,9 +555,20 @@ impl Conv1d {
                         for k in 0..kernel_size {
                             // column-major: index = col * out_channels + row
                             tap_weights_colmajor[k][col * out_channels + row] = taps[k];
+                            #[cfg(feature = "fast-kernels")]
+                            if let Some(compact) = &mut compact_tap_weights {
+                                let tap_stride = out_per_group * in_per_group * groups;
+                                let group_offset = g * out_per_group * in_per_group;
+                                compact[k * tap_stride + group_offset + j * out_per_group + i] =
+                                    taps[k];
+                            }
                         }
                     }
                 }
+            }
+            #[cfg(feature = "fast-kernels")]
+            {
+                compact_grouped_weights = compact_tap_weights;
             }
             Conv1dWeights::General(tap_weights_colmajor)
         };
@@ -603,6 +621,8 @@ impl Conv1d {
             output_buf: ColMajorMatrix::new(out_channels, 1),
             #[cfg(feature = "fast-kernels")]
             flat_weights,
+            #[cfg(feature = "fast-kernels")]
+            compact_grouped_weights,
             #[cfg(feature = "fast-kernels")]
             tap_offsets: vec![0; kernel_size],
         })
@@ -662,6 +682,21 @@ impl Conv1d {
                 let offset_signed: isize = dil as isize * (k as isize + 1 - ks as isize);
                 let lookback = (-offset_signed) as usize;
                 self.tap_offsets[k] = self.input_buffer.read_offset(lookback);
+            }
+            if out_ch == 12 && in_ch == 3 && ks == 2 && self.groups == 3 {
+                if let Some(weights) = &self.compact_grouped_weights {
+                    if crate::fast_kernels::conv1d_grouped_12x3_k2(
+                        &mut self.output_buf.data,
+                        &self.input_buffer.storage,
+                        &self.tap_offsets,
+                        weights,
+                        &self.bias,
+                        num_frames,
+                    ) {
+                        self.input_buffer.advance(num_frames);
+                        return;
+                    }
+                }
             }
             let use_sgemm = out_ch * in_ch >= SGEMM_MIN_SIZE;
             match &self.weights {
