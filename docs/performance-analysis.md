@@ -1,6 +1,6 @@
 # Performance Analysis: Rust vs C++ NAM
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 
 ## Historical Performance Numbers
 
@@ -44,14 +44,14 @@ The allocation-free WaveNet run on Apple Silicon produced:
 
 | Callback | Default A1 | Default A2 | `fast-kernels` A1 | `fast-kernels` A2 |
 |---------:|-----------:|-----------:|------------------:|------------------:|
-| 32 samples | 58.2 us | 31.7 us | 37.7 us | 19.5 us |
-| 64 samples | 115.4 us | 62.4 us | 72.9 us | 38.0 us |
-| 128 samples | 229.6 us | 119.1 us | 143.4 us | 75.6 us |
-| 256 samples | 456.8 us | 245.7 us | 286.7 us | 151.2 us |
+| 32 samples | 58.2 us | 31.7 us | 24.2 us | 19.5 us |
+| 64 samples | 115.4 us | 62.4 us | 47.9 us | 38.0 us |
+| 128 samples | 229.6 us | 119.1 us | 95.8 us | 75.6 us |
+| 256 samples | 456.8 us | 245.7 us | 189.5 us | 151.2 us |
 
-Against the immediately preceding backend, the default build stayed within
-4.0% at every measured size. The `fast-kernels` build stayed within 7.0%.
-The new path preserves the bit-identical A2 render on Apple Silicon.
+The default and A2 columns come from the preceding maintained run. The vForce
+change affects only `fast-kernels` A1. It preserves the bit-identical A2 render
+on Apple Silicon.
 
 Linux CI enforces these Callgrind budgets independently for the default,
 `faer`, and `fast-kernels` builds:
@@ -78,6 +78,7 @@ budget change can be traced to the functions and source lines that caused it.
 | sgemm threshold=64 | Better than threshold=32 for a2_max (350ms → 257ms) | None |
 | target-cpu=native | ~2x improvement early on | None |
 | Slice-based bounds elimination | Minor improvement | None |
+| Accelerate vForce accurate tanh on Apple platforms | 31% to 33% faster complete A1 callbacks | No measurable regression |
 
 ### What didn't work
 
@@ -90,7 +91,8 @@ budget change can be traced to the functions and source lines that caused it.
 | f32::mul_add (FMA) | No change | The compiler was already using FMA where beneficial via target-cpu=native. |
 | Axpy loop without sgemm | 50% **slower** on standard WaveNet | The compiler's auto-vectorizer couldn't match matrixmultiply's hand-tuned SIMD micro-kernels for 16x16 matrices. |
 | Axpy loop replacing sgemm | Faster on some, but a2_max accuracy degraded 4.77e-06 → 6.20e-06 | Different FP accumulation order compounds through a2_max's deep network with large weights. |
-| fast_tanh polynomial | Only 11% speedup | tanh is ~11% of total time, not the bottleneck. GEMM dominates. |
+| fast_tanh polynomial before packed kernels | Only 11% speedup | GEMM still dominated that revision. |
+| Batched vForce LSTM gates and state tanh | 48% slower complete LSTM callback | Library-call overhead dominates at hidden size 3. |
 
 ### Small-matrix SIMD evaluation
 
@@ -275,15 +277,49 @@ and 1.02e-06 on x86-64. Direct kernel oracles cover 8x8, 16x16, full, and
 partial column tiles. Complete model tests cover render accuracy,
 callback-partition invariance, reset behavior, and allocation freedom.
 
+### Accurate Apple activation backend
+
+After the packed convolution kernels moved activation to roughly 40% of A1
+callback samples, the accurate fused add-and-tanh kernel was changed to use
+Accelerate vForce on Apple platforms. The kernel adds into fixed 256-element
+stack chunks and applies `vvtanhf` without allocating.
+
+Matched Criterion runs measured the complete A1 callback:
+
+| Frames | Scalar accurate tanh | vForce accurate tanh | Improvement |
+|-------:|---------------------:|---------------------:|------------:|
+| 32 | 36.37 us | 24.23 us | 33.2% |
+| 64 | 72.02 us | 47.87 us | 33.1% |
+| 128 | 139.39 us | 95.79 us | 31.1% |
+| 256 | 277.48 us | 189.45 us | 31.6% |
+
+The direct kernel test covers lengths on both sides of the 256-element chunk
+boundary. Complete A1 render, callback-partition, reset, and plugin allocation
+tests pass. The maximum render difference remains 7.97e-07 on ARM64.
+
+A post-change Apple M4 profile attributed 18.5% of complete callback leaf
+samples to vForce and 8.1% to its platform-vector helpers. Scalar libm fell to
+0.02%, and the fused kernel's own addition and dispatch code accounted for
+2.1%. The remaining activation cost is inside the retained vector math
+implementation.
+
+The same profiling pass found no activation target in A2: activation kernels
+accounted for 3.3% of its complete callback, while Conv1d and Conv1x1 accounted
+for 55.1%. LSTM scalar math accounted for 32.3%, but batching its four gate
+vectors and cell-state tanh through vForce made the complete callback 48.2%
+slower. That prototype was removed.
+
 ## Key Insights
 
-### 1. The bottleneck is small-matrix GEMM
+### 1. A1 bottlenecks shift after each retained kernel
 
 The standard WaveNet's hot path is 16x16 and 8x8 matrix-vector multiplies with
 multiple frames batched. These are too small for general-purpose BLAS to be
 optimal, but too large for scalar code to be competitive. The current backend
 uses reset-sized packing scratch and an 8x8 NEON kernel on AArch64. Other
-architectures use allocation-free `nano-gemm` microkernels.
+architectures use allocation-free `nano-gemm` microkernels. Once those kernels
+landed, accurate tanh became the dominant A1 target and warranted a separate
+vector-math backend.
 
 ### 2. Accuracy and performance trade off through FP accumulation order
 
@@ -293,9 +329,13 @@ Any change to the GEMM inner loop order changes which floating-point rounding er
 
 PGO, LTO, and codegen-units=1 all made things worse. The workload is dominated by tight numerical loops where instruction cache locality matters more than cross-function optimization. The default Rust release settings (16 codegen units, no LTO) produce the best results because they keep the hot code compact.
 
-### 4. tanh is not the bottleneck
+### 4. Accurate tanh became the post-kernel A1 bottleneck
 
-Despite C++ getting 1.5-2x speedup from fast_tanh, in my Rust implementation tanh only accounts for ~11% of total time. The difference is that C++ Eigen's GEMM is so fast that tanh becomes a significant fraction of the remaining time, while my GEMM is slower so it dominates.
+Before the packed kernels, the fast-tanh approximation improved the callback
+by only 11%. After the matrix work was reduced, accurate activation accounted
+for roughly 40% of Apple samples and 44% of Linux instructions. Accelerate
+vForce reduced the complete Apple callback by 31% to 33% without switching to
+the approximate activation mode.
 
 ### 5. Small models match or beat C++
 
@@ -303,10 +343,14 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The packed A1 Conv1d backend covers the dominant 16x16 and 8x8 matrix shapes
-on ARM64 and AVX2/FMA x86-64. Post-kernel profiles show that another retained
-A1 optimization needs either an accurate vector-math activation backend or a
-broader design that removes more than one layer pass without inhibiting SIMD.
+The Apple accurate activation backend now clears the complete-callback
+retention gate. A2 activation is too small a fraction of its callback, and the
+LSTM vForce prototype regressed.
+
+Linux x86-64 still uses scalar accurate tanh. glibc exposes a vector tanh ABI
+only from version 2.35, so using it directly would add a runtime and linker
+constraint to the optional fast-kernel feature. A Linux backend needs a native
+benchmark plus an explicit compatibility design before it can be retained.
 
 ## Real-world impact of the performance gap
 

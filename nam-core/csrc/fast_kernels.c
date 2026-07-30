@@ -12,6 +12,10 @@
 #include <stddef.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 /* ── Full Conv1d block processing (depthwise case) ──────────────────────
  * Equivalent to the entire Conv1d::process_block for depthwise weights.
  * Processes all kernel taps and adds bias in one call.
@@ -183,9 +187,22 @@ void fast_add_activate(
                         * fabsf(x + 0.814642734961073f * x * ax));
         }
     } else {
+#if defined(__APPLE__)
+        float sums[256];
+        const size_t chunk_capacity = sizeof(sums) / sizeof(sums[0]);
+        for (size_t offset = 0; offset < len; offset += chunk_capacity) {
+            size_t remaining = len - offset;
+            int count = (int)(remaining < chunk_capacity ? remaining : chunk_capacity);
+            for (int i = 0; i < count; i++) {
+                sums[i] = conv_out[offset + (size_t)i] + mixin_out[offset + (size_t)i];
+            }
+            vvtanhf(z_out + offset, sums, &count);
+        }
+#else
         for (size_t i = 0; i < len; i++) {
             z_out[i] = tanhf(conv_out[i] + mixin_out[i]);
         }
+#endif
     }
 }
 

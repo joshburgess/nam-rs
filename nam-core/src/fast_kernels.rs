@@ -593,6 +593,71 @@ mod tests {
         assert_eq!(activation, [7.0]);
     }
 
+    #[test]
+    fn accurate_fused_tanh_handles_chunk_boundaries() {
+        for len in [0, 1, 255, 256, 257, 511, 512, 513, 1024] {
+            let left = (0..len)
+                .map(|index| (index as f32 * 0.037).sin() * 2.0)
+                .collect::<Vec<_>>();
+            let right = (0..len)
+                .map(|index| (index as f32 * 0.021).cos() * 0.75)
+                .collect::<Vec<_>>();
+            let expected = left
+                .iter()
+                .zip(&right)
+                .map(|(&left, &right)| (left + right).tanh())
+                .collect::<Vec<_>>();
+            let mut actual = vec![0.0; len];
+
+            super::add_activate(&mut actual, &left, &right, len, false);
+
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-6,
+                    "length {len}, output {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accurate_fused_tanh_handles_special_values() {
+        let left = [
+            f32::NEG_INFINITY,
+            -100.0,
+            -20.0,
+            -3.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            3.0,
+            20.0,
+            100.0,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let mut right = [0.0; 13];
+        right[5] = -0.0;
+        let mut actual = [0.0; 13];
+
+        super::add_activate(&mut actual, &left, &right, left.len(), false);
+
+        for (index, ((&actual, &left), &right)) in actual.iter().zip(&left).zip(&right).enumerate()
+        {
+            let expected = (left + right).tanh();
+            if expected.is_nan() {
+                assert!(actual.is_nan(), "output {index} did not preserve NaN");
+            } else {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-6,
+                    "output {index}: expected {expected}, got {actual}"
+                );
+            }
+        }
+        assert!(actual[5].is_sign_negative());
+    }
+
     proptest! {
         #[test]
         fn backend_equivalence_fused_add_activation_matches_scalar_rust(
