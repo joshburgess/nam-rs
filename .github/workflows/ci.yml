@@ -292,6 +292,20 @@ jobs:
           target/iai
           .github/performance/inference_instructions.json
 
+      - name: Measure native AVX2/FMA A1 inference
+        if: matrix.name == 'default'
+        run: >-
+          cargo bench -p nam-core --bench inference_native_callgrind
+          --no-default-features
+          -- --save-summary=json --allow-aslr=yes
+
+      - name: Summarize native A1 profile
+        if: matrix.name == 'default'
+        run: |
+          find target/iai -path '*inference_native_callgrind*' -name 'callgrind.out.*' -print0 |
+            xargs -0 -n1 callgrind_annotate --inclusive=yes --threshold=0 --show=Ir |
+            grep -E 'PROGRAM TOTALS|WaveNetLayer|Conv1d|Conv1x1|MatrixLayout|pack_right|multiply_packed|tanhf|memmove'
+
       - name: Upload instruction profiles
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

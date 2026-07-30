@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "inference_callgrind"
 harness = false
+
+[[bench]]
+name = "inference_native_callgrind"
+harness = false
