@@ -203,6 +203,19 @@ ARM64 clears the repository's 10% full-callback retention gate at every
 maintained size. Native Linux x86-64 instruction counts are enforced by CI;
 Rosetta does not expose the AVX2/FMA features required by the x86-64 kernel.
 
+The native Linux x86-64 Callgrind run measured:
+
+| Frames | Previous backend | Packed kernel | Improvement |
+|-------:|-----------------:|--------------:|------------:|
+| 32 | 2,048,948 | 1,901,015 | 7.2% |
+| 64 | 4,110,634 | 3,784,699 | 7.9% |
+| 128 | 8,237,169 | 7,555,558 | 8.3% |
+| 256 | 16,477,384 | 15,121,543 | 8.2% |
+
+The x86-64 result does not independently clear 10%, but the implementation is
+retained because the ARM64 full-callback result clears the cross-platform
+retention rule.
+
 Keeping each output tile in registers changes the rounding boundary between
 convolution taps, while preserving tap order, depth order, and bias-last
 evaluation. The measured complete-render differences are 7.97e-07 on ARM64
