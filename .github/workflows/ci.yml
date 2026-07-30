@@ -302,7 +302,8 @@ jobs:
       - name: Summarize native A1 profile
         if: matrix.name == 'default'
         run: |
-          find target/iai -name 'callgrind.out.*' -print0 |
+          find target/iai -path '*inference_native_callgrind*' \
+            -type f -name 'callgrind.*.out' -print0 |
             while IFS= read -r -d '' profile; do
               echo "PROFILE: ${profile}"
               callgrind_annotate --inclusive=yes --threshold=0 --show=Ir "${profile}" |
