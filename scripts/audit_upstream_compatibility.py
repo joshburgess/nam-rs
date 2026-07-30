@@ -93,6 +93,25 @@ def load_manifest(path: Path) -> dict:
     return manifest
 
 
+def fixture_failure(fixture: dict, comparison: Comparison) -> str | None:
+    name = fixture["name"]
+    if fixture.get("require_bit_exact") and comparison.differing_samples:
+        return (
+            f"{name} is not bit-exact "
+            f"({comparison.differing_samples} samples differ)"
+        )
+    if "max_abs_error" in fixture:
+        tolerance = float(fixture["max_abs_error"])
+        if not math.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(f"{name} has invalid max_abs_error {tolerance}")
+        if comparison.max_abs_error > tolerance:
+            return (
+                f"{name} exceeds max_abs_error {tolerance:.9g} "
+                f"({comparison.max_abs_error:.9g})"
+            )
+    return None
+
+
 def audit(args: argparse.Namespace) -> int:
     manifest = load_manifest(args.manifest)
     expected_commit = manifest["neural_amp_modeler_core"]["commit"]
@@ -135,10 +154,9 @@ def audit(args: argparse.Namespace) -> int:
                 f"max {comparison.max_abs_error:.9g}, "
                 f"RMS {comparison.rms_error:.9g}"
             )
-            if fixture.get("require_bit_exact") and comparison.differing_samples:
-                failures.append(
-                    f"{name} is not bit-exact ({comparison.differing_samples} samples differ)"
-                )
+            failure = fixture_failure(fixture, comparison)
+            if failure is not None:
+                failures.append(failure)
 
     if failures:
         for failure in failures:

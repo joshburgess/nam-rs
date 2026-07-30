@@ -1,6 +1,6 @@
 # Feature Gap Analysis: nam-rs vs C++ NeuralAmpModelerCore
 
-Comparison date: 2026-07-29
+Comparison date: 2026-07-30
 
 ## Comparison Basis
 
@@ -8,6 +8,8 @@ This audit compares nam-rs against:
 
 - `neural-amp-modeler` A2 release
   [`v0.13.0`](https://github.com/sdatkinson/neural-amp-modeler/tree/f26112906de06ec6b796ad6d1982e29eed83144e)
+- `neural-amp-modeler` main at
+  [`7527d0224b6110a2336819ba37f3422f2c15db3c`](https://github.com/sdatkinson/neural-amp-modeler/tree/7527d0224b6110a2336819ba37f3422f2c15db3c)
 - `NeuralAmpModelerCore` main at
   [`3cde95c354d5ba6da01316cad90b05cfc4855053`](https://github.com/sdatkinson/NeuralAmpModelerCore/tree/3cde95c354d5ba6da01316cad90b05cfc4855053)
 
@@ -15,6 +17,17 @@ The post-A2 Core changes covered by this audit are the LSTM real-time fix
 (`c9ac48e`), A2 prewarming fix (`763a079`), slimmable breakpoint API
 (`1108b60`), WaveNet head dilation (`4c0ee78`), and FFT Linear processing
 (`b352966`).
+
+Training changes after v0.13.0 add packed breakpoint validation
+([`3cafd2a`](https://github.com/sdatkinson/neural-amp-modeler/commit/3cafd2a81f5299a9c3aba373a91e70074ce4d891),
+[`faccd89`](https://github.com/sdatkinson/neural-amp-modeler/commit/faccd895769d9ea608acdb92aaca58d44c9ec731)),
+mean packed validation metrics
+([`bb56b2e`](https://github.com/sdatkinson/neural-amp-modeler/commit/bb56b2e8c84d8dbf035922dedd7d14bef64228fd)),
+centralized packed Lightning module resolution
+([`4f42495`](https://github.com/sdatkinson/neural-amp-modeler/commit/4f4249572b69b06ad973ed038b9a59d1427e80bd)),
+and safer interrupted-training export
+([`7527d02`](https://github.com/sdatkinson/neural-amp-modeler/commit/7527d0224b6110a2336819ba37f3422f2c15db3c)).
+These commits do not add an inference architecture or exported model field.
 
 ## Feature Support Matrix
 
@@ -45,7 +58,7 @@ The post-A2 Core changes covered by this audit are the LSTM real-time fix
 | SlimmableWaveNet | Supported | `Dsp::set_slimming` selects channel width and `Dsp::slimming_breakpoints` exposes every valid transition |
 | SlimmableContainer | Supported | Loads embedded models, defaults to the highest-quality submodel, validates full breakpoint coverage, and exposes runtime transitions |
 | Packed A2 plugin control | Supported | Persisted model-size parameter applies supported breakpoints during loading, parameter changes, reset, and allocation-free audio processing |
-| Packed A2 trainer option | Supported | Requires `neural-amp-modeler >= 0.13.0`, reports actionable dependency errors, and supports the upstream full-config packed training path |
+| Packed A2 trainer option | Supported | Requires `neural-amp-modeler >= 0.13.0`, reports actionable dependency errors, supports the upstream full-config packed training path, and normalizes per-submodel metrics across release and main semantics |
 | FastTanh / fast sigmoid approximation | Supported | Global performance-mode toggle applies to WaveNet activations and LSTM gates/state tanh |
 
 ## Models That Load and Process Correctly
@@ -103,8 +116,10 @@ callback times:
 ## Repeatable Upstream Audit
 
 The fixture manifest at `scripts/upstream_compatibility.json` records the
-comparison date, training release, Core commit, and every bit-exact render
-fixture. With the pinned Core checkout built, reproduce the audit with:
+comparison date, training release and main commits, Core commit, and upstream
+render fixtures. Bit-exact fixtures reject any differing sample. Packed A2 and
+head-dilation fixtures enforce their recorded maximum absolute error. With the
+pinned Core checkout built, reproduce the audit with:
 
 ```sh
 python3 scripts/audit_upstream_compatibility.py \
@@ -116,6 +131,6 @@ commit. The script rejects any other Core revision before rendering.
 
 ## Remaining Gap
 
-No known post-A2 model-format or inference capability gap remains at the pinned
+No known post-A2 model-format or inference capability gap remains at the
 comparison commits. Performance work remains ongoing, especially small-matrix
 throughput on standard A1 models, but it does not block model compatibility.

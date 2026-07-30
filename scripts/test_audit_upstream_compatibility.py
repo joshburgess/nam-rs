@@ -50,6 +50,26 @@ class CompatibilityAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sample-count mismatch"):
             audit.compare_samples([0.0], [0.0, 1.0])
 
+    def test_enforces_maximum_absolute_error(self) -> None:
+        comparison = audit.compare_samples([0.0, 1.001], [0.0, 1.0])
+        fixture = {"name": "tolerant", "max_abs_error": 0.002}
+
+        self.assertIsNone(audit.fixture_failure(fixture, comparison))
+        fixture["max_abs_error"] = 0.0005
+        self.assertRegex(
+            audit.fixture_failure(fixture, comparison),
+            "exceeds max_abs_error",
+        )
+
+    def test_rejects_invalid_absolute_error_tolerance(self) -> None:
+        comparison = audit.compare_samples([0.0], [0.0])
+
+        with self.assertRaisesRegex(ValueError, "invalid max_abs_error"):
+            audit.fixture_failure(
+                {"name": "invalid", "max_abs_error": float("nan")},
+                comparison,
+            )
+
 
 def f32_from_bits(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<I", bits))[0]

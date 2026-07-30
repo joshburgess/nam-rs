@@ -835,6 +835,29 @@ fn python_worker_routes_default_core_train_request() {
         2,
         "events: {events:#?}"
     );
+    let epoch_events: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "epoch_end")
+        .collect();
+    assert_eq!(epoch_events.len(), 2, "events: {events:#?}");
+    assert!(epoch_events.iter().all(|event| {
+        event["val_loss"]
+            .as_f64()
+            .is_some_and(|value| (value - 0.3).abs() < f64::EPSILON)
+    }));
+    assert!(epoch_events.iter().all(|event| {
+        event["esr"]
+            .as_f64()
+            .is_some_and(|value| (value - 0.2).abs() < f64::EPSILON)
+    }));
+    assert!(events
+        .iter()
+        .filter(|event| event["type"] == "training_complete")
+        .all(|event| {
+            event["validation_esr"]
+                .as_f64()
+                .is_some_and(|value| (value - 0.2).abs() < f64::EPSILON)
+        }));
     assert_eq!(
         events.last().and_then(|event| event["type"].as_str()),
         Some("all_complete")
@@ -1026,6 +1049,8 @@ def train(
     threshold_esr=None,
     user_metadata=None,
 ):
+    import pytorch_lightning as pl
+
     kwargs = {
         "input_path": input_path,
         "output_path": output_path,
@@ -1054,6 +1079,19 @@ def train(
         json.dump(serializable, fp)
     with open(os.path.join(train_path, "nested", "model.nam"), "w") as fp:
         fp.write("{}")
+    trainer = pl.Trainer()
+    trainer.current_epoch = epochs - 1
+    trainer.callback_metrics = {
+        "loss": 0.4,
+        "val_loss": 0.6,
+        "ESR": 0.8,
+        "val_loss_packed_0": 0.2,
+        "val_loss_packed_1": 0.4,
+        "ESR_packed_0": 0.1,
+        "ESR_packed_1": 0.3,
+    }
+    for callback in trainer.callbacks:
+        callback.on_validation_epoch_end(trainer, None)
     return object()
 
 def _detect_input_version(input_path):

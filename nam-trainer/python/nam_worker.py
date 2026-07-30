@@ -14,6 +14,7 @@ inject a custom callback, since core.train() doesn't expose a callback parameter
 
 import json
 import importlib.metadata
+import math
 import os
 import re
 import sys
@@ -47,6 +48,49 @@ def supports_packed_a2_version(version):
         match
         and tuple(int(part) for part in match.groups()) >= MIN_PACKED_A2_VERSION
     )
+
+
+def finite_metric(value, default=0.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def named_metric(metrics, names, default=0.0):
+    for name in names:
+        if name in metrics:
+            return finite_metric(metrics[name], default)
+    return default
+
+
+def packed_metric_mean(metrics, prefix):
+    pattern = re.compile(rf"{re.escape(prefix)}\d+")
+    values = [
+        finite_metric(value, None)
+        for key, value in metrics.items()
+        if pattern.fullmatch(str(key))
+    ]
+    values = [value for value in values if value is not None]
+    return sum(values) / len(values) if values else None
+
+
+def progress_metrics(metrics, packed):
+    train_loss = named_metric(
+        metrics,
+        ("loss", "train_loss", "train_loss_epoch"),
+    )
+    val_loss = None
+    esr = None
+    if packed:
+        val_loss = packed_metric_mean(metrics, "val_loss_packed_")
+        esr = packed_metric_mean(metrics, "ESR_packed_")
+    if val_loss is None:
+        val_loss = named_metric(metrics, ("val_loss",))
+    if esr is None:
+        esr = named_metric(metrics, ("ESR", "val_esr", "val_loss"))
+    return train_loss, val_loss, esr
 
 
 def emit(event: dict):
@@ -178,6 +222,8 @@ def main():
             })
             sys.exit(1)
 
+    latest_validation_esr = 0.0
+
     # Custom callback for JSON progress reporting. We use
     # on_validation_epoch_end so both training and validation metrics
     # are available. on_train_epoch_end fires before validation runs,
@@ -189,6 +235,7 @@ def main():
             self._logged_keys = False
 
         def on_validation_epoch_end(self, trainer, pl_module):
+            nonlocal latest_validation_esr
             if CANCEL_REQUESTED.is_set():
                 raise KeyboardInterrupt("Training cancelled by user")
             metrics = trainer.callback_metrics
@@ -198,18 +245,11 @@ def main():
                 emit({"type": "log", "message": f"Available metrics: {sorted(metrics.keys())}"})
                 self._logged_keys = True
 
-            # NAM logs training loss as "loss", validation as "val_loss".
-            # ESR may appear as "ESR" or may just be val_loss (NAM uses
-            # ESR as the loss function). Try multiple key names.
-            train_loss = float(
-                metrics.get("loss", metrics.get("train_loss",
-                metrics.get("train_loss_epoch", 0.0)))
+            train_loss, val_loss, esr = progress_metrics(
+                metrics,
+                request.get("packed", False),
             )
-            val_loss = float(metrics.get("val_loss", 0.0))
-            esr = float(
-                metrics.get("ESR", metrics.get("val_esr",
-                metrics.get("val_loss", 0.0)))
-            )
+            latest_validation_esr = esr
 
             emit({
                 "type": "epoch_end",
@@ -379,6 +419,7 @@ def main():
         if CANCEL_REQUESTED.is_set():
             break
         CURRENT_FILE_INDEX = index
+        latest_validation_esr = 0.0
         basename = model_basename(index, output_path)
 
         emit({
@@ -448,7 +489,7 @@ def main():
             emit({
                 "type": "training_complete",
                 "file": output_path,
-                "validation_esr": 0.0,
+                "validation_esr": latest_validation_esr,
                 "model_path": model_path,
             })
 
