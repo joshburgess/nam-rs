@@ -231,6 +231,21 @@ complete A1 callbacks at every maintained buffer size:
 | 128 | 39.3% | 22.5% | 15.3% | 18.7% | 4.1% |
 | 256 | 39.6% | 22.7% | 14.2% | 18.9% | 4.4% |
 
+Native Linux x86-64 Callgrind profiles from the same post-kernel revision
+provided instruction-level attribution:
+
+| Frames | Activation | Packed multiply | Input packing | Mixin add | Residual add | Ring buffer | Head accumulation |
+|-------:|-----------:|----------------:|--------------:|----------:|-------------:|------------:|------------------:|
+| 32 | 43.66% | 10.00% | 6.08% | 6.07% | 5.16% | 1.26% | 3.65% |
+| 64 | 43.85% | 10.01% | 6.05% | 6.09% | 5.18% | 1.22% | 3.66% |
+| 128 | 43.92% | 10.01% | 6.03% | 6.10% | 5.19% | 1.20% | 3.66% |
+| 256 | 43.88% | 9.99% | 6.02% | 6.10% | 5.18% | 1.29% | 3.66% |
+
+Activation includes the activation loops and their `tanhf` and `expm1f`
+callees. Ring-buffer attribution includes the inlined write path and its
+libc copy instructions. The remaining instructions are primarily Conv1x1
+matrix work, packed-kernel dispatch, output handling, and loop overhead.
+
 Temporary symbol boundaries split the 256-frame Conv1d path into 10.9% packed
 multiplication, 7.2% input-panel packing, and 4.4% ring-buffer handling,
 dispatch, and call overhead. Source-line attribution split the layer vector

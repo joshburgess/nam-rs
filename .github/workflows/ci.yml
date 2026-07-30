@@ -306,9 +306,8 @@ jobs:
             -type f -name 'callgrind.*.out' -print0 |
             while IFS= read -r -d '' profile; do
               echo "PROFILE: ${profile}"
-              callgrind_annotate --inclusive=yes --threshold=0 --show=Ir "${profile}" |
-                grep -E 'PROGRAM TOTALS|WaveNetLayer|Conv1d|Conv1x1|MatrixLayout|pack_right|multiply_packed|tanhf|memmove' ||
-                true
+              callgrind_annotate --threshold=0.5 --show=Ir "${profile}" |
+                sed -n '1,120p'
             done
 
       - name: Upload instruction profiles
