@@ -213,11 +213,13 @@ struct Conv1x1 {
     /// Weights stored column-major: [out_channels * in_channels]
     /// weight[j * out_ch + i] = W(i, j)
     weight_colmajor: Vec<f32>,
+    #[cfg(feature = "fast-kernels")]
+    compact_grouped_weights: Option<Vec<f32>>,
     bias: Option<Vec<f32>>,
     out_channels: usize,
     in_channels: usize,
     matrix_layout: MatrixLayout,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "fast-kernels"), allow(dead_code))]
     groups: usize,
     // Pre-allocated output buffer for block processing
     output_buf: ColMajorMatrix,
@@ -244,12 +246,19 @@ impl Conv1x1 {
         // Build weight in column-major order matching Eigen layout
         // Eigen column-major: W(i,j) at index j * out_channels + i
         let mut weight_colmajor = vec![0.0f32; matrix_layout.left_len()];
+        #[cfg(feature = "fast-kernels")]
+        let mut compact_grouped_weights =
+            (groups > 1).then(|| Vec::with_capacity(matrix_layout.left_len() / groups));
 
         // C++ weight order: for group, for out_per_group, for in_per_group
         for g in 0..groups {
             for i in 0..out_per_group {
                 for j in 0..in_per_group {
                     let val = iter.take(1)?[0];
+                    #[cfg(feature = "fast-kernels")]
+                    if let Some(compact) = &mut compact_grouped_weights {
+                        compact.push(val);
+                    }
                     let row = g * out_per_group + i;
                     let col = g * in_per_group + j;
                     // column-major: index = col * out_channels + row
@@ -266,6 +275,8 @@ impl Conv1x1 {
 
         Ok(Self {
             weight_colmajor,
+            #[cfg(feature = "fast-kernels")]
+            compact_grouped_weights,
             bias,
             out_channels,
             in_channels,
@@ -286,6 +297,23 @@ impl Conv1x1 {
     fn process_block(&mut self, input: &ColMajorMatrix, num_frames: usize) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
+
+        #[cfg(feature = "fast-kernels")]
+        if let Some(weights) = self.compact_grouped_weights.as_deref() {
+            if crate::fast_kernels::conv1x1_grouped(
+                &mut self.output_buf.data,
+                weights,
+                &input.data,
+                self.bias.as_deref(),
+                out_ch,
+                in_ch,
+                self.groups,
+                input.rows,
+                num_frames,
+            ) {
+                return;
+            }
+        }
 
         if out_ch * in_ch >= SGEMM_MIN_SIZE {
             // Large matrix: SIMD-optimized sgemm
@@ -323,6 +351,23 @@ impl Conv1x1 {
     ) {
         let out_ch = self.out_channels;
         let in_ch = self.in_channels;
+
+        #[cfg(feature = "fast-kernels")]
+        if let Some(weights) = self.compact_grouped_weights.as_deref() {
+            if crate::fast_kernels::conv1x1_grouped(
+                &mut self.output_buf.data,
+                weights,
+                input_data,
+                self.bias.as_deref(),
+                out_ch,
+                in_ch,
+                self.groups,
+                input_stride,
+                num_frames,
+            ) {
+                return;
+            }
+        }
 
         if out_ch * in_ch >= SGEMM_MIN_SIZE {
             if let Some(ref b) = self.bias {
@@ -394,6 +439,61 @@ impl Conv1x1 {
                     product + bias.as_ref().map_or(0.0, |values| values[output_channel]);
             }
         }
+    }
+}
+
+#[cfg(feature = "benchmark-internals")]
+pub struct GroupedConv1x1Benchmark {
+    conv: Conv1x1,
+    input: ColMajorMatrix,
+    num_frames: usize,
+}
+
+#[cfg(feature = "benchmark-internals")]
+impl GroupedConv1x1Benchmark {
+    pub fn new(
+        out_channels: usize,
+        in_channels: usize,
+        groups: usize,
+        num_frames: usize,
+    ) -> Result<Self, NamError> {
+        if groups == 0
+            || !out_channels.is_multiple_of(groups)
+            || !in_channels.is_multiple_of(groups)
+        {
+            return Err(NamError::InvalidConfigField {
+                field: "benchmark.groups".into(),
+                reason: "must be positive and divide both input and output channels",
+            });
+        }
+        let compact_weight_len = checked_dimension_mul(
+            "benchmark grouped Conv1x1 weights",
+            out_channels,
+            in_channels,
+        )? / groups;
+        let mut weight_data = (0..compact_weight_len)
+            .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25)
+            .collect::<Vec<_>>();
+        weight_data.extend((0..out_channels).map(|index| index as f32 * 0.01 - 0.03));
+        let mut iter = WeightIter::new(&weight_data);
+        let mut conv = Conv1x1::from_weights(in_channels, out_channels, true, groups, &mut iter)?;
+        conv.set_max_buffer_size(num_frames);
+        let input = ColMajorMatrix {
+            data: (0..in_channels * num_frames)
+                .map(|index| ((index + 1) as f32 * 0.017).sin())
+                .collect(),
+            rows: in_channels,
+            max_cols: num_frames,
+        };
+        Ok(Self {
+            conv,
+            input,
+            num_frames,
+        })
+    }
+
+    pub fn process(&mut self) {
+        self.conv.process_block(&self.input, self.num_frames);
     }
 }
 
@@ -934,7 +1034,35 @@ impl FiLM {
             }
         }
         #[cfg(feature = "fast-kernels")]
-        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.do_shift
+            && self.cond_to_scale_shift.groups == 4
+        {
+            if let (Some(bias), Some(weights)) = (
+                self.cond_to_scale_shift.bias.as_deref(),
+                self.cond_to_scale_shift.compact_grouped_weights.as_deref(),
+            ) {
+                if crate::fast_kernels::film_grouped_16x8_g4_scale_shift(
+                    &mut self.output_buf.data,
+                    &input.data,
+                    &condition.data,
+                    weights,
+                    bias,
+                    input.rows,
+                    self.input_dim,
+                    condition.rows,
+                    num_frames,
+                ) {
+                    return;
+                }
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.cond_to_scale_shift.groups == 1
+        {
             if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
                 if self.do_shift {
                     crate::fast_kernels::film_8x8_scale_shift(
@@ -1011,7 +1139,35 @@ impl FiLM {
             }
         }
         #[cfg(feature = "fast-kernels")]
-        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.do_shift
+            && self.cond_to_scale_shift.groups == 4
+        {
+            if let (Some(bias), Some(weights)) = (
+                self.cond_to_scale_shift.bias.as_deref(),
+                self.cond_to_scale_shift.compact_grouped_weights.as_deref(),
+            ) {
+                if crate::fast_kernels::film_grouped_16x8_g4_scale_shift(
+                    &mut self.output_buf.data,
+                    input_data,
+                    &condition.data,
+                    weights,
+                    bias,
+                    input_stride,
+                    self.input_dim,
+                    condition.rows,
+                    num_frames,
+                ) {
+                    return;
+                }
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.cond_to_scale_shift.groups == 1
+        {
             if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
                 if self.do_shift {
                     crate::fast_kernels::film_8x8_scale_shift(
@@ -1172,7 +1328,33 @@ impl FiLM {
             }
         }
         #[cfg(feature = "fast-kernels")]
-        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.do_shift
+            && self.cond_to_scale_shift.groups == 4
+        {
+            if let (Some(bias), Some(weights)) = (
+                self.cond_to_scale_shift.bias.as_deref(),
+                self.cond_to_scale_shift.compact_grouped_weights.as_deref(),
+            ) {
+                if crate::fast_kernels::film_grouped_16x8_g4_inplace_scale_shift(
+                    target_data,
+                    &condition.data,
+                    weights,
+                    bias,
+                    target_stride,
+                    condition.rows,
+                    num_frames,
+                ) {
+                    return;
+                }
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8
+            && self.input_dim == 8
+            && self.cond_to_scale_shift.groups == 1
+        {
             if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
                 if self.do_shift {
                     crate::fast_kernels::film_8x8_inplace_scale_shift(

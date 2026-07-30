@@ -405,6 +405,47 @@ The conservative confidence bound exceeds 10% at every size. Direct tests
 cover compact loader order, scalar equivalence, and invalid buffer extents.
 Complete render, streaming, reset, and plugin allocation tests also pass.
 
+The following CI profile attributed 22.8% to 24.6% of the callback to
+Conv1x1. Its generic inner loop accounted for 15.9% to 17.4%. Grouped
+Conv1x1 weights were still expanded into dense block-diagonal matrices,
+including the grouped FiLM projections.
+
+The loader now retains the upstream group-major weights. Grouped products
+route through fixed 1-, 2-, and 4-input-per-group kernels before the dense
+or matrix backends. Direct four-output kernels preserve vectorization for
+the 4x4/g2 and 4x8/g4 layouts. The 16x8/g4 scale-and-shift projection uses
+a compact fused FiLM kernel.
+
+Criterion benchmarks exercise every grouped Conv1x1 layout in the maintained
+A2 fixture through the production loader and dispatch:
+
+| Output x input | Groups | Improvement across 16–256 frames |
+|---------------:|-------:|---------------------------------:|
+| 3x6 | 3 | 61.6% to 63.4% |
+| 6x6 | 3 | 68.9% to 71.6% |
+| 4x2 | 2 | 27.7% to 33.6% |
+| 4x4 | 2 | 61.8% to 64.7% |
+| 4x8 | 4 | 21.5% to 27.3% |
+| 8x8 | 2 | 31.2% to 32.8% |
+| 8x8 | 4 | 37.2% to 41.1% |
+| 8x8 | 8 | 29.1% to 32.0% |
+| 16x8 | 4 | 7.6% to 12.7% |
+
+Matched Apple M4 runs measured the complete A2 callback:
+
+| Frames | Dense grouped path | Compact grouped path | Improvement |
+|-------:|-------------------:|---------------------:|------------:|
+| 16 | 6.296 us | 5.417 us | 14.0% |
+| 32 | 12.225 us | 10.392 us | 15.0% |
+| 64 | 23.738 us | 20.068 us | 15.5% |
+| 128 | 46.908 us | 39.569 us | 15.6% |
+| 256 | 93.727 us | 80.142 us | 14.5% |
+
+The conservative confidence bound exceeds 13.7% at every size. Scalar
+oracles cover every grouped shape, optional bias, strided input, and the
+out-of-place and in-place fused FiLM paths. Complete render, streaming,
+reset, and plugin allocation tests pass.
+
 ### Accurate Linux activation backend
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point

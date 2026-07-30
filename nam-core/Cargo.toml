@@ -53,3 +53,8 @@ harness = false
 name = "conv1d_shapes"
 harness = false
 required-features = ["fast-kernels", "benchmark-internals"]
+
+[[bench]]
+name = "conv1x1_grouped_shapes"
+harness = false
+required-features = ["fast-kernels", "benchmark-internals"]

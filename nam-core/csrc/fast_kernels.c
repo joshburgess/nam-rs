@@ -456,6 +456,151 @@ void fast_conv1x1_small(
     }
 }
 
+void fast_conv1x1_grouped(
+    float *restrict output,
+    const float *restrict weights,
+    const float *restrict input,
+    const float *restrict bias,
+    size_t out_ch,
+    size_t in_ch,
+    size_t groups,
+    size_t input_stride,
+    size_t num_frames
+) {
+    size_t out_per_group = out_ch / groups;
+    size_t in_per_group = in_ch / groups;
+    size_t weights_per_group = out_per_group * in_per_group;
+
+    if (out_ch == 4 && in_ch == 4 && groups == 2) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * 4;
+            float input0 = input[in_off];
+            float input1 = input[in_off + 1];
+            float input2 = input[in_off + 2];
+            float input3 = input[in_off + 3];
+            output[out_off] = weights[0] * input0 + weights[1] * input1
+                            + (bias ? bias[0] : 0.0f);
+            output[out_off + 1] = weights[2] * input0 + weights[3] * input1
+                                + (bias ? bias[1] : 0.0f);
+            output[out_off + 2] = weights[4] * input2 + weights[5] * input3
+                                + (bias ? bias[2] : 0.0f);
+            output[out_off + 3] = weights[6] * input2 + weights[7] * input3
+                                + (bias ? bias[3] : 0.0f);
+        }
+        return;
+    }
+
+    if (out_ch == 4 && in_ch == 8 && groups == 4) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * 4;
+            output[out_off] = weights[0] * input[in_off]
+                            + weights[1] * input[in_off + 1]
+                            + (bias ? bias[0] : 0.0f);
+            output[out_off + 1] = weights[2] * input[in_off + 2]
+                                + weights[3] * input[in_off + 3]
+                                + (bias ? bias[1] : 0.0f);
+            output[out_off + 2] = weights[4] * input[in_off + 4]
+                                + weights[5] * input[in_off + 5]
+                                + (bias ? bias[2] : 0.0f);
+            output[out_off + 3] = weights[6] * input[in_off + 6]
+                                + weights[7] * input[in_off + 7]
+                                + (bias ? bias[3] : 0.0f);
+        }
+        return;
+    }
+
+    if (in_per_group == 1) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * out_ch;
+            for (size_t g = 0; g < groups; g++) {
+                const float *group_weights = weights + g * out_per_group;
+                float value = input[in_off + g];
+                size_t group_output = out_off + g * out_per_group;
+                for (size_t o = 0; o < out_per_group; o++) {
+                    size_t output_channel = g * out_per_group + o;
+                    output[group_output + o] =
+                        group_weights[o] * value
+                        + (bias ? bias[output_channel] : 0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    if (in_per_group == 2) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * out_ch;
+            for (size_t g = 0; g < groups; g++) {
+                const float *group_weights = weights + g * out_per_group * 2;
+                const float *group_input = input + in_off + g * 2;
+                size_t group_output = out_off + g * out_per_group;
+                float input0 = group_input[0];
+                float input1 = group_input[1];
+                for (size_t o = 0; o < out_per_group; o++) {
+                    const float *row_weights = group_weights + o * 2;
+                    float sum = row_weights[0] * input0;
+                    sum += row_weights[1] * input1;
+                    size_t output_channel = g * out_per_group + o;
+                    output[group_output + o] =
+                        sum + (bias ? bias[output_channel] : 0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    if (in_per_group == 4) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * out_ch;
+            for (size_t g = 0; g < groups; g++) {
+                const float *group_weights = weights + g * out_per_group * 4;
+                const float *group_input = input + in_off + g * 4;
+                size_t group_output = out_off + g * out_per_group;
+                float input0 = group_input[0];
+                float input1 = group_input[1];
+                float input2 = group_input[2];
+                float input3 = group_input[3];
+                for (size_t o = 0; o < out_per_group; o++) {
+                    const float *row_weights = group_weights + o * 4;
+                    float sum = row_weights[0] * input0;
+                    sum += row_weights[1] * input1;
+                    sum += row_weights[2] * input2;
+                    sum += row_weights[3] * input3;
+                    size_t output_channel = g * out_per_group + o;
+                    output[group_output + o] =
+                        sum + (bias ? bias[output_channel] : 0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * out_ch;
+        for (size_t g = 0; g < groups; g++) {
+            const float *group_weights = weights + g * weights_per_group;
+            const float *group_input = input + in_off + g * in_per_group;
+            size_t group_output = out_off + g * out_per_group;
+            for (size_t o = 0; o < out_per_group; o++) {
+                const float *row_weights = group_weights + o * in_per_group;
+                float sum = row_weights[0] * group_input[0];
+                for (size_t i = 1; i < in_per_group; i++) {
+                    sum += row_weights[i] * group_input[i];
+                }
+                size_t output_channel = g * out_per_group + o;
+                output[group_output + o] =
+                    sum + (bias ? bias[output_channel] : 0.0f);
+            }
+        }
+    }
+}
+
 void fast_film_rank1_scale_shift(
     float *restrict output,
     const float *restrict input,
@@ -649,6 +794,71 @@ void fast_film_8x8_inplace_scale(
         for (size_t i = 0; i < dim; i++) {
             float scale = nam_dot8(weights, condition_frame, dim, i) + bias[i];
             data[data_off + i] *= scale;
+        }
+    }
+}
+
+void fast_film_grouped_16x8_g4_scale_shift(
+    float *restrict output,
+    const float *restrict input,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t input_stride,
+    size_t output_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * output_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < 8; i++) {
+            size_t lane = i & 3;
+            size_t scale_group = i >> 2;
+            size_t shift_group = scale_group + 2;
+            const float *scale_weights = weights + scale_group * 8 + lane * 2;
+            const float *shift_weights = weights + shift_group * 8 + lane * 2;
+            const float *scale_condition = condition_frame + scale_group * 2;
+            const float *shift_condition = condition_frame + shift_group * 2;
+            float scale = scale_weights[0] * scale_condition[0];
+            scale += scale_weights[1] * scale_condition[1];
+            scale += bias[i];
+            float shift = shift_weights[0] * shift_condition[0];
+            shift += shift_weights[1] * shift_condition[1];
+            shift += bias[8 + i];
+            output[out_off + i] = input[in_off + i] * scale + shift;
+        }
+    }
+}
+
+void fast_film_grouped_16x8_g4_inplace_scale_shift(
+    float *restrict data,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t data_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t data_off = f * data_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < 8; i++) {
+            size_t lane = i & 3;
+            size_t scale_group = i >> 2;
+            size_t shift_group = scale_group + 2;
+            const float *scale_weights = weights + scale_group * 8 + lane * 2;
+            const float *shift_weights = weights + shift_group * 8 + lane * 2;
+            const float *scale_condition = condition_frame + scale_group * 2;
+            const float *shift_condition = condition_frame + shift_group * 2;
+            float scale = scale_weights[0] * scale_condition[0];
+            scale += scale_weights[1] * scale_condition[1];
+            scale += bias[i];
+            float shift = shift_weights[0] * shift_condition[0];
+            shift += shift_weights[1] * shift_condition[1];
+            shift += bias[8 + i];
+            data[data_off + i] = data[data_off + i] * scale + shift;
         }
     }
 }

@@ -59,6 +59,18 @@ mod ffi {
             input_stride: usize,
             num_frames: usize,
         );
+        #[link_name = "fast_conv1x1_grouped"]
+        pub(super) fn conv1x1_grouped(
+            output: *mut f32,
+            weights: *const f32,
+            input: *const f32,
+            bias: *const f32,
+            out_ch: usize,
+            in_ch: usize,
+            groups: usize,
+            input_stride: usize,
+            num_frames: usize,
+        );
         #[link_name = "fast_film_rank1_scale_shift"]
         pub(super) fn film_rank1_scale_shift(
             output: *mut f32,
@@ -143,6 +155,28 @@ mod ffi {
         );
         #[link_name = "fast_film_8x8_inplace_scale"]
         pub(super) fn film_8x8_inplace_scale(
+            data: *mut f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            data_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_grouped_16x8_g4_scale_shift"]
+        pub(super) fn film_grouped_16x8_g4_scale_shift(
+            output: *mut f32,
+            input: *const f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            input_stride: usize,
+            output_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_grouped_16x8_g4_inplace_scale_shift"]
+        pub(super) fn film_grouped_16x8_g4_inplace_scale_shift(
             data: *mut f32,
             condition: *const f32,
             weights: *const f32,
@@ -298,6 +332,58 @@ pub(crate) fn conv1x1_small(
             num_frames,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn conv1x1_grouped(
+    output: &mut [f32],
+    weights: &[f32],
+    input: &[f32],
+    bias: Option<&[f32]>,
+    out_channels: usize,
+    in_channels: usize,
+    groups: usize,
+    input_stride: usize,
+    num_frames: usize,
+) -> bool {
+    if groups <= 1
+        || out_channels == 0
+        || in_channels == 0
+        || !out_channels.is_multiple_of(groups)
+        || !in_channels.is_multiple_of(groups)
+    {
+        return false;
+    }
+    let Some(weight_len) = out_channels
+        .checked_mul(in_channels)
+        .map(|dense_len| dense_len / groups)
+    else {
+        return false;
+    };
+    if !has_len(output, product(out_channels, num_frames))
+        || !has_len(weights, weight_len)
+        || !has_len(input, strided_len(input_stride, in_channels, num_frames))
+        || bias.is_some_and(|bias| !has_len(bias, out_channels))
+    {
+        return false;
+    }
+    let bias = bias.map_or(core::ptr::null(), <[f32]>::as_ptr);
+    // SAFETY: The validated compact weights and strided matrix extents cover
+    // every C access. Mutable output cannot alias any shared input.
+    unsafe {
+        ffi::conv1x1_grouped(
+            output.as_mut_ptr(),
+            weights.as_ptr(),
+            input.as_ptr(),
+            bias,
+            out_channels,
+            in_channels,
+            groups,
+            input_stride,
+            num_frames,
+        );
+    }
+    true
 }
 
 pub(crate) fn conv1d_depthwise(
@@ -774,6 +860,83 @@ pub(crate) fn film_8x8_inplace_scale(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn film_grouped_16x8_g4_scale_shift(
+    output: &mut [f32],
+    input: &[f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    input_stride: usize,
+    output_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) -> bool {
+    const DIM: usize = 8;
+    const PARAMETERS: usize = DIM * 2;
+    const COMPACT_WEIGHTS: usize = 32;
+    if !has_len(input, strided_len(input_stride, DIM, num_frames))
+        || !has_len(output, strided_len(output_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, COMPACT_WEIGHTS)
+        || !has_len(bias, PARAMETERS)
+    {
+        return false;
+    }
+    // SAFETY: Every fixed-width and strided extent used by the fused grouped
+    // kernel is validated, and output has an exclusive borrow.
+    unsafe {
+        ffi::film_grouped_16x8_g4_scale_shift(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_grouped_16x8_g4_inplace_scale_shift(
+    data: &mut [f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    data_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) -> bool {
+    const DIM: usize = 8;
+    const PARAMETERS: usize = DIM * 2;
+    const COMPACT_WEIGHTS: usize = 32;
+    if !has_len(data, strided_len(data_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, COMPACT_WEIGHTS)
+        || !has_len(bias, PARAMETERS)
+    {
+        return false;
+    }
+    // SAFETY: The fixed-width data and condition ranges plus both parameter
+    // slices cover all C accesses. Data is exclusively borrowed.
+    unsafe {
+        ffi::film_grouped_16x8_g4_inplace_scale_shift(
+            data.as_mut_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            data_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn film_scale_shift(
     output: &mut [f32],
     input: &[f32],
@@ -999,6 +1162,231 @@ mod tests {
     #[test]
     fn safe_facade_rejects_short_output_buffer() {
         super::conv1x1_small(&mut [], &[1.0], &[1.0], None, 1, 1, 1, 1);
+    }
+
+    #[test]
+    fn safe_facade_rejects_invalid_grouped_conv1x1_layouts() {
+        let mut output = [7.0; 8];
+        assert!(!super::conv1x1_grouped(
+            &mut output,
+            &[1.0; 4],
+            &[1.0; 8],
+            None,
+            4,
+            2,
+            1,
+            2,
+            2,
+        ));
+        assert!(!super::conv1x1_grouped(
+            &mut output,
+            &[1.0; 4],
+            &[1.0; 8],
+            None,
+            4,
+            3,
+            2,
+            3,
+            2,
+        ));
+        assert!(!super::conv1x1_grouped(
+            &mut output,
+            &[1.0; 3],
+            &[1.0; 4],
+            None,
+            4,
+            2,
+            2,
+            2,
+            2,
+        ));
+        assert!(!super::conv1x1_grouped(
+            &mut [],
+            &[],
+            &[],
+            None,
+            0,
+            2,
+            2,
+            2,
+            0,
+        ));
+        assert_eq!(output, [7.0; 8]);
+    }
+
+    #[test]
+    fn grouped_conv1x1_shapes_match_scalar_reference() {
+        for (out_channels, in_channels, groups) in [
+            (3, 6, 3),
+            (6, 6, 3),
+            (4, 2, 2),
+            (4, 4, 2),
+            (4, 8, 4),
+            (8, 8, 2),
+            (8, 8, 4),
+            (8, 8, 8),
+            (16, 8, 4),
+        ] {
+            let num_frames = 19;
+            let input_stride = in_channels + 3;
+            let input = (0..input_stride * num_frames)
+                .map(|index| ((index + 1) as f32 * 0.017).sin())
+                .collect::<Vec<_>>();
+            let weights = (0..out_channels * in_channels / groups)
+                .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25)
+                .collect::<Vec<_>>();
+            let bias = (0..out_channels)
+                .map(|index| index as f32 * 0.01 - 0.03)
+                .collect::<Vec<_>>();
+            let out_per_group = out_channels / groups;
+            let in_per_group = in_channels / groups;
+
+            for use_bias in [false, true] {
+                let mut expected = vec![0.0f32; out_channels * num_frames];
+                for frame in 0..num_frames {
+                    for group in 0..groups {
+                        for output in 0..out_per_group {
+                            let output_channel = group * out_per_group + output;
+                            let weight_offset = (group * out_per_group + output) * in_per_group;
+                            let input_offset = frame * input_stride + group * in_per_group;
+                            let mut sum = weights[weight_offset] * input[input_offset];
+                            for input_channel in 1..in_per_group {
+                                sum += weights[weight_offset + input_channel]
+                                    * input[input_offset + input_channel];
+                            }
+                            if use_bias {
+                                sum += bias[output_channel];
+                            }
+                            expected[frame * out_channels + output_channel] = sum;
+                        }
+                    }
+                }
+
+                let mut actual = vec![0.0f32; expected.len()];
+                assert!(super::conv1x1_grouped(
+                    &mut actual,
+                    &weights,
+                    &input,
+                    use_bias.then_some(&bias),
+                    out_channels,
+                    in_channels,
+                    groups,
+                    input_stride,
+                    num_frames,
+                ));
+                for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= 2.0e-6,
+                        "{out_channels}x{in_channels}/g{groups} output {index}: expected \
+                         {expected}, got {actual}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_16x8_g4_film_matches_scalar_reference() {
+        let num_frames = 13;
+        let input_stride = 11;
+        let output_stride = 10;
+        let condition_stride = 12;
+        let input = (0..input_stride * num_frames)
+            .map(|index| ((index + 1) as f32 * 0.017).sin())
+            .collect::<Vec<_>>();
+        let condition = (0..condition_stride * num_frames)
+            .map(|index| ((index + 1) as f32 * 0.023).cos())
+            .collect::<Vec<_>>();
+        let weights = (0..32)
+            .map(|index| ((index + 1) as f32 * 0.031).sin() * 0.25)
+            .collect::<Vec<_>>();
+        let bias = (0..16)
+            .map(|index| index as f32 * 0.01 - 0.03)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; output_stride * num_frames];
+        for frame in 0..num_frames {
+            for channel in 0..8 {
+                let lane = channel % 4;
+                let scale_group = channel / 4;
+                let shift_group = scale_group + 2;
+                let scale_weight = scale_group * 8 + lane * 2;
+                let shift_weight = shift_group * 8 + lane * 2;
+                let condition_offset = frame * condition_stride;
+                let mut scale =
+                    weights[scale_weight] * condition[condition_offset + scale_group * 2];
+                scale +=
+                    weights[scale_weight + 1] * condition[condition_offset + scale_group * 2 + 1];
+                scale += bias[channel];
+                let mut shift =
+                    weights[shift_weight] * condition[condition_offset + shift_group * 2];
+                shift +=
+                    weights[shift_weight + 1] * condition[condition_offset + shift_group * 2 + 1];
+                shift += bias[8 + channel];
+                expected[frame * output_stride + channel] =
+                    input[frame * input_stride + channel] * scale + shift;
+            }
+        }
+
+        let mut output = vec![0.0f32; expected.len()];
+        assert!(super::film_grouped_16x8_g4_scale_shift(
+            &mut output,
+            &input,
+            &condition,
+            &weights,
+            &bias,
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        ));
+        for frame in 0..num_frames {
+            for channel in 0..8 {
+                let index = frame * output_stride + channel;
+                assert!((output[index] - expected[index]).abs() <= 2.0e-6);
+            }
+        }
+
+        let mut inplace = (0..output_stride * num_frames)
+            .map(|index| ((index + 1) as f32 * 0.017).sin())
+            .collect::<Vec<_>>();
+        let mut expected_inplace = inplace.clone();
+        for frame in 0..num_frames {
+            for channel in 0..8 {
+                let lane = channel % 4;
+                let scale_group = channel / 4;
+                let shift_group = scale_group + 2;
+                let scale_weight = scale_group * 8 + lane * 2;
+                let shift_weight = shift_group * 8 + lane * 2;
+                let condition_offset = frame * condition_stride;
+                let mut scale =
+                    weights[scale_weight] * condition[condition_offset + scale_group * 2];
+                scale +=
+                    weights[scale_weight + 1] * condition[condition_offset + scale_group * 2 + 1];
+                scale += bias[channel];
+                let mut shift =
+                    weights[shift_weight] * condition[condition_offset + shift_group * 2];
+                shift +=
+                    weights[shift_weight + 1] * condition[condition_offset + shift_group * 2 + 1];
+                shift += bias[8 + channel];
+                let index = frame * output_stride + channel;
+                expected_inplace[index] = inplace[index] * scale + shift;
+            }
+        }
+        assert!(super::film_grouped_16x8_g4_inplace_scale_shift(
+            &mut inplace,
+            &condition,
+            &weights,
+            &bias,
+            output_stride,
+            condition_stride,
+            num_frames,
+        ));
+        for frame in 0..num_frames {
+            for channel in 0..8 {
+                let index = frame * output_stride + channel;
+                assert!((inplace[index] - expected_inplace[index]).abs() <= 2.0e-6);
+            }
+        }
     }
 
     #[test]

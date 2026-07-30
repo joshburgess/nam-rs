@@ -1024,6 +1024,27 @@ fn test_kernel_size_int_receptive_field() {
 
 // ── Depthwise convolution tests ─────────────────────────────────────────
 
+#[cfg(feature = "fast-kernels")]
+#[test]
+fn test_grouped_conv1x1_preserves_compact_upstream_weight_order() {
+    let mut weights_data = (1..=8).map(|value| value as f32).collect::<Vec<_>>();
+    weights_data.extend([0.0; 4]);
+    let mut iter = crate::util::WeightIter::new(&weights_data);
+    let conv = Conv1x1::from_weights(8, 4, true, 4, &mut iter).unwrap();
+
+    assert_eq!(
+        conv.compact_grouped_weights.as_deref(),
+        Some(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..])
+    );
+    assert_eq!(
+        conv.weight_colmajor,
+        [
+            1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0,
+            0.0, 5.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 8.0,
+        ]
+    );
+}
+
 #[test]
 fn test_conv1d_depthwise_detected() {
     // groups == in_channels == out_channels triggers depthwise path

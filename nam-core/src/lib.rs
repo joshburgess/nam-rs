@@ -17,6 +17,8 @@ pub use get_dsp::get_dsp;
 
 #[cfg(all(feature = "benchmark-internals", feature = "fast-kernels"))]
 pub mod benchmark {
+    pub use crate::wavenet::GroupedConv1x1Benchmark;
+
     #[allow(clippy::too_many_arguments)]
     pub fn conv1d_small_gemv(
         output: &mut [f32],
