@@ -302,9 +302,13 @@ jobs:
       - name: Summarize native A1 profile
         if: matrix.name == 'default'
         run: |
-          find target/iai -path '*a1_native*' -name 'callgrind.out.*' -print0 |
-            xargs -0 -r -n1 callgrind_annotate --inclusive=yes --threshold=0 --show=Ir |
-            grep -E 'PROGRAM TOTALS|WaveNetLayer|Conv1d|Conv1x1|MatrixLayout|pack_right|multiply_packed|tanhf|memmove'
+          find target/iai -name 'callgrind.out.*' -print0 |
+            while IFS= read -r -d '' profile; do
+              echo "PROFILE: ${profile}"
+              callgrind_annotate --inclusive=yes --threshold=0 --show=Ir "${profile}" |
+                grep -E 'PROGRAM TOTALS|WaveNetLayer|Conv1d|Conv1x1|MatrixLayout|pack_right|multiply_packed|tanhf|memmove' ||
+                true
+            done
 
       - name: Upload instruction profiles
         if: always()

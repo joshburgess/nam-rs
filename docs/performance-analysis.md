@@ -207,14 +207,51 @@ The native Linux x86-64 Callgrind run measured:
 
 | Frames | Previous backend | Packed kernel | Improvement |
 |-------:|-----------------:|--------------:|------------:|
-| 32 | 2,048,948 | 1,901,015 | 7.2% |
-| 64 | 4,110,634 | 3,784,699 | 7.9% |
-| 128 | 8,237,169 | 7,555,558 | 8.3% |
-| 256 | 16,477,384 | 15,121,543 | 8.2% |
+| 32 | 2,048,948 | 1,900,766 | 7.2% |
+| 64 | 4,110,634 | 3,784,468 | 7.9% |
+| 128 | 8,237,169 | 7,555,533 | 8.3% |
+| 256 | 16,477,384 | 15,121,451 | 8.2% |
 
 The x86-64 result does not independently clear 10%, but the implementation is
 retained because the ARM64 full-callback result clears the cross-platform
-retention rule.
+retention rule. A dedicated native harness asserts AVX2 and FMA before loading
+the model. Its measurements agree within 0.02% with the portable CI harness.
+The portable harness's glibc capability mask stabilizes library dispatch, but
+does not suppress Rust's CPUID-based packed-kernel detection.
+
+### Post-kernel A1 callback profile and fusion gate
+
+After the packed kernel landed, fresh symbolized Apple M4 profiles measured
+complete A1 callbacks at every maintained buffer size:
+
+| Frames | Activation | Conv1d | Conv1x1 | Layer vector operations | Head accumulation |
+|-------:|-----------:|-------:|--------:|------------------------:|------------------:|
+| 32 | 39.5% | 22.5% | 15.1% | 18.4% | 4.4% |
+| 64 | 39.6% | 23.2% | 14.7% | 18.2% | 4.2% |
+| 128 | 39.3% | 22.5% | 15.3% | 18.7% | 4.1% |
+| 256 | 39.6% | 22.7% | 14.2% | 18.9% | 4.4% |
+
+Temporary symbol boundaries split the 256-frame Conv1d path into 10.9% packed
+multiplication, 7.2% input-panel packing, and 4.4% ring-buffer handling,
+dispatch, and call overhead. Source-line attribution split the layer vector
+operations into 10.4% for the convolution-plus-mixin pass and about 8.4% for
+the residual pass. The proportions remained stable across callback sizes.
+
+Three exact, allocation-free fusion designs were evaluated:
+
+| Prototype | Complete callback result |
+|-----------|--------------------------|
+| Convolution-plus-mixin, accurate tanh, and head accumulation in one loop | Neutral at 32 and 64 frames, slower at 128 frames, and 8.1% slower at 256 frames |
+| Convolution-plus-mixin and accurate tanh in one loop | 22% slower at 32 frames, increasing to 66% slower at 256 frames |
+| Residual addition in the 1x1 matrix store | 8.7%, 7.5%, 7.4%, and 6.5% faster at 32, 64, 128, and 256 frames |
+
+Putting scalar `tanhf` calls inside the vector addition loop prevents that
+loop from vectorizing. Fusing the residual into the matrix store was
+profitable, but did not meet the 10% complete-callback retention gate.
+Batching all ten layer heads and reducing them with explicit SIMD also failed
+the gate in matched alternating runs: median improvements were 6.0% at 64
+frames and 3.8% at 256 frames, with no statistically significant change.
+Every prototype was removed.
 
 Keeping each output tile in registers changes the rounding boundary between
 convolution taps, while preserving tap order, depth order, and bias-last
@@ -251,10 +288,10 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The packed A1 Conv1d backend now covers the dominant 16x16 and 8x8 matrix
-shapes on ARM64 and AVX2/FMA x86-64. Further A1 work should profile the
-remaining activation, residual, and layer-head paths against this lower
-Conv1d baseline before selecting another target.
+The packed A1 Conv1d backend covers the dominant 16x16 and 8x8 matrix shapes
+on ARM64 and AVX2/FMA x86-64. Post-kernel profiles show that another retained
+A1 optimization needs either an accurate vector-math activation backend or a
+broader design that removes more than one layer pass without inhibiting SIMD.
 
 ## Real-world impact of the performance gap
 
