@@ -865,6 +865,70 @@ impl FiLM {
         condition: &ColMajorMatrix,
         num_frames: usize,
     ) {
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 1 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_rank1_scale_shift(
+                        &mut self.output_buf.data,
+                        &input.data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        input.rows,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_rank1_scale(
+                        &mut self.output_buf.data,
+                        &input.data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        input.rows,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_8x8_scale_shift(
+                        &mut self.output_buf.data,
+                        &input.data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        input.rows,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_8x8_scale(
+                        &mut self.output_buf.data,
+                        &input.data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        input.rows,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
         self.cond_to_scale_shift
             .process_block(condition, num_frames);
         self.apply_film_inner(&input.data, input.rows, num_frames);
@@ -878,6 +942,70 @@ impl FiLM {
         condition: &ColMajorMatrix,
         num_frames: usize,
     ) {
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 1 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_rank1_scale_shift(
+                        &mut self.output_buf.data,
+                        input_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        input_stride,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_rank1_scale(
+                        &mut self.output_buf.data,
+                        input_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        input_stride,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_8x8_scale_shift(
+                        &mut self.output_buf.data,
+                        input_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        input_stride,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_8x8_scale(
+                        &mut self.output_buf.data,
+                        input_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        input_stride,
+                        self.input_dim,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
         self.cond_to_scale_shift
             .process_block(condition, num_frames);
         self.apply_film_inner(input_data, input_stride, num_frames);
@@ -979,6 +1107,62 @@ impl FiLM {
         condition: &ColMajorMatrix,
         num_frames: usize,
     ) {
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 1 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_rank1_inplace_scale_shift(
+                        target_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        target_stride,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_rank1_inplace_scale(
+                        target_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        self.input_dim,
+                        target_stride,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
+        #[cfg(feature = "fast-kernels")]
+        if self.cond_to_scale_shift.in_channels == 8 && self.input_dim == 8 {
+            if let Some(bias) = self.cond_to_scale_shift.bias.as_deref() {
+                if self.do_shift {
+                    crate::fast_kernels::film_8x8_inplace_scale_shift(
+                        target_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        target_stride,
+                        condition.rows,
+                        num_frames,
+                    );
+                } else {
+                    crate::fast_kernels::film_8x8_inplace_scale(
+                        target_data,
+                        &condition.data,
+                        &self.cond_to_scale_shift.weight_colmajor,
+                        bias,
+                        target_stride,
+                        condition.rows,
+                        num_frames,
+                    );
+                }
+                return;
+            }
+        }
         self.cond_to_scale_shift
             .process_block(condition, num_frames);
         let scale_shift = &self.cond_to_scale_shift.output_buf;

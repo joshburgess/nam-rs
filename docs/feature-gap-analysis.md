@@ -16,7 +16,10 @@ This audit compares nam-rs against:
 The post-A2 Core changes covered by this audit are the LSTM real-time fix
 (`c9ac48e`), A2 prewarming fix (`763a079`), slimmable breakpoint API
 (`1108b60`), WaveNet head dilation (`4c0ee78`), and FFT Linear processing
-(`b352966`).
+(`b352966`). Core also added small convolution specializations (`dd972d6`).
+The broader portable A2Fast optimization (`baf1bf8`) was reverted
+(`b5a68c3`) after target-dependent regressions, so it is not part of current
+upstream parity.
 
 Training changes after v0.13.0 add packed breakpoint validation
 ([`3cafd2a`](https://github.com/sdatkinson/neural-amp-modeler/commit/3cafd2a81f5299a9c3aba373a91e70074ce4d891),

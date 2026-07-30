@@ -50,6 +50,98 @@ mod ffi {
             input_stride: usize,
             num_frames: usize,
         );
+        #[link_name = "fast_film_rank1_scale_shift"]
+        pub(super) fn film_rank1_scale_shift(
+            output: *mut f32,
+            input: *const f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            dim: usize,
+            input_stride: usize,
+            output_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_rank1_scale"]
+        pub(super) fn film_rank1_scale(
+            output: *mut f32,
+            input: *const f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            dim: usize,
+            input_stride: usize,
+            output_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_rank1_inplace_scale_shift"]
+        pub(super) fn film_rank1_inplace_scale_shift(
+            data: *mut f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            dim: usize,
+            data_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_rank1_inplace_scale"]
+        pub(super) fn film_rank1_inplace_scale(
+            data: *mut f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            dim: usize,
+            data_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_8x8_scale_shift"]
+        pub(super) fn film_8x8_scale_shift(
+            output: *mut f32,
+            input: *const f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            input_stride: usize,
+            output_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_8x8_scale"]
+        pub(super) fn film_8x8_scale(
+            output: *mut f32,
+            input: *const f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            input_stride: usize,
+            output_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_8x8_inplace_scale_shift"]
+        pub(super) fn film_8x8_inplace_scale_shift(
+            data: *mut f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            data_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
+        #[link_name = "fast_film_8x8_inplace_scale"]
+        pub(super) fn film_8x8_inplace_scale(
+            data: *mut f32,
+            condition: *const f32,
+            weights: *const f32,
+            bias: *const f32,
+            data_stride: usize,
+            condition_stride: usize,
+            num_frames: usize,
+        );
         #[link_name = "fast_film_scale_shift"]
         pub(super) fn film_scale_shift(
             output: *mut f32,
@@ -341,6 +433,298 @@ fn film_lengths(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn film_rank1_scale_shift(
+    output: &mut [f32],
+    input: &[f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    dim: usize,
+    input_stride: usize,
+    output_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    let parameters = product(dim, 2);
+    if !has_len(input, strided_len(input_stride, dim, num_frames))
+        || !has_len(output, strided_len(output_stride, dim, num_frames))
+        || !has_len(condition, strided_len(condition_stride, 1, num_frames))
+        || !has_len(weights, parameters)
+        || !has_len(bias, parameters)
+    {
+        return;
+    }
+    // SAFETY: All dense and strided ranges cover the C loop bounds. Mutable
+    // output cannot alias the input, condition, weights, or bias.
+    unsafe {
+        ffi::film_rank1_scale_shift(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            dim,
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_rank1_scale(
+    output: &mut [f32],
+    input: &[f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    dim: usize,
+    input_stride: usize,
+    output_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    if !has_len(input, strided_len(input_stride, dim, num_frames))
+        || !has_len(output, strided_len(output_stride, dim, num_frames))
+        || !has_len(condition, strided_len(condition_stride, 1, num_frames))
+        || !has_len(weights, dim)
+        || !has_len(bias, dim)
+    {
+        return;
+    }
+    // SAFETY: All dense and strided ranges cover the C loop bounds. Mutable
+    // output cannot alias the input, condition, weights, or bias.
+    unsafe {
+        ffi::film_rank1_scale(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            dim,
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_rank1_inplace_scale_shift(
+    data: &mut [f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    dim: usize,
+    data_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    let parameters = product(dim, 2);
+    if !has_len(data, strided_len(data_stride, dim, num_frames))
+        || !has_len(condition, strided_len(condition_stride, 1, num_frames))
+        || !has_len(weights, parameters)
+        || !has_len(bias, parameters)
+    {
+        return;
+    }
+    // SAFETY: Data covers every in-place element, and the shared parameters
+    // are disjoint from its exclusive borrow.
+    unsafe {
+        ffi::film_rank1_inplace_scale_shift(
+            data.as_mut_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            dim,
+            data_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_rank1_inplace_scale(
+    data: &mut [f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    dim: usize,
+    data_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    if !has_len(data, strided_len(data_stride, dim, num_frames))
+        || !has_len(condition, strided_len(condition_stride, 1, num_frames))
+        || !has_len(weights, dim)
+        || !has_len(bias, dim)
+    {
+        return;
+    }
+    // SAFETY: Data covers every in-place element, and the shared parameters
+    // are disjoint from its exclusive borrow.
+    unsafe {
+        ffi::film_rank1_inplace_scale(
+            data.as_mut_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            dim,
+            data_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_8x8_scale_shift(
+    output: &mut [f32],
+    input: &[f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    input_stride: usize,
+    output_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    const DIM: usize = 8;
+    const PARAMETERS: usize = DIM * 2;
+    if !has_len(input, strided_len(input_stride, DIM, num_frames))
+        || !has_len(output, strided_len(output_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, PARAMETERS * DIM)
+        || !has_len(bias, PARAMETERS)
+    {
+        return;
+    }
+    // SAFETY: All fixed 8-wide ranges cover the C loop bounds. Mutable output
+    // cannot alias the input or parameters.
+    unsafe {
+        ffi::film_8x8_scale_shift(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_8x8_scale(
+    output: &mut [f32],
+    input: &[f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    input_stride: usize,
+    output_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    const DIM: usize = 8;
+    if !has_len(input, strided_len(input_stride, DIM, num_frames))
+        || !has_len(output, strided_len(output_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, DIM * DIM)
+        || !has_len(bias, DIM)
+    {
+        return;
+    }
+    // SAFETY: All fixed 8-wide ranges cover the C loop bounds. Mutable output
+    // cannot alias the input or parameters.
+    unsafe {
+        ffi::film_8x8_scale(
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            input_stride,
+            output_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_8x8_inplace_scale_shift(
+    data: &mut [f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    data_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    const DIM: usize = 8;
+    const PARAMETERS: usize = DIM * 2;
+    if !has_len(data, strided_len(data_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, PARAMETERS * DIM)
+        || !has_len(bias, PARAMETERS)
+    {
+        return;
+    }
+    // SAFETY: Data covers every fixed-width in-place element, and the shared
+    // parameters are disjoint from its exclusive borrow.
+    unsafe {
+        ffi::film_8x8_inplace_scale_shift(
+            data.as_mut_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            data_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn film_8x8_inplace_scale(
+    data: &mut [f32],
+    condition: &[f32],
+    weights: &[f32],
+    bias: &[f32],
+    data_stride: usize,
+    condition_stride: usize,
+    num_frames: usize,
+) {
+    const DIM: usize = 8;
+    if !has_len(data, strided_len(data_stride, DIM, num_frames))
+        || !has_len(condition, strided_len(condition_stride, DIM, num_frames))
+        || !has_len(weights, DIM * DIM)
+        || !has_len(bias, DIM)
+    {
+        return;
+    }
+    // SAFETY: Data covers every fixed-width in-place element, and the shared
+    // parameters are disjoint from its exclusive borrow.
+    unsafe {
+        ffi::film_8x8_inplace_scale(
+            data.as_mut_ptr(),
+            condition.as_ptr(),
+            weights.as_ptr(),
+            bias.as_ptr(),
+            data_stride,
+            condition_stride,
+            num_frames,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn film_scale_shift(
     output: &mut [f32],
     input: &[f32],
@@ -587,6 +971,20 @@ mod tests {
         let mut output = [7.0; 4];
         super::film_scale_shift(&mut output, &[1.0; 4], &[1.0; 3], 2, 2, 2, 4, 2);
         assert_eq!(output, [7.0; 4]);
+
+        super::film_rank1_scale_shift(
+            &mut output,
+            &[1.0; 4],
+            &[1.0; 2],
+            &[1.0; 3],
+            &[1.0; 4],
+            2,
+            2,
+            2,
+            1,
+            2,
+        );
+        assert_eq!(output, [7.0; 4]);
     }
 
     #[test]
@@ -677,6 +1075,178 @@ mod tests {
         );
     }
 
+    fn assert_film_close(actual: &[f32], expected: &[f32], stride: usize, dim: usize) {
+        for (frame, (actual, expected)) in actual
+            .chunks(stride)
+            .zip(expected.chunks(stride))
+            .enumerate()
+        {
+            for channel in 0..dim {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 2.0e-5,
+                    "frame {frame}, channel {channel}: expected {}, got {}",
+                    expected[channel],
+                    actual[channel]
+                );
+            }
+        }
+    }
+
+    fn verify_fused_film(in_channels: usize, dim: usize, do_shift: bool) {
+        let frames = 3;
+        let input_stride = dim + 2;
+        let output_stride = dim + 1;
+        let condition_stride = in_channels + 2;
+        let parameters = if do_shift { dim * 2 } else { dim };
+        let input = (0..frames * input_stride)
+            .map(|index| index as f32 * 0.031 - 0.4)
+            .collect::<Vec<_>>();
+        let condition = (0..frames * condition_stride)
+            .map(|index| index as f32 * -0.027 + 0.3)
+            .collect::<Vec<_>>();
+        let weights = (0..parameters * in_channels)
+            .map(|index| index as f32 * 0.013 - 0.2)
+            .collect::<Vec<_>>();
+        let bias = (0..parameters)
+            .map(|index| index as f32 * -0.019 + 0.1)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0; frames * output_stride];
+
+        for frame in 0..frames {
+            for channel in 0..dim {
+                let mut scale =
+                    weights[channel] * condition[frame * condition_stride] + bias[channel];
+                for input_channel in 1..in_channels {
+                    scale += weights[input_channel * parameters + channel]
+                        * condition[frame * condition_stride + input_channel];
+                }
+                let shift = if do_shift {
+                    let mut shift = weights[dim + channel] * condition[frame * condition_stride]
+                        + bias[dim + channel];
+                    for input_channel in 1..in_channels {
+                        shift += weights[input_channel * parameters + dim + channel]
+                            * condition[frame * condition_stride + input_channel];
+                    }
+                    shift
+                } else {
+                    0.0
+                };
+                expected[frame * output_stride + channel] =
+                    input[frame * input_stride + channel] * scale + shift;
+            }
+        }
+
+        let mut actual = vec![0.0; expected.len()];
+        match (in_channels, do_shift) {
+            (1, true) => super::film_rank1_scale_shift(
+                &mut actual,
+                &input,
+                &condition,
+                &weights,
+                &bias,
+                dim,
+                input_stride,
+                output_stride,
+                condition_stride,
+                frames,
+            ),
+            (1, false) => super::film_rank1_scale(
+                &mut actual,
+                &input,
+                &condition,
+                &weights,
+                &bias,
+                dim,
+                input_stride,
+                output_stride,
+                condition_stride,
+                frames,
+            ),
+            (8, true) => super::film_8x8_scale_shift(
+                &mut actual,
+                &input,
+                &condition,
+                &weights,
+                &bias,
+                input_stride,
+                output_stride,
+                condition_stride,
+                frames,
+            ),
+            (8, false) => super::film_8x8_scale(
+                &mut actual,
+                &input,
+                &condition,
+                &weights,
+                &bias,
+                input_stride,
+                output_stride,
+                condition_stride,
+                frames,
+            ),
+            _ => panic!("unsupported fused FiLM test shape"),
+        }
+        assert_film_close(&actual, &expected, output_stride, dim);
+
+        let mut inplace = input.clone();
+        let mut inplace_expected = input.clone();
+        for frame in 0..frames {
+            inplace_expected[frame * input_stride..frame * input_stride + dim]
+                .copy_from_slice(&expected[frame * output_stride..frame * output_stride + dim]);
+        }
+        match (in_channels, do_shift) {
+            (1, true) => super::film_rank1_inplace_scale_shift(
+                &mut inplace,
+                &condition,
+                &weights,
+                &bias,
+                dim,
+                input_stride,
+                condition_stride,
+                frames,
+            ),
+            (1, false) => super::film_rank1_inplace_scale(
+                &mut inplace,
+                &condition,
+                &weights,
+                &bias,
+                dim,
+                input_stride,
+                condition_stride,
+                frames,
+            ),
+            (8, true) => super::film_8x8_inplace_scale_shift(
+                &mut inplace,
+                &condition,
+                &weights,
+                &bias,
+                input_stride,
+                condition_stride,
+                frames,
+            ),
+            (8, false) => super::film_8x8_inplace_scale(
+                &mut inplace,
+                &condition,
+                &weights,
+                &bias,
+                input_stride,
+                condition_stride,
+                frames,
+            ),
+            _ => panic!("unsupported fused FiLM test shape"),
+        }
+        assert_film_close(&inplace, &inplace_expected, input_stride, dim);
+    }
+
+    #[test]
+    fn fused_film_matches_two_stage_reference() {
+        for (in_channels, dim) in [(1, 6), (8, 8)] {
+            for do_shift in [false, true] {
+                verify_fused_film(in_channels, dim, do_shift);
+            }
+        }
+    }
+
     #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
     #[test]
     fn vector_math_availability_matches_glibc_version() {
@@ -736,12 +1306,13 @@ mod tests {
         #[test]
         fn backend_equivalence_small_c_gemm_matches_scalar_rust(
             out_channels in 1usize..8,
-            in_channels in 1usize..8,
+            in_channels in 1usize..9,
             frames in 1usize..24,
             padding in 0usize..4,
             raw_weights in prop::collection::vec(-1.0f32..1.0, 1..64),
             raw_input in prop::collection::vec(-1.0f32..1.0, 1..256),
             raw_bias in prop::collection::vec(-1.0f32..1.0, 1..8),
+            use_bias in any::<bool>(),
         ) {
             let stride = in_channels + padding;
             let weights = raw_weights
@@ -764,10 +1335,13 @@ mod tests {
 
             for frame in 0..frames {
                 for output_channel in 0..out_channels {
-                    let mut sum = bias[output_channel];
-                    for input_channel in 0..in_channels {
+                    let mut sum = weights[output_channel] * input[frame * stride];
+                    for input_channel in 1..in_channels {
                         sum += weights[input_channel * out_channels + output_channel]
                             * input[frame * stride + input_channel];
+                    }
+                    if use_bias {
+                        sum += bias[output_channel];
                     }
                     expected[frame * out_channels + output_channel] = sum;
                 }
@@ -777,7 +1351,7 @@ mod tests {
                 &mut actual,
                 &weights,
                 &input,
-                Some(&bias),
+                use_bias.then_some(&bias),
                 out_channels,
                 in_channels,
                 stride,

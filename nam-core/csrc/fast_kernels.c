@@ -305,6 +305,56 @@ void fast_conv1x1_small(
     size_t input_stride,
     size_t num_frames
 ) {
+    if (in_ch == 1) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t out_off = f * out_ch;
+            float value = input[f * input_stride];
+            for (size_t o = 0; o < out_ch; o++) {
+                output[out_off + o] =
+                    weights[o] * value + (bias ? bias[o] : 0.0f);
+            }
+        }
+        return;
+    }
+
+    if (in_ch == 4) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * out_ch;
+            float input0 = input[in_off];
+            float input1 = input[in_off + 1];
+            float input2 = input[in_off + 2];
+            float input3 = input[in_off + 3];
+            for (size_t o = 0; o < out_ch; o++) {
+                float sum = weights[o] * input0;
+                sum += weights[out_ch + o] * input1;
+                sum += weights[2 * out_ch + o] * input2;
+                sum += weights[3 * out_ch + o] * input3;
+                output[out_off + o] = sum + (bias ? bias[o] : 0.0f);
+            }
+        }
+        return;
+    }
+
+    if (in_ch == 8) {
+        for (size_t f = 0; f < num_frames; f++) {
+            size_t in_off = f * input_stride;
+            size_t out_off = f * out_ch;
+            for (size_t o = 0; o < out_ch; o++) {
+                float sum = weights[o] * input[in_off];
+                sum += weights[out_ch + o] * input[in_off + 1];
+                sum += weights[2 * out_ch + o] * input[in_off + 2];
+                sum += weights[3 * out_ch + o] * input[in_off + 3];
+                sum += weights[4 * out_ch + o] * input[in_off + 4];
+                sum += weights[5 * out_ch + o] * input[in_off + 5];
+                sum += weights[6 * out_ch + o] * input[in_off + 6];
+                sum += weights[7 * out_ch + o] * input[in_off + 7];
+                output[out_off + o] = sum + (bias ? bias[o] : 0.0f);
+            }
+        }
+        return;
+    }
+
     for (size_t f = 0; f < num_frames; f++) {
         size_t in_off = f * input_stride;
         size_t out_off = f * out_ch;
@@ -314,6 +364,203 @@ void fast_conv1x1_small(
                 sum += weights[i * out_ch + o] * input[in_off + i];
             }
             output[out_off + o] = sum + (bias ? bias[o] : 0.0f);
+        }
+    }
+}
+
+void fast_film_rank1_scale_shift(
+    float *restrict output,
+    const float *restrict input,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t dim,
+    size_t input_stride,
+    size_t output_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * output_stride;
+        float value = condition[f * condition_stride];
+        for (size_t i = 0; i < dim; i++) {
+            float scale = weights[i] * value + bias[i];
+            float shift = weights[dim + i] * value + bias[dim + i];
+            output[out_off + i] = input[in_off + i] * scale + shift;
+        }
+    }
+}
+
+void fast_film_rank1_scale(
+    float *restrict output,
+    const float *restrict input,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t dim,
+    size_t input_stride,
+    size_t output_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * output_stride;
+        float value = condition[f * condition_stride];
+        for (size_t i = 0; i < dim; i++) {
+            float scale = weights[i] * value + bias[i];
+            output[out_off + i] = input[in_off + i] * scale;
+        }
+    }
+}
+
+void fast_film_rank1_inplace_scale_shift(
+    float *restrict data,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t dim,
+    size_t data_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t data_off = f * data_stride;
+        float value = condition[f * condition_stride];
+        for (size_t i = 0; i < dim; i++) {
+            float scale = weights[i] * value + bias[i];
+            float shift = weights[dim + i] * value + bias[dim + i];
+            data[data_off + i] = data[data_off + i] * scale + shift;
+        }
+    }
+}
+
+void fast_film_rank1_inplace_scale(
+    float *restrict data,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t dim,
+    size_t data_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t data_off = f * data_stride;
+        float value = condition[f * condition_stride];
+        for (size_t i = 0; i < dim; i++) {
+            float scale = weights[i] * value + bias[i];
+            data[data_off + i] *= scale;
+        }
+    }
+}
+
+static inline float nam_dot8(
+    const float *restrict weights,
+    const float *restrict condition,
+    size_t rows,
+    size_t row
+) {
+    float sum = weights[row] * condition[0];
+    sum += weights[rows + row] * condition[1];
+    sum += weights[2 * rows + row] * condition[2];
+    sum += weights[3 * rows + row] * condition[3];
+    sum += weights[4 * rows + row] * condition[4];
+    sum += weights[5 * rows + row] * condition[5];
+    sum += weights[6 * rows + row] * condition[6];
+    sum += weights[7 * rows + row] * condition[7];
+    return sum;
+}
+
+void fast_film_8x8_scale_shift(
+    float *restrict output,
+    const float *restrict input,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t input_stride,
+    size_t output_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    const size_t dim = 8;
+    const size_t rows = 16;
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * output_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < dim; i++) {
+            float scale = nam_dot8(weights, condition_frame, rows, i) + bias[i];
+            float shift = nam_dot8(weights, condition_frame, rows, dim + i)
+                        + bias[dim + i];
+            output[out_off + i] = input[in_off + i] * scale + shift;
+        }
+    }
+}
+
+void fast_film_8x8_scale(
+    float *restrict output,
+    const float *restrict input,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t input_stride,
+    size_t output_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    const size_t dim = 8;
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t in_off = f * input_stride;
+        size_t out_off = f * output_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < dim; i++) {
+            float scale = nam_dot8(weights, condition_frame, dim, i) + bias[i];
+            output[out_off + i] = input[in_off + i] * scale;
+        }
+    }
+}
+
+void fast_film_8x8_inplace_scale_shift(
+    float *restrict data,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t data_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    const size_t dim = 8;
+    const size_t rows = 16;
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t data_off = f * data_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < dim; i++) {
+            float scale = nam_dot8(weights, condition_frame, rows, i) + bias[i];
+            float shift = nam_dot8(weights, condition_frame, rows, dim + i)
+                        + bias[dim + i];
+            data[data_off + i] = data[data_off + i] * scale + shift;
+        }
+    }
+}
+
+void fast_film_8x8_inplace_scale(
+    float *restrict data,
+    const float *restrict condition,
+    const float *restrict weights,
+    const float *restrict bias,
+    size_t data_stride,
+    size_t condition_stride,
+    size_t num_frames
+) {
+    const size_t dim = 8;
+    for (size_t f = 0; f < num_frames; f++) {
+        size_t data_off = f * data_stride;
+        const float *condition_frame = condition + f * condition_stride;
+        for (size_t i = 0; i < dim; i++) {
+            float scale = nam_dot8(weights, condition_frame, dim, i) + bias[i];
+            data[data_off + i] *= scale;
         }
     }
 }

@@ -310,6 +310,46 @@ for 55.1%. LSTM scalar math accounted for 32.3%, but batching its four gate
 vectors and cell-state tanh through vForce made the complete callback 48.2%
 slower. That prototype was removed.
 
+### A2 convolution kernels
+
+Native Linux x86-64 Callgrind profiles separated A2 convolution self
+instructions from their wrappers and matrix callees:
+
+| Frames | Conv1d | Conv1x1 | Combined |
+|-------:|-------:|--------:|---------:|
+| 32 | 29.69% | 51.48% | 81.17% |
+| 64 | 29.96% | 51.58% | 81.54% |
+| 128 | 30.07% | 51.57% | 81.64% |
+| 256 | 30.12% | 51.56% | 81.68% |
+
+The largest target was Conv1x1. Current Core commit `3cde95c` retains Eigen
+for broad A2 block convolution and adds explicit small convolution paths in
+[`dd972d6`](https://github.com/sdatkinson/NeuralAmpModelerCore/commit/dd972d6a45574aa4abff3a22487aebe7998aa5c7).
+Its earlier portable A2Fast change
+([`baf1bf8`](https://github.com/sdatkinson/NeuralAmpModelerCore/commit/baf1bf8e6a83691804ed23bbc176483d3f20b661))
+was reverted in
+[`b5a68c3`](https://github.com/sdatkinson/NeuralAmpModelerCore/commit/b5a68c3ebed5035a91d9207219346c81e8e3ce8e)
+after AppleClang testing found target-dependent regressions.
+
+The retained nam-rs path specializes 1, 4, and 8-input Conv1x1 products and
+fuses the common rank-1 and 8-channel FiLM projections with their scale and
+shift application. This removes the intermediate FiLM parameter-buffer pass
+without changing the accumulation order. Matched Apple M4 Criterion runs
+measured complete A2 callbacks:
+
+| Frames | Before | After | Improvement |
+|-------:|-------:|------:|------------:|
+| 32 | 18.528 us | 16.172 us | 11.26% |
+| 64 | 36.269 us | 32.324 us | 11.11% |
+| 128 | 71.333 us | 62.661 us | 12.36% |
+| 256 | 141.82 us | 123.91 us | 13.43% |
+
+The conservative confidence bound exceeded 10% at every maintained size.
+Direct tests cover strided and in-place FiLM variants plus every specialized
+Conv1x1 input width. Complete model tests preserve callback partition and
+reset equivalence, report zero plugin-callback allocations, and keep the
+maximum A2 render difference at 5.72e-06 against the pinned Core fixture.
+
 ### Accurate Linux activation backend
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point
@@ -368,11 +408,12 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The Apple and GNU x86-64 accurate activation backends clear the
-complete-callback retention gate. A2 activation is too small a fraction of its
-callback, and the LSTM vForce prototype regressed. Windows and non-glibc Linux
-retain scalar accurate tanh until a portable vector-math implementation can
-clear the same accuracy and complete-callback gates.
+The Apple and GNU x86-64 accurate activation backends and the A2 Conv1x1
+specializations clear the complete-callback retention gate. A2 activation is
+too small a fraction of its callback, and the LSTM vForce prototype regressed.
+Windows and non-glibc Linux retain scalar accurate tanh until a portable
+vector-math implementation can clear the same accuracy and complete-callback
+gates.
 
 ## Real-world impact of the performance gap
 
