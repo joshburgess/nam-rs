@@ -967,6 +967,89 @@ mod tests {
     }
 
     #[test]
+    fn safe_facade_rejects_short_small_conv1d_buffers() {
+        let mut output = [7.0; 4];
+        super::conv1d_small_gemv(
+            &mut output,
+            &[1.0; 16],
+            &[0, 8],
+            &[1.0; 32],
+            &[0.0; 4],
+            super::Conv1dDimensions {
+                out_channels: 4,
+                in_channels: 4,
+                num_frames: 2,
+            },
+        );
+        assert_eq!(output, [7.0; 4]);
+    }
+
+    #[test]
+    fn specialized_small_conv1d_shapes_match_scalar_reference() {
+        for (out_channels, in_channels, kernel_size) in
+            [(8, 4, 4), (4, 4, 4), (4, 4, 3), (12, 3, 2)]
+        {
+            let num_frames = 19;
+            let tap_elements = in_channels * num_frames;
+            let input = (0..tap_elements * kernel_size)
+                .map(|index| ((index + 1) as f32 * 0.017).sin())
+                .collect::<Vec<_>>();
+            let tap_offsets = (0..kernel_size)
+                .map(|tap| tap * tap_elements)
+                .collect::<Vec<_>>();
+            let weights = (0..out_channels * in_channels * kernel_size)
+                .map(|index| ((index + 1) as f32 * 0.031).cos() * 0.25)
+                .collect::<Vec<_>>();
+            let bias = (0..out_channels)
+                .map(|index| index as f32 * 0.01 - 0.03)
+                .collect::<Vec<_>>();
+            let mut expected = vec![0.0f32; out_channels * num_frames];
+
+            for (tap, &tap_offset) in tap_offsets.iter().enumerate() {
+                let weight_offset = tap * out_channels * in_channels;
+                for frame in 0..num_frames {
+                    for output_channel in 0..out_channels {
+                        let mut sum = 0.0f32;
+                        for input_channel in 0..in_channels {
+                            sum += weights
+                                [weight_offset + input_channel * out_channels + output_channel]
+                                * input[tap_offset + frame * in_channels + input_channel];
+                        }
+                        expected[frame * out_channels + output_channel] += sum;
+                    }
+                }
+            }
+            for frame in 0..num_frames {
+                for output_channel in 0..out_channels {
+                    expected[frame * out_channels + output_channel] += bias[output_channel];
+                }
+            }
+
+            let mut actual = vec![0.0f32; expected.len()];
+            super::conv1d_small_gemv(
+                &mut actual,
+                &input,
+                &tap_offsets,
+                &weights,
+                &bias,
+                super::Conv1dDimensions {
+                    out_channels,
+                    in_channels,
+                    num_frames,
+                },
+            );
+
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-6,
+                    "{out_channels}x{in_channels}/k{kernel_size} output {index}: \
+                     expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn safe_facade_rejects_short_film_parameters() {
         let mut output = [7.0; 4];
         super::film_scale_shift(&mut output, &[1.0; 4], &[1.0; 3], 2, 2, 2, 4, 2);

@@ -14,6 +14,7 @@ default = []
 float_io = []  # Use f32 instead of f64 for process() I/O (matches C++ DSP_SAMPLE_FLOAT)
 faer = []  # Compatibility alias; WaveNet uses its allocation-free matrix backend
 fast-kernels = []  # Optimized C inner loops
+benchmark-internals = []
 
 [build-dependencies]
 cc = { version = "1", optional = false }
@@ -47,3 +48,8 @@ harness = false
 [[bench]]
 name = "inference_native_callgrind"
 harness = false
+
+[[bench]]
+name = "conv1d_shapes"
+harness = false
+required-features = ["fast-kernels", "benchmark-internals"]

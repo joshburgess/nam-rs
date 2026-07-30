@@ -350,6 +350,37 @@ Conv1x1 input width. Complete model tests preserve callback partition and
 reset equivalence, report zero plugin-callback allocations, and keep the
 maximum A2 render difference at 5.72e-06 against the pinned Core fixture.
 
+The follow-up profile attributed 40.20% of the 64-frame callback and 40.46%
+of the 256-frame callback to Conv1d. Source-line attribution placed about
+89.5% of the kernel's instructions in the generic matrix inner loop.
+Shape-specific benchmarks cover the upstream 8x4/k4 path and the maintained
+A2 fixture's 4x4/k4, 4x4/k3, and grouped 12x3/k2 paths at 16, 32, 64, 128,
+and 256 frames.
+
+Explicit 8x4 and 4x4 kernels retain the input-channel, tap, and bias
+accumulation order of the generic implementation. The 8x4 kernel reduced
+shape-level time by 77.6% to 78.2%. The 4x4/k3 path improved by 79.4% to
+81.3%. The grouped 12x3/k2 fallback remained unchanged within the benchmark's
+noise threshold.
+
+The upstream fused 4x4/k3 design was also evaluated. It improved the retained
+per-tap kernel by 6.8% to 12.3% at 16 through 64 frames, but regressed it by
+20.9% at 128 frames and 45.0% at 256 frames. The fused prototype was removed.
+The per-tap specialization improved the complete Apple M4 A2 callback:
+
+| Frames | Before | After | Improvement |
+|-------:|-------:|------:|------------:|
+| 16 | 8.773 us | 7.296 us | 16.1% |
+| 32 | 16.734 us | 13.833 us | 17.1% |
+| 64 | 32.807 us | 26.991 us | 17.9% |
+| 128 | 64.210 us | 53.085 us | 17.4% |
+| 256 | 128.06 us | 105.62 us | 17.2% |
+
+The complete callback clears the 10% retention gate at every measured size.
+Direct scalar oracles cover all benchmarked shapes and short-buffer
+rejection. Complete model tests preserve render accuracy, streaming and reset
+behavior, and allocation freedom.
+
 ### Accurate Linux activation backend
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point

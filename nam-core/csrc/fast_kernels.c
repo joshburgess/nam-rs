@@ -153,25 +153,71 @@ void fast_conv1d_small_gemv(
 
     /* Accumulate all taps */
     size_t w_stride = out_ch * in_ch;
-    for (size_t k = 0; k < kernel_size; k++) {
-        const float *tap = input + tap_offsets[k];
-        const float *w = weights + k * w_stride;
-        for (size_t f = 0; f < num_frames; f++) {
-            size_t in_off = f * in_ch;
-            size_t out_off = f * out_ch;
-            if (out_ch == 1 && in_ch == 4) {
-                float product =
-                    (w[0] * tap[in_off] + w[1] * tap[in_off + 1])
-                    + (w[2] * tap[in_off + 2] + w[3] * tap[in_off + 3]);
-                output[out_off] += product;
-                continue;
-            }
-            for (size_t o = 0; o < out_ch; o++) {
-                float sum = 0.0f;
-                for (size_t i = 0; i < in_ch; i++) {
-                    sum += w[i * out_ch + o] * tap[in_off + i];
+    if (out_ch == 8 && in_ch == 4) {
+        for (size_t k = 0; k < kernel_size; k++) {
+            const float *tap = input + tap_offsets[k];
+            const float *w = weights + k * w_stride;
+            for (size_t f = 0; f < num_frames; f++) {
+                size_t in_off = f * 4;
+                size_t out_off = f * 8;
+                float input0 = tap[in_off];
+                float input1 = tap[in_off + 1];
+                float input2 = tap[in_off + 2];
+                float input3 = tap[in_off + 3];
+                for (size_t o = 0; o < 8; o++) {
+                    float sum = w[o] * input0;
+                    sum += w[8 + o] * input1;
+                    sum += w[16 + o] * input2;
+                    sum += w[24 + o] * input3;
+                    output[out_off + o] += sum;
                 }
-                output[out_off + o] += sum;
+            }
+        }
+    } else if (out_ch == 4 && in_ch == 4) {
+        for (size_t k = 0; k < kernel_size; k++) {
+            const float *tap = input + tap_offsets[k];
+            const float *w = weights + k * w_stride;
+            const float w00 = w[0], w10 = w[1], w20 = w[2], w30 = w[3];
+            const float w01 = w[4], w11 = w[5], w21 = w[6], w31 = w[7];
+            const float w02 = w[8], w12 = w[9], w22 = w[10], w32 = w[11];
+            const float w03 = w[12], w13 = w[13], w23 = w[14], w33 = w[15];
+            for (size_t f = 0; f < num_frames; f++) {
+                size_t off = f * 4;
+                float input0 = tap[off];
+                float input1 = tap[off + 1];
+                float input2 = tap[off + 2];
+                float input3 = tap[off + 3];
+                output[off] +=
+                    w00 * input0 + w01 * input1 + w02 * input2 + w03 * input3;
+                output[off + 1] +=
+                    w10 * input0 + w11 * input1 + w12 * input2 + w13 * input3;
+                output[off + 2] +=
+                    w20 * input0 + w21 * input1 + w22 * input2 + w23 * input3;
+                output[off + 3] +=
+                    w30 * input0 + w31 * input1 + w32 * input2 + w33 * input3;
+            }
+        }
+    } else {
+        for (size_t k = 0; k < kernel_size; k++) {
+            const float *tap = input + tap_offsets[k];
+            const float *w = weights + k * w_stride;
+            for (size_t f = 0; f < num_frames; f++) {
+                size_t in_off = f * in_ch;
+                size_t out_off = f * out_ch;
+                if (out_ch == 1 && in_ch == 4) {
+                    float product =
+                        (w[0] * tap[in_off] + w[1] * tap[in_off + 1])
+                        + (w[2] * tap[in_off + 2] + w[3] * tap[in_off + 3]);
+                    output[out_off] += product;
+                    continue;
+                }
+                for (size_t o = 0; o < out_ch; o++) {
+                    float sum = 0.0f;
+                    for (size_t i = 0; i < in_ch; i++) {
+                        sum += w[i * out_ch + o] * tap[in_off + i];
+                    }
+                    output[out_off + o] += sum;
+                }
             }
         }
     }
