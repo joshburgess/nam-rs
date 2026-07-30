@@ -6,6 +6,8 @@
 mod ffi {
     #[allow(dead_code)]
     extern "C" {
+        #[link_name = "fast_init_vector_math"]
+        pub(super) fn init_vector_math() -> i32;
         #[link_name = "fast_conv1d_depthwise"]
         pub(super) fn conv1d_depthwise(
             output: *mut f32,
@@ -131,6 +133,11 @@ mod ffi {
         #[link_name = "fast_tanh_poly_inplace"]
         pub(super) fn tanh_poly_inplace(data: *mut f32, len: usize);
     }
+}
+
+pub(crate) fn init_vector_math() -> bool {
+    // SAFETY: The C initializer is process-global, idempotent, and takes no arguments
+    unsafe { ffi::init_vector_math() != 0 }
 }
 
 pub(crate) struct Conv1dDimensions {
@@ -595,6 +602,7 @@ mod tests {
 
     #[test]
     fn accurate_fused_tanh_handles_chunk_boundaries() {
+        let _ = super::init_vector_math();
         for len in [0, 1, 255, 256, 257, 511, 512, 513, 1024] {
             let left = (0..len)
                 .map(|index| (index as f32 * 0.037).sin() * 2.0)
@@ -622,6 +630,7 @@ mod tests {
 
     #[test]
     fn accurate_fused_tanh_handles_special_values() {
+        let _ = super::init_vector_math();
         let left = [
             f32::NEG_INFINITY,
             -100.0,
@@ -656,6 +665,44 @@ mod tests {
             }
         }
         assert!(actual[5].is_sign_negative());
+    }
+
+    #[test]
+    fn vector_math_initialization_is_idempotent() {
+        let lanes = super::init_vector_math();
+        assert_eq!(
+            lanes,
+            super::init_vector_math(),
+            "vector-math availability changed after initialization"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    #[test]
+    fn vector_math_availability_matches_glibc_version() {
+        use std::ffi::{c_char, CStr};
+
+        unsafe extern "C" {
+            fn gnu_get_libc_version() -> *const c_char;
+        }
+
+        // SAFETY: glibc returns a process-lifetime, null-terminated version string
+        let version = unsafe { CStr::from_ptr(gnu_get_libc_version()) }
+            .to_str()
+            .expect("glibc version was not UTF-8");
+        let mut components = version.split('.');
+        let major = components
+            .next()
+            .expect("glibc version had no major component")
+            .parse::<u32>()
+            .expect("glibc major version was not numeric");
+        let minor = components
+            .next()
+            .expect("glibc version had no minor component")
+            .parse::<u32>()
+            .expect("glibc minor version was not numeric");
+
+        assert_eq!(super::init_vector_math(), (major, minor) >= (2, 35));
     }
 
     proptest! {

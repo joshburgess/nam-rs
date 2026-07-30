@@ -79,6 +79,7 @@ budget change can be traced to the functions and source lines that caused it.
 | target-cpu=native | ~2x improvement early on | None |
 | Slice-based bounds elimination | Minor improvement | None |
 | Accelerate vForce accurate tanh on Apple platforms | 31% to 33% faster complete A1 callbacks | No measurable regression |
+| glibc libmvec accurate tanh on x86-64 Linux | 22% to 28% faster complete A1 callbacks | No measurable regression |
 
 ### What didn't work
 
@@ -309,6 +310,30 @@ for 55.1%. LSTM scalar math accounted for 32.3%, but batching its four gate
 vectors and cell-state tanh through vForce made the complete callback 48.2%
 slower. That prototype was removed.
 
+### Accurate Linux activation backend
+
+The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point
+during WaveNet construction. glibc 2.35 and newer use the vector function.
+Older glibc versions, musl, and non-x86 Linux targets retain the scalar path.
+This avoids a hard GLIBC 2.35 symbol dependency and keeps dynamic loading out
+of the audio callback.
+
+Matched Criterion runs in an Ubuntu 22.04 x86-64 container measured the
+complete A1 callback:
+
+| Frames | Scalar accurate tanh | libmvec accurate tanh | Improvement |
+|-------:|---------------------:|----------------------:|------------:|
+| 32 | 201.90 us | 158.45 us | 21.8% |
+| 64 | 406.52 us | 289.97 us | 27.9% |
+| 128 | 786.56 us | 575.52 us | 27.0% |
+| 256 | 1.5693 ms | 1.1752 ms | 24.9% |
+
+The x86-64 container ran under Rosetta, so CI's native Linux instruction
+profile remains the architecture-native performance gate. The same Ubuntu
+22.04 environment passed boundary, special-value, and randomized-equivalence
+tests. A glibc 2.31 build resolved no vector entry point and selected the
+scalar fallback.
+
 ## Key Insights
 
 ### 1. A1 bottlenecks shift after each retained kernel
@@ -343,14 +368,11 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The Apple accurate activation backend now clears the complete-callback
-retention gate. A2 activation is too small a fraction of its callback, and the
-LSTM vForce prototype regressed.
-
-Linux x86-64 still uses scalar accurate tanh. glibc exposes a vector tanh ABI
-only from version 2.35, so using it directly would add a runtime and linker
-constraint to the optional fast-kernel feature. A Linux backend needs a native
-benchmark plus an explicit compatibility design before it can be retained.
+The Apple and GNU x86-64 accurate activation backends clear the
+complete-callback retention gate. A2 activation is too small a fraction of its
+callback, and the LSTM vForce prototype regressed. Windows and non-glibc Linux
+retain scalar accurate tanh until a portable vector-math implementation can
+clear the same accuracy and complete-callback gates.
 
 ## Real-world impact of the performance gap
 

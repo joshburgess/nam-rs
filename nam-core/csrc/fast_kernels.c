@@ -15,6 +15,66 @@
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #endif
+#if defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#define NAM_GLIBC_VECTOR_TANH 1
+#endif
+
+#if defined(NAM_GLIBC_VECTOR_TANH)
+typedef float nam_v4sf __attribute__((vector_size(16)));
+typedef nam_v4sf (*nam_tanhf4_fn)(nam_v4sf);
+
+static pthread_once_t nam_vector_math_once = PTHREAD_ONCE_INIT;
+static _Atomic(nam_tanhf4_fn) nam_tanhf4 = NULL;
+
+static void nam_resolve_vector_math(void) {
+    void *handle = dlopen("libmvec.so.1", RTLD_LAZY | RTLD_LOCAL);
+    if (handle == NULL) {
+        return;
+    }
+    /* Callbacks retain the function pointer, so libmvec stays loaded. */
+
+    void *symbol4 = dlsym(handle, "_ZGVbN4v_tanhf");
+    if (symbol4 != NULL) {
+        nam_tanhf4_fn function4 = NULL;
+        _Static_assert(sizeof(function4) == sizeof(symbol4), "function pointer size mismatch");
+        memcpy(&function4, &symbol4, sizeof(function4));
+        atomic_store_explicit(&nam_tanhf4, function4, memory_order_release);
+    }
+}
+
+int fast_init_vector_math(void) {
+    pthread_once(&nam_vector_math_once, nam_resolve_vector_math);
+    return atomic_load_explicit(&nam_tanhf4, memory_order_acquire) != NULL;
+}
+
+__attribute__((target("sse2")))
+static size_t nam_add_tanh_sse2(
+    float *restrict output,
+    const float *restrict left,
+    const float *restrict right,
+    size_t len,
+    nam_tanhf4_fn tanh4
+) {
+    size_t offset = 0;
+    for (; offset + 4 <= len; offset += 4) {
+        nam_v4sf left_values;
+        nam_v4sf right_values;
+        memcpy(&left_values, left + offset, sizeof(left_values));
+        memcpy(&right_values, right + offset, sizeof(right_values));
+        nam_v4sf result = tanh4(left_values + right_values);
+        memcpy(output + offset, &result, sizeof(result));
+    }
+    return offset;
+}
+
+#else
+int fast_init_vector_math(void) {
+    return 0;
+}
+#endif
 
 /* ── Full Conv1d block processing (depthwise case) ──────────────────────
  * Equivalent to the entire Conv1d::process_block for depthwise weights.
@@ -197,6 +257,21 @@ void fast_add_activate(
                 sums[i] = conv_out[offset + (size_t)i] + mixin_out[offset + (size_t)i];
             }
             vvtanhf(z_out + offset, sums, &count);
+        }
+#elif defined(NAM_GLIBC_VECTOR_TANH)
+        size_t offset = 0;
+        nam_tanhf4_fn tanh4 =
+            atomic_load_explicit(&nam_tanhf4, memory_order_acquire);
+        if (tanh4 != NULL) {
+            offset += nam_add_tanh_sse2(
+                z_out + offset,
+                conv_out + offset,
+                mixin_out + offset,
+                len - offset,
+                tanh4);
+        }
+        for (; offset < len; offset++) {
+            z_out[offset] = tanhf(conv_out[offset] + mixin_out[offset]);
         }
 #else
         for (size_t i = 0; i < len; i++) {
