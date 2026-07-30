@@ -25,8 +25,8 @@ Callgrind now provide the maintained performance record.
 | wavenet | 0.0 (bit-identical) |
 | wavenet_condition_dsp | 0.0 (bit-identical) |
 | lstm | 8.94e-08 |
-| wavenet_a1_standard | 5.96e-08 |
-| my_model | 5.96e-08 |
+| wavenet_a1_standard | 7.97e-07 ARM64, 1.02e-06 x86-64 |
+| my_model | 7.97e-07 ARM64, 1.02e-06 x86-64 |
 | wavenet_a2_max | 0.0 (bit-identical, Apple Silicon default backend) |
 
 The A2 max result is checked against a render produced by pinned
@@ -175,6 +175,41 @@ full-callback headroom, so isolated changes to those operations cannot meet
 the retention gate. A future attempt would need a complete architecture-
 specific packed-weight kernel that also replaces most of the multiplication.
 
+### Packed A1 Conv1d kernels
+
+The complete packed-weight design was evaluated against
+NeuralAmpModelerCore commit
+`3cde95c354d5ba6da01316cad90b05cfc4855053` and its Eigen commit
+`bc3b39870ecb690a623a3f49149a358b95c5781d`. The model loader now packs the
+three convolution taps into the native register-tile layout. The callback
+packs input panels into reset-sized scratch, accumulates all three taps while
+the output tile remains in registers, adds bias, and stores once.
+
+The ARM64 layout follows Eigen's 12x8 plus 4x8 decomposition for a 16x16
+matrix and its 8x8 decomposition for an 8x8 matrix. The x86-64 AVX2/FMA
+layout uses 16x4 and 8x4 tiles. Unsupported shapes and x86-64 processors
+without AVX2/FMA continue through the existing backend.
+
+Fresh Apple M4 Criterion runs measured the complete A1 callback:
+
+| Frames | Previous backend | Packed kernel | Improvement |
+|-------:|-----------------:|--------------:|------------:|
+| 32 | 76.361 us | 56.204 us | 26.4% |
+| 64 | 149.98 us | 109.71 us | 26.9% |
+| 128 | 308.98 us | 219.47 us | 29.0% |
+| 256 | 589.10 us | 435.02 us | 26.2% |
+
+ARM64 clears the repository's 10% full-callback retention gate at every
+maintained size. Native Linux x86-64 instruction counts are enforced by CI;
+Rosetta does not expose the AVX2/FMA features required by the x86-64 kernel.
+
+Keeping each output tile in registers changes the rounding boundary between
+convolution taps, while preserving tap order, depth order, and bias-last
+evaluation. The measured complete-render differences are 7.97e-07 on ARM64
+and 1.02e-06 on x86-64. Direct kernel oracles cover 8x8, 16x16, full, and
+partial column tiles. Complete model tests cover render accuracy,
+callback-partition invariance, reset behavior, and allocation freedom.
+
 ## Key Insights
 
 ### 1. The bottleneck is small-matrix GEMM
@@ -203,11 +238,10 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The allocation-free backend covers the batched matrix path. The measured NEON
-and AVX2/FMA small-matrix prototypes did not clear the retention threshold.
-The fused Conv1d tap prototype also regressed on both backend families.
-Further A1 work requires a complete packed-weight matrix kernel or a different
-path with more than 10% achievable full-callback headroom.
+The packed A1 Conv1d backend now covers the dominant 16x16 and 8x8 matrix
+shapes on ARM64 and AVX2/FMA x86-64. Further A1 work should profile the
+remaining activation, residual, and layer-head paths against this lower
+Conv1d baseline before selecting another target.
 
 ## Real-world impact of the performance gap
 

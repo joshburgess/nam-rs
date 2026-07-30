@@ -885,8 +885,8 @@ mod tests {
     //   wavenet:              1.19e-07  (f32 precision floor)
     //   wavenet_condition_dsp: 8.94e-08  (f32 precision floor)
     //   lstm:                 8.94e-08  (f32 precision floor)
-    //   wavenet_a1_standard:  6.42e-07  (f32 precision floor for 20-layer model)
-    //   my_model:             6.42e-07  (same architecture as a1_standard)
+    //   wavenet_a1_standard:  7.97e-07 ARM, 1.02e-06 x86 (packed SIMD order)
+    //   my_model:             same architecture and measured limits
     //   wavenet_a2_max:       7.15e-06  (deep network with condition_dsp)
     //
     // Thresholds are set slightly above actual values to allow for
@@ -935,7 +935,14 @@ mod tests {
             // this 20-layer recurrent model while remaining within f32 accuracy.
             #[cfg(feature = "faer")]
             let limit = 4.0e-06;
-            #[cfg(not(feature = "faer"))]
+            #[cfg(all(not(feature = "faer"), target_arch = "aarch64"))]
+            let limit = 8.5e-07;
+            #[cfg(all(not(feature = "faer"), target_arch = "x86_64"))]
+            let limit = 1.1e-06;
+            #[cfg(all(
+                not(feature = "faer"),
+                not(any(target_arch = "aarch64", target_arch = "x86_64"))
+            ))]
             let limit = 7.0e-07;
             assert!(
                 max_diff <= limit,
@@ -949,7 +956,14 @@ mod tests {
         if let Some((max_diff, _rms)) = regression_compare("my_model") {
             #[cfg(feature = "faer")]
             let limit = 4.0e-06;
-            #[cfg(not(feature = "faer"))]
+            #[cfg(all(not(feature = "faer"), target_arch = "aarch64"))]
+            let limit = 8.5e-07;
+            #[cfg(all(not(feature = "faer"), target_arch = "x86_64"))]
+            let limit = 1.1e-06;
+            #[cfg(all(
+                not(feature = "faer"),
+                not(any(target_arch = "aarch64", target_arch = "x86_64"))
+            ))]
             let limit = 7.0e-07;
             assert!(
                 max_diff <= limit,

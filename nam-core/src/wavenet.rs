@@ -5,8 +5,10 @@ use crate::util::{
     checked_dimension_add, checked_dimension_mul, config_usize, positive_config_usize, WeightIter,
 };
 
+mod a1_conv_backend;
 mod matrix_backend;
 
+use a1_conv_backend::PackedA1Conv;
 use matrix_backend::{MatrixLayout, SGEMM_MIN_SIZE};
 
 // ── Gating mode ─────────────────────────────────────────────────────────────
@@ -414,6 +416,7 @@ enum Conv1dWeights {
 /// Weight stored per kernel tap in column-major order matching Eigen.
 struct Conv1d {
     weights: Conv1dWeights,
+    packed_a1: Option<PackedA1Conv>,
     bias: Vec<f32>,
     kernel_size: usize,
     dilation: usize,
@@ -557,6 +560,12 @@ impl Conv1d {
         } else {
             vec![0.0; out_channels]
         };
+        let packed_a1 = match &weights {
+            Conv1dWeights::General(taps) if groups == 1 => {
+                PackedA1Conv::new(out_channels, in_channels, taps)
+            }
+            _ => None,
+        };
 
         // Build flat weights for C FFI
         #[cfg(feature = "fast-kernels")]
@@ -581,6 +590,7 @@ impl Conv1d {
 
         Ok(Self {
             weights,
+            packed_a1,
             bias,
             kernel_size,
             dilation,
@@ -606,6 +616,9 @@ impl Conv1d {
     fn set_max_buffer_size(&mut self, max_buffer_size: usize) {
         let rf = self.receptive_field();
         self.matrix_layout.set_max_buffer_size(max_buffer_size);
+        if let Some(packed_a1) = &mut self.packed_a1 {
+            packed_a1.set_max_buffer_size(max_buffer_size);
+        }
         self.input_buffer.set_max_lookback(rf);
         self.input_buffer.reset(self.in_channels, max_buffer_size);
         self.output_buf.resize(self.out_channels, max_buffer_size);
@@ -623,6 +636,24 @@ impl Conv1d {
         let in_ch = self.in_channels;
         let ks = self.kernel_size;
         let dil = self.dilation;
+
+        if let Some(packed_a1) = &mut self.packed_a1 {
+            let right_offsets = core::array::from_fn(|k| {
+                let offset_signed = dil as isize * (k as isize + 1 - ks as isize);
+                self.input_buffer.read_offset((-offset_signed) as usize)
+            });
+            if packed_a1.process(
+                num_frames,
+                &self.input_buffer.storage,
+                right_offsets,
+                in_ch,
+                &self.bias,
+                &mut self.output_buf.data,
+            ) {
+                self.input_buffer.advance(num_frames);
+                return;
+            }
+        }
 
         // Fast-kernels path: single C FFI call for the entire Conv1d
         #[cfg(feature = "fast-kernels")]
