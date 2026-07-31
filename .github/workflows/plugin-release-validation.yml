@@ -1,0 +1,358 @@
+name: Plugin Release Validation
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
+
+jobs:
+  validate:
+    name: Validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-arm64
+            validator_platform: macos
+            trainer_bin: nam-trainer
+            pluginval_bin: validator-tools/pluginval/pluginval.app/Contents/MacOS/pluginval
+            clap_validator_bin: validator-tools/clap-validator/clap-validator
+          - os: windows-latest
+            platform: windows-x86_64
+            validator_platform: windows
+            trainer_bin: nam-trainer.exe
+            pluginval_bin: validator-tools/pluginval/pluginval.exe
+            clap_validator_bin: validator-tools/clap-validator/clap-validator.exe
+          # Ubuntu 22.04 keeps release binaries compatible with glibc 2.35.
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            validator_platform: linux
+            trainer_bin: nam-trainer
+            pluginval_bin: validator-tools/pluginval/pluginval
+            clap_validator_bin: validator-tools/clap-validator/clap-validator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev xvfb
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-release-validation-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify plugin feature defaults
+        run: python scripts/check_plugin_features.py
+
+      - name: Run release plugin regressions
+        run: cargo test --release -p nam-core -p nam-plugin
+
+      - name: Bundle portable plugin fallback
+        run: cargo xtask bundle nam-plugin --release --no-default-features
+
+      - name: Preserve portable bundles (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p validation/portable
+          cp -R target/bundled/. validation/portable/
+
+      - name: Preserve portable bundles (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path validation/portable | Out-Null
+          Copy-Item -Recurse target/bundled/* validation/portable/
+
+      - name: Inspect portable plugin binaries
+        run: python scripts/check_release_artifacts.py validation/portable
+
+      - name: Bundle optimized plugin
+        run: cargo xtask bundle nam-plugin --release
+
+      - name: Preserve optimized bundles (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p validation/release
+          cp -R target/bundled/. validation/release/
+
+      - name: Preserve optimized bundles (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path validation/release | Out-Null
+          Copy-Item -Recurse target/bundled/* validation/release/
+
+      - name: Inspect optimized plugin binaries
+        run: python scripts/check_release_artifacts.py validation/release
+
+      - name: Install pinned plugin validators
+        run: >-
+          python scripts/install_plugin_validators.py
+          --platform ${{ matrix.validator_platform }}
+          --destination validator-tools
+
+      - name: Prepare validation diagnostics (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: mkdir -p validator-logs/{portable,release}/pluginval-results crash-dumps
+
+      - name: Prepare validation diagnostics (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path validator-logs/portable/pluginval-results | Out-Null
+          New-Item -ItemType Directory -Force -Path validator-logs/release/pluginval-results | Out-Null
+          New-Item -ItemType Directory -Force -Path crash-dumps | Out-Null
+          $dumps = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Path $dumps -Force | Out-Null
+          New-ItemProperty -Path $dumps -Name DumpFolder -Value "$PWD\crash-dumps" -PropertyType ExpandString -Force | Out-Null
+          New-ItemProperty -Path $dumps -Name DumpType -Value 2 -PropertyType DWord -Force | Out-Null
+
+      - name: Enable Linux core dumps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo sysctl -w kernel.core_pattern="$PWD/crash-dumps/core.%e.%p"
+
+      - name: Validate portable VST3 with pluginval (Linux)
+        id: pluginval_portable_linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          ulimit -c unlimited
+          python scripts/run_with_timeout.py \
+            --timeout-seconds 900 \
+            --log validator-logs/portable/pluginval.log \
+            -- xvfb-run -a "${{ matrix.pluginval_bin }}" \
+            --strictness-level 10 \
+            --timeout-ms 120000 \
+            --skip-gui-tests \
+            --sample-rates 44100,48000,96000 \
+            --block-sizes 1,17,64,127,512,1024 \
+            --random-seed 0x4e414d \
+            --output-dir validator-logs/portable/pluginval-results \
+            validation/portable/nam-plugin.vst3
+
+      - name: Validate portable VST3 with pluginval
+        id: pluginval_portable_other
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log validator-logs/portable/pluginval.log
+          -- "${{ matrix.pluginval_bin }}"
+          --strictness-level 10
+          --timeout-ms 120000
+          --skip-gui-tests
+          --sample-rates 44100,48000,96000
+          --block-sizes 1,17,64,127,512,1024
+          --random-seed 0x4e414d
+          --output-dir validator-logs/portable/pluginval-results
+          validation/portable/nam-plugin.vst3
+
+      - name: Validate optimized VST3 with pluginval (Linux)
+        id: pluginval_release_linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          ulimit -c unlimited
+          python scripts/run_with_timeout.py \
+            --timeout-seconds 900 \
+            --log validator-logs/release/pluginval.log \
+            -- xvfb-run -a "${{ matrix.pluginval_bin }}" \
+            --strictness-level 10 \
+            --timeout-ms 120000 \
+            --skip-gui-tests \
+            --sample-rates 44100,48000,96000 \
+            --block-sizes 1,17,64,127,512,1024 \
+            --random-seed 0x4e414d \
+            --output-dir validator-logs/release/pluginval-results \
+            validation/release/nam-plugin.vst3
+
+      - name: Validate optimized VST3 with pluginval
+        id: pluginval_release_other
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log validator-logs/release/pluginval.log
+          -- "${{ matrix.pluginval_bin }}"
+          --strictness-level 10
+          --timeout-ms 120000
+          --skip-gui-tests
+          --sample-rates 44100,48000,96000
+          --block-sizes 1,17,64,127,512,1024
+          --random-seed 0x4e414d
+          --output-dir validator-logs/release/pluginval-results
+          validation/release/nam-plugin.vst3
+
+      - name: Validate portable CLAP bundle
+        id: clap_portable
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log validator-logs/portable/clap-validator.log
+          -- "${{ matrix.clap_validator_bin }}"
+          validate --jobs 1
+          validation/portable/nam-plugin.clap
+
+      - name: Validate optimized CLAP bundle
+        id: clap_release
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log validator-logs/release/clap-validator.log
+          -- "${{ matrix.clap_validator_bin }}"
+          validate --jobs 1
+          validation/release/nam-plugin.clap
+
+      - name: Upload validator diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-validation-${{ matrix.platform }}
+          if-no-files-found: ignore
+          path: |
+            validator-logs/
+            crash-dumps/
+            ~/Library/Logs/DiagnosticReports/pluginval*
+            ~/Library/Logs/DiagnosticReports/clap-validator*
+
+      - name: Enforce validator success
+        if: >-
+          always() &&
+          (steps.pluginval_portable_linux.outcome == 'failure' ||
+          steps.pluginval_portable_other.outcome == 'failure' ||
+          steps.pluginval_release_linux.outcome == 'failure' ||
+          steps.pluginval_release_other.outcome == 'failure' ||
+          steps.clap_portable.outcome == 'failure' ||
+          steps.clap_release.outcome == 'failure')
+        run: exit 1
+
+      - name: Measure portable A1 callback
+        run: >-
+          cargo bench -p nam-plugin --no-default-features
+          --features benchmark-internals --bench callback
+          -- a1_accurate_complete_plugin_callback
+
+      - name: Preserve portable measurements (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p profiles/portable
+          mv target/criterion/a1_accurate_complete_plugin_callback profiles/portable/
+
+      - name: Preserve portable measurements (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path profiles/portable | Out-Null
+          Move-Item target/criterion/a1_accurate_complete_plugin_callback profiles/portable/
+
+      - name: Measure optimized A1 callback
+        run: >-
+          cargo bench -p nam-plugin --features benchmark-internals
+          --bench callback -- a1_accurate_complete_plugin_callback
+
+      - name: Preserve optimized measurements (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p profiles/release
+          mv target/criterion/a1_accurate_complete_plugin_callback profiles/release/
+
+      - name: Preserve optimized measurements (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path profiles/release | Out-Null
+          Move-Item target/criterion/a1_accurate_complete_plugin_callback profiles/release/
+
+      - name: Enforce optimized callback speedup
+        run: >-
+          python scripts/check_callback_speedup.py
+          profiles/portable profiles/release
+
+      - name: Upload release measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-callback-${{ matrix.platform }}
+          path: profiles/
+
+      - name: Build trainer
+        run: cargo build --release -p nam-trainer
+
+      - name: Smoke test trainer (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          xvfb-run -a bash -c "
+            ./target/release/${{ matrix.trainer_bin }} &
+            pid=\$!
+            sleep 5
+            if kill -0 \$pid 2>/dev/null; then
+              kill \$pid
+              echo 'Trainer stayed alive for 5s'
+              exit 0
+            fi
+            echo 'Trainer died before 5s'
+            wait \$pid
+            exit 1
+          "
+
+      - name: Package validated artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release-staging
+          cp "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}"
+          cd validation/release
+          for plugin in *.clap *.vst3; do
+            [ -e "$plugin" ] || continue
+            ext="${plugin##*.}"
+            zip -r "../../release-staging/nam-plugin-${{ matrix.platform }}-${ext}.zip" "$plugin"
+          done
+
+      - name: Package validated artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-staging | Out-Null
+          Copy-Item "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}.exe"
+          Compress-Archive -Path "validation/release/nam-plugin.clap" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-clap.zip" -Force
+          Compress-Archive -Path "validation/release/nam-plugin.vst3" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-vst3.zip" -Force
+
+      - name: Upload validated release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-package-${{ matrix.platform }}
+          path: release-staging/

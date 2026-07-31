@@ -1,0 +1,44 @@
+{
+  "pluginval": {
+    "version": "1.0.4",
+    "source_commit": "ed19c2c16b57a6d94db391bea3ef4a80b769d5bf",
+    "platforms": {
+      "linux": {
+        "url": "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Linux.zip",
+        "sha256": "c01c49d8063965c4c2dea8324468336768f5c9139e0b1caebde14c2400b55352",
+        "executable": "pluginval"
+      },
+      "macos": {
+        "url": "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_macOS.zip",
+        "sha256": "3c4c533bda0c5059eea3ddaea752d757ee2025041f0f47e6bcb0e87f6082b29f",
+        "executable": "pluginval.app/Contents/MacOS/pluginval"
+      },
+      "windows": {
+        "url": "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip",
+        "sha256": "c08e61ce3b96db41636f8ec7e76f4c7e2c13ebdac7fa1b5a1f52b4f32ec715ab",
+        "executable": "pluginval.exe"
+      }
+    }
+  },
+  "clap-validator": {
+    "version": "0.4.1",
+    "source_commit": "152b9823e992d782c5c1fd33bca0295478b919aa",
+    "platforms": {
+      "linux": {
+        "url": "https://github.com/free-audio/clap-validator/releases/download/0.4.1/clap-validator-0.4.1-127-g152b982-ubuntu-22.04.zip",
+        "sha256": "49edadcfb407ea0dd946ce418300e853fbd2660fa4b0d00e4f19ff8eef24ad90",
+        "executable": "clap-validator"
+      },
+      "macos": {
+        "url": "https://github.com/free-audio/clap-validator/releases/download/0.4.1/clap-validator-0.4.1-127-g152b982-macos-15-aarch64.zip",
+        "sha256": "719a0248ea431718bb7c92c8a0b9a78afa0bb23d692cf452e80973fe8b89282d",
+        "executable": "clap-validator"
+      },
+      "windows": {
+        "url": "https://github.com/free-audio/clap-validator/releases/download/0.4.1/clap-validator-0.4.1-127-g152b982-windows.zip",
+        "sha256": "d935c3af0a45c3911ea2e900f4aa5d6709dac82bb485f0c4ce28648ab2cd0c10",
+        "executable": "clap-validator.exe"
+      }
+    }
+  }
+}
