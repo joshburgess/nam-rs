@@ -24,7 +24,8 @@ jobs:
             trainer_bin: nam-trainer
             pluginval_bin: validator-tools/pluginval/pluginval.app/Contents/MacOS/pluginval
             clap_validator_bin: validator-tools/clap-validator/clap-validator
-          - os: windows-latest
+          # Pluginval 1.0.4 predates the Windows Server 2025 runner image.
+          - os: windows-2022
             platform: windows-x86_64
             validator_platform: windows
             trainer_bin: nam-trainer.exe
@@ -233,6 +234,19 @@ jobs:
           -- "${{ matrix.clap_validator_bin }}"
           validate --jobs 1
           validation/release/nam-plugin.clap
+
+      - name: Collect Windows crash events
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            StartTime = (Get-Date).AddHours(-2)
+          } -ErrorAction SilentlyContinue)
+          $events |
+            Where-Object ProviderName -In 'Application Error', 'Windows Error Reporting' |
+            Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message |
+            Out-File validator-logs/windows-crashes.txt
 
       - name: Upload validator diagnostics
         if: always()
