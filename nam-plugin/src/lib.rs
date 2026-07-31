@@ -409,6 +409,7 @@ fn mute_non_finite(samples: &mut [nam_core::Sample]) -> bool {
 pub mod benchmark {
     use super::{LoadedModel, NamPlugin, ProcessStatus, ResamplerState};
     use nih_plug::prelude::Buffer;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
     struct PassthroughDsp;
@@ -491,6 +492,38 @@ pub mod benchmark {
                 self.plugin.process_buffer(&mut buffer),
                 ProcessStatus::Normal
             );
+        }
+
+        pub fn new_a2(buffer_size: usize) -> Result<Self, nam_core::NamError> {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../nam-core/test_fixtures/models/wavenet_a2_max.nam");
+            let mut dsp = nam_core::get_dsp(&path)?;
+            let sample_rate = dsp.metadata().expected_sample_rate.unwrap_or(48_000.0);
+            dsp.reset(sample_rate, buffer_size);
+            dsp.prewarm();
+
+            let mut plugin = NamPlugin::new(false);
+            plugin.model = Some(LoadedModel {
+                generation: 1,
+                dsp,
+                resampler: None,
+                applied_model_size: None,
+            });
+            plugin.latest_generation.store(1, Ordering::Release);
+            plugin.installed_generation.store(1, Ordering::Release);
+            plugin.input_buf = vec![0.0; buffer_size];
+            plugin.output_buf = vec![0.0; buffer_size];
+            plugin.sample_rate = sample_rate;
+            plugin.max_buffer_size = buffer_size;
+
+            let mut case = Self {
+                plugin,
+                audio: vec![0.25; buffer_size],
+            };
+            for _ in 0..4 {
+                case.process();
+            }
+            Ok(case)
         }
     }
 }

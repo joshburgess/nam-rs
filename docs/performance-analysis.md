@@ -446,6 +446,53 @@ oracles cover every grouped shape, optional bias, strided input, and the
 out-of-place and in-place fused FiLM paths. Complete render, streaming,
 reset, and plugin allocation tests pass.
 
+### Remaining grouped A2 FiLM evaluation
+
+A fresh Apple M4 profile after the grouped Conv1x1 work attributed 26.9% of
+the A2 callback to grouped Conv1x1, 11.1% to small grouped Conv1d, 7.0% to
+dense small Conv1x1, 6.2% to gated activation, and 5.5% to the retained
+16x8/g4 fused FiLM path.
+
+The maintained A2 fixture executes ten remaining grouped FiLM projections per
+callback:
+
+| Layout | Calls | Sites |
+|-------:|------:|-------|
+| 8x8/g2 | 6 | `conv_pre`, `input_mixin_post`, `activation_post` |
+| 8x8/g4 | 4 | `conv_post`, `head1x1_post` |
+| 8x8/g8 | 0 | Configured at `layer1x1_post`, disabled by `gating = None` |
+
+An allocation-free prototype fused each compact grouped projection directly
+with scale and shift. It covered out-of-place, strided, and in-place
+processing without constructing the intermediate Conv1x1 output. Matched core
+DSP benchmarks measured:
+
+| Frames | Existing path | Fused path | Improvement |
+|-------:|--------------:|-----------:|------------:|
+| 16 | 5.508 us | 5.103 us | 7.4% |
+| 32 | 10.420 us | 9.755 us | 6.4% |
+| 64 | 20.077 us | 18.927 us | 5.7% |
+| 128 | 39.718 us | 37.895 us | 4.6% |
+| 256 | 79.447 us | 74.675 us | 6.0% |
+
+The complete plugin callback benchmark, including buffer conversion, gain,
+model processing, and output handling, reduced the candidate's effect further.
+Its stable 16, 32, 64, and 128-frame measurements improved by 2.4%, 3.6%,
+3.8%, and 3.5%. The 256-frame run was discarded after its confidence interval
+and nonlinear timing exposed thermal instability. The stable core DSP result
+at that size was 6.0%.
+
+Forced inlining, exact g2/g4 specializations, transposed weights, a shared
+aliasing entry point, and a larger fusion spanning both FiLM stages were also
+tested. Each regressed relative to the compact block helper or to the
+existing path. Reorganizing the retained 16x8/g4 loop produced no clear
+improvement.
+
+The best candidate failed the required 10% complete-callback improvement at
+every stable size, so all production kernel and dispatch changes were removed.
+The complete A2 plugin callback Criterion benchmark remains as a reusable gate
+for future work.
+
 ### Accurate Linux activation backend
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point

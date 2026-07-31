@@ -2685,6 +2685,7 @@ dependencies = [
 name = "nam-plugin"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "crossbeam-queue",
  "iai-callgrind",
  "nam-core",
