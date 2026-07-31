@@ -1613,6 +1613,26 @@ mod tests {
     }
 
     #[test]
+    fn accurate_fused_tanh_matches_scalar_across_range() {
+        let _ = super::init_vector_math();
+        let left = (-10_000..=10_000)
+            .map(|index| index as f32 * 0.001)
+            .collect::<Vec<_>>();
+        let right = vec![0.0; left.len()];
+        let mut actual = vec![0.0; left.len()];
+
+        super::add_activate(&mut actual, &left, &right, left.len(), false);
+
+        for (index, (&actual, &input)) in actual.iter().zip(&left).enumerate() {
+            let expected = input.tanh();
+            assert!(
+                (actual - expected).abs() <= 1.2e-7,
+                "output {index} for {input}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
     fn accurate_fused_tanh_handles_special_values() {
         let _ = super::init_vector_math();
         let left = [

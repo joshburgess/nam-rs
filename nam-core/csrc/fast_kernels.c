@@ -15,11 +15,98 @@
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #if defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #define NAM_GLIBC_VECTOR_TANH 1
+#endif
+#if (defined(__x86_64__) || defined(_M_X64)) && \
+    (defined(_WIN32) || (defined(__linux__) && !defined(__GLIBC__))) && \
+    !defined(NAM_DISABLE_PORTABLE_VECTOR_TANH)
+#define NAM_PORTABLE_VECTOR_TANH 1
+#endif
+
+#if defined(NAM_PORTABLE_VECTOR_TANH)
+/* Adapted from SLEEF 3.9.0, copyright Naoki Shibata and contributors
+ * 2010-2025. See third-party/SLEEF-LICENSE.txt. */
+static __m128 nam_expm1f4_sse2(__m128 input) {
+    const __m128 reciprocal_ln2 = _mm_set1_ps(1.4426950408889634f);
+    const __m128 ln2_upper = _mm_set1_ps(-0.693145751953125f);
+    const __m128 ln2_lower = _mm_set1_ps(-1.428606765330187e-6f);
+    __m128i exponent = _mm_cvtps_epi32(_mm_mul_ps(input, reciprocal_ln2));
+    __m128 exponent_f = _mm_cvtepi32_ps(exponent);
+    __m128 reduced = _mm_add_ps(_mm_mul_ps(exponent_f, ln2_upper), input);
+    reduced = _mm_add_ps(_mm_mul_ps(exponent_f, ln2_lower), reduced);
+
+    __m128 reduced2 = _mm_mul_ps(reduced, reduced);
+    __m128 reduced4 = _mm_mul_ps(reduced2, reduced2);
+    __m128 polynomial2 = _mm_add_ps(
+        _mm_mul_ps(reduced, _mm_set1_ps(0.00019852761761285365f)),
+        _mm_set1_ps(0.0013930435525253415f));
+    __m128 polynomial4 = _mm_add_ps(
+        _mm_mul_ps(
+            reduced2,
+            _mm_add_ps(
+                _mm_mul_ps(reduced, _mm_set1_ps(0.008333360776305199f)),
+                _mm_set1_ps(0.041666485369205475f))),
+        _mm_add_ps(
+            _mm_mul_ps(reduced, _mm_set1_ps(0.1666666716337204f)),
+            _mm_set1_ps(0.5f)));
+    __m128 polynomial = _mm_add_ps(_mm_mul_ps(reduced4, polynomial2), polynomial4);
+    __m128 expm1_reduced = _mm_add_ps(
+        _mm_mul_ps(reduced2, polynomial),
+        reduced);
+
+    __m128i half_exponent = _mm_srli_epi32(exponent, 1);
+    __m128i remaining_exponent = _mm_sub_epi32(exponent, half_exponent);
+    __m128 scale1 = _mm_castsi128_ps(
+        _mm_slli_epi32(_mm_add_epi32(half_exponent, _mm_set1_epi32(127)), 23));
+    __m128 scale2 = _mm_castsi128_ps(
+        _mm_slli_epi32(_mm_add_epi32(remaining_exponent, _mm_set1_epi32(127)), 23));
+    __m128 scaled = _mm_sub_ps(
+        _mm_mul_ps(_mm_mul_ps(_mm_add_ps(expm1_reduced, _mm_set1_ps(1.0f)), scale1), scale2),
+        _mm_set1_ps(1.0f));
+    __m128 exponent_is_zero = _mm_castsi128_ps(
+        _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
+    return _mm_or_ps(
+        _mm_and_ps(exponent_is_zero, expm1_reduced),
+        _mm_andnot_ps(exponent_is_zero, scaled));
+}
+
+static __m128 nam_tanhf4_sse2(__m128 input) {
+    const __m128 sign_mask = _mm_set1_ps(-0.0f);
+    const __m128 saturation = _mm_set1_ps(8.664339742f);
+    __m128 magnitude = _mm_andnot_ps(sign_mask, input);
+    __m128 bounded = _mm_min_ps(magnitude, saturation);
+    __m128 expm1 = nam_expm1f4_sse2(_mm_add_ps(bounded, bounded));
+    __m128 result = _mm_div_ps(expm1, _mm_add_ps(_mm_set1_ps(2.0f), expm1));
+    __m128 saturated = _mm_cmpgt_ps(magnitude, saturation);
+    result = _mm_or_ps(
+        _mm_and_ps(saturated, _mm_set1_ps(1.0f)),
+        _mm_andnot_ps(saturated, result));
+    result = _mm_xor_ps(result, _mm_and_ps(input, sign_mask));
+    return _mm_or_ps(result, _mm_cmpunord_ps(input, input));
+}
+
+static size_t nam_add_tanh_portable_sse2(
+    float *restrict output,
+    const float *restrict left,
+    const float *restrict right,
+    size_t len
+) {
+    size_t offset = 0;
+    for (; offset + 4 <= len; offset += 4) {
+        __m128 left_values = _mm_loadu_ps(left + offset);
+        __m128 right_values = _mm_loadu_ps(right + offset);
+        __m128 result = nam_tanhf4_sse2(_mm_add_ps(left_values, right_values));
+        _mm_storeu_ps(output + offset, result);
+    }
+    return offset;
+}
 #endif
 
 #if defined(NAM_GLIBC_VECTOR_TANH)
@@ -70,6 +157,10 @@ static size_t nam_add_tanh_sse2(
     return offset;
 }
 
+#elif defined(NAM_PORTABLE_VECTOR_TANH)
+int fast_init_vector_math(void) {
+    return 1;
+}
 #else
 int fast_init_vector_math(void) {
     return 0;
@@ -358,6 +449,15 @@ void fast_add_activate(
                 len - offset,
                 tanh4);
         }
+        for (; offset < len; offset++) {
+            z_out[offset] = tanhf(conv_out[offset] + mixin_out[offset]);
+        }
+#elif defined(NAM_PORTABLE_VECTOR_TANH)
+        size_t offset = nam_add_tanh_portable_sse2(
+            z_out,
+            conv_out,
+            mixin_out,
+            len);
         for (; offset < len; offset++) {
             z_out[offset] = tanhf(conv_out[offset] + mixin_out[offset]);
         }
