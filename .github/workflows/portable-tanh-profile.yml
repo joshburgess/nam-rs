@@ -2,6 +2,35 @@ name: Portable Tanh Profile
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/portable-tanh-profile.yml
+      - nam-core/Cargo.toml
+      - nam-core/build.rs
+      - nam-core/csrc/fast_kernels.c
+      - nam-core/src/fast_kernels.rs
+      - nam-core/src/wavenet.rs
+      - nam-plugin/Cargo.toml
+      - nam-plugin/benches/callback.rs
+      - nam-plugin/benches/callback_instructions.rs
+      - nam-plugin/src/lib.rs
+      - scripts/check_callback_speedup.py
+      - scripts/check_callgrind_speedup.py
+  pull_request:
+    paths:
+      - .github/workflows/portable-tanh-profile.yml
+      - nam-core/Cargo.toml
+      - nam-core/build.rs
+      - nam-core/csrc/fast_kernels.c
+      - nam-core/src/fast_kernels.rs
+      - nam-core/src/wavenet.rs
+      - nam-plugin/Cargo.toml
+      - nam-plugin/benches/callback.rs
+      - nam-plugin/benches/callback_instructions.rs
+      - nam-plugin/src/lib.rs
+      - scripts/check_callback_speedup.py
+      - scripts/check_callgrind_speedup.py
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +58,9 @@ jobs:
           cargo bench -p nam-plugin --features benchmark-internals,nam-core/fast-kernels --bench callback -- a1_accurate_complete_plugin_callback
           New-Item -ItemType Directory -Force -Path profiles/vector | Out-Null
           Copy-Item target/criterion/a1_accurate_complete_plugin_callback profiles/vector -Recurse
+
+      - name: Enforce callback performance gate
+        run: python scripts/check_callback_speedup.py profiles/scalar profiles/vector
 
       - name: Verify render parity and allocation behavior
         run: |
@@ -58,7 +90,7 @@ jobs:
             rust:1.97-alpine \
             sh -c '
               apk add --no-cache \
-                build-base clang cmake git pkgconf valgrind-dev \
+                build-base clang cmake git pkgconf valgrind valgrind-dev \
                 libx11-dev libxcb-dev mesa-dev libxcursor-dev \
                 libxrandr-dev libxi-dev libxinerama-dev \
                 wayland-dev libxkbcommon-dev &&
@@ -75,6 +107,29 @@ jobs:
                 --bench callback -- a1_accurate_complete_plugin_callback &&
               cp -R target/criterion/a1_accurate_complete_plugin_callback \
                 profiles/vector/ &&
+              python3 scripts/check_callback_speedup.py \
+                profiles/scalar profiles/vector &&
+              NAM_DISABLE_PORTABLE_VECTOR_TANH=1 \
+                cargo build --release -p nam-plugin \
+                  --features benchmark-internals,nam-core/fast-kernels \
+                  --bench callback_instructions &&
+              callback_executable=$(find target/release/deps -maxdepth 1 \
+                -type f -name "callback_instructions-*" -perm -111 | head -n 1) &&
+              test -n "$callback_executable" &&
+              valgrind --tool=callgrind --quiet \
+                --callgrind-out-file=profiles/scalar.callgrind \
+                "$callback_executable" &&
+              cargo build --release -p nam-plugin \
+                --features benchmark-internals,nam-core/fast-kernels \
+                --bench callback_instructions &&
+              callback_executable=$(find target/release/deps -maxdepth 1 \
+                -type f -name "callback_instructions-*" -perm -111 | head -n 1) &&
+              test -n "$callback_executable" &&
+              valgrind --tool=callgrind --quiet \
+                --callgrind-out-file=profiles/vector.callgrind \
+                "$callback_executable" &&
+              python3 scripts/check_callgrind_speedup.py \
+                profiles/scalar.callgrind profiles/vector.callgrind &&
               cargo test --release -p nam-core --lib \
                 get_dsp::tests::test_regression_wavenet_a1_standard \
                 --features fast-kernels &&

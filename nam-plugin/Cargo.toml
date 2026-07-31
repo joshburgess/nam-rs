@@ -24,6 +24,11 @@ name = "callback"
 harness = false
 required-features = ["benchmark-internals"]
 
+[[bench]]
+name = "callback_instructions"
+harness = false
+required-features = ["benchmark-internals"]
+
 [dependencies]
 crossbeam-queue = "0.3"
 nam-core = { version = "0.1.0", path = "../nam-core" }
