@@ -60,6 +60,11 @@ jobs:
       - name: Verify plugin feature defaults
         run: python scripts/check_plugin_features.py
 
+      - name: Enable Windows crash symbols
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"RUSTFLAGS=$env:RUSTFLAGS -C debuginfo=1" >> $env:GITHUB_ENV'
+
       - name: Run release plugin regressions
         run: cargo test --release -p nam-core -p nam-plugin
 
@@ -79,6 +84,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path validation/portable | Out-Null
           Copy-Item -Recurse target/bundled/* validation/portable/
+          Get-ChildItem target/release -Filter *.pdb |
+            Copy-Item -Destination validation/portable/
 
       - name: Inspect portable plugin binaries
         run: python scripts/check_release_artifacts.py validation/portable
@@ -99,6 +106,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path validation/release | Out-Null
           Copy-Item -Recurse target/bundled/* validation/release/
+          Get-ChildItem target/release -Filter *.pdb |
+            Copy-Item -Destination validation/release/
 
       - name: Inspect optimized plugin binaries
         run: python scripts/check_release_artifacts.py validation/release
@@ -234,6 +243,56 @@ jobs:
           -- "${{ matrix.clap_validator_bin }}"
           validate --jobs 1
           validation/release/nam-plugin.clap
+
+      - name: Install Windows debugger after VST3 crash
+        if: >-
+          runner.os == 'Windows' &&
+          (steps.pluginval_portable_other.outcome == 'failure' ||
+          steps.pluginval_release_other.outcome == 'failure')
+        shell: pwsh
+        run: >-
+          choco install windows-sdk-10-version-2004-windbg
+          --version 10.0.19041.685 --yes --no-progress
+
+      - name: Capture Windows VST3 crash stacks
+        if: >-
+          runner.os == 'Windows' &&
+          (steps.pluginval_portable_other.outcome == 'failure' ||
+          steps.pluginval_release_other.outcome == 'failure')
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $cdb = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if (-not (Test-Path $cdb)) {
+            throw "cdb.exe was not installed at $cdb"
+          }
+
+          $pluginval = (Resolve-Path '${{ matrix.pluginval_bin }}').Path
+          $common = @(
+            '--strictness-level', '10',
+            '--timeout-ms', '120000',
+            '--skip-gui-tests',
+            '--sample-rates', '44100,48000,96000',
+            '--block-sizes', '1,17,64,127,512,1024',
+            '--random-seed', '0x4e414d'
+          )
+
+          foreach ($variant in 'portable', 'release') {
+            $bundle = (Resolve-Path "validation/$variant/nam-plugin.vst3").Path
+            $symbols = (Resolve-Path "validation/$variant").Path
+            $commands = @"
+          .symfix
+          .sympath+ $symbols
+          sxe -c ".ecxr; .reload /f; kv; lm; q" av
+          g
+          "@
+            $commandFile = "validator-logs/$variant/cdb-commands.txt"
+            Set-Content -Path $commandFile -Value $commands
+            python scripts/run_with_timeout.py `
+              --timeout-seconds 180 `
+              --log "validator-logs/$variant/cdb.log" `
+              -- $cdb -o -g -G -cf $commandFile $pluginval @common $bundle
+          }
 
       - name: Collect Windows crash events
         if: always() && runner.os == 'Windows'
