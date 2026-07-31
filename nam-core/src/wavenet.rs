@@ -963,6 +963,7 @@ impl Conv1d {
         self.input_buffer.advance(num_frames);
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[cfg(not(feature = "fast-kernels"))]
     fn process_grouped_12x3_k2_with_films_and_mixin(
         &mut self,
