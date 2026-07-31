@@ -58,11 +58,11 @@ jobs:
             rust:1.97-alpine \
             sh -c '
               apk add --no-cache \
-                build-base clang clang22-libclang cmake git pkgconf valgrind-dev \
+                build-base clang cmake git pkgconf valgrind-dev \
                 libx11-dev libxcb-dev mesa-dev libxcursor-dev \
                 libxrandr-dev libxi-dev libxinerama-dev \
                 wayland-dev libxkbcommon-dev &&
-              export LIBCLANG_PATH=/usr/lib/llvm22/lib &&
+              export RUSTFLAGS="$RUSTFLAGS -C target-feature=-crt-static" &&
               NAM_DISABLE_PORTABLE_VECTOR_TANH=1 \
                 cargo bench -p nam-plugin \
                   --features benchmark-internals,nam-core/fast-kernels \
