@@ -258,7 +258,8 @@ impl Default for NamParams {
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
             .with_step_size(0.01)
-            .with_value_to_string(formatters::v2s_f32_percentage(0)),
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
 
             model_path: Mutex::new(String::new()),
         }

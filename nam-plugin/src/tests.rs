@@ -682,6 +682,16 @@ fn packed_a2_model_size_parameter_is_persisted() {
 }
 
 #[test]
+fn packed_a2_model_size_text_conversion_roundtrips() {
+    let params = NamParams::default();
+    let formatted = params.model_size.normalized_value_to_string(0.55, false);
+    let parsed = params.model_size.string_to_normalized_value(&formatted);
+
+    assert_eq!(formatted, "55");
+    assert!(parsed.is_some_and(|value| (value - 0.55).abs() < f32::EPSILON));
+}
+
+#[test]
 fn packed_a2_model_size_changes_and_resets_without_allocating() {
     let buffer_size = 128;
     let mut plugin = plugin_with_model_fixture("upstream_packed_a2_export.nam", buffer_size);

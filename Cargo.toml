@@ -1,6 +1,6 @@
 [workspace]
 members = ["nam-core", "nam-cli", "nam-plugin", "nam-trainer", "xtask"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "third-party/nih-plug"]
 resolver = "2"
 
 [workspace.package]
