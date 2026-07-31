@@ -108,6 +108,7 @@ struct NamPlugin {
     load_status: Arc<Mutex<ModelLoadStatus>>,
     audio_error: Arc<AtomicU8>,
     plugin_alive: Arc<AtomicBool>,
+    model_reaper: Option<thread::JoinHandle<()>>,
     input_buf: Vec<nam_core::Sample>,
     output_buf: Vec<nam_core::Sample>,
     sample_rate: f64,
@@ -190,17 +191,25 @@ impl NamPlugin {
     fn new(spawn_model_reaper: bool) -> Self {
         let loaded_models = Arc::new(ArrayQueue::new(1));
         let retired_models = Arc::new(ArrayQueue::new(4));
-        if spawn_model_reaper {
+        let plugin_alive = Arc::new(AtomicBool::new(true));
+        let model_reaper = if spawn_model_reaper {
             let retired_models_weak = Arc::downgrade(&retired_models);
-            let _ = thread::Builder::new()
+            let plugin_alive = plugin_alive.clone();
+            thread::Builder::new()
                 .name("nam-model-reaper".to_string())
                 .spawn(move || {
                     while let Some(retired_models) = retired_models_weak.upgrade() {
                         while retired_models.pop().is_some() {}
+                        if !plugin_alive.load(Ordering::Acquire) {
+                            break;
+                        }
                         thread::park_timeout(Duration::from_millis(10));
                     }
-                });
-        }
+                })
+                .ok()
+        } else {
+            None
+        };
 
         Self {
             params: Arc::new(NamParams::default()),
@@ -212,11 +221,20 @@ impl NamPlugin {
             installed_generation: Arc::new(AtomicU64::new(0)),
             load_status: Arc::new(Mutex::new(ModelLoadStatus::Empty)),
             audio_error: Arc::new(AtomicU8::new(AudioProcessError::None as u8)),
-            plugin_alive: Arc::new(AtomicBool::new(true)),
+            plugin_alive,
+            model_reaper,
             input_buf: Vec::new(),
             output_buf: Vec::new(),
             sample_rate: 48000.0,
             max_buffer_size: 4096,
+        }
+    }
+
+    fn stop_model_reaper(&mut self) {
+        self.plugin_alive.store(false, Ordering::Release);
+        if let Some(model_reaper) = self.model_reaper.take() {
+            model_reaper.thread().unpark();
+            let _ = model_reaper.join();
         }
     }
 }
@@ -859,7 +877,7 @@ impl Plugin for NamPlugin {
 
 impl Drop for NamPlugin {
     fn drop(&mut self) {
-        self.plugin_alive.store(false, Ordering::Release);
+        self.stop_model_reaper();
     }
 }
 

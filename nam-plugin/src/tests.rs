@@ -1,6 +1,16 @@
 use super::*;
 use proptest::prelude::*;
 
+#[test]
+fn model_reaper_is_joined_during_teardown() {
+    let mut plugin = NamPlugin::default();
+    assert!(plugin.model_reaper.is_some());
+
+    plugin.stop_model_reaper();
+
+    assert!(plugin.model_reaper.is_none());
+}
+
 /// A trivial pass-through DSP for testing resampling in isolation.
 struct PassthroughDsp;
 
