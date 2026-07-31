@@ -291,7 +291,7 @@ jobs:
             python scripts/run_with_timeout.py `
               --timeout-seconds 180 `
               --log "validator-logs/$variant/cdb.log" `
-              -- $cdb -o -g -G -cf $commandFile $pluginval @common $bundle
+              -- $cdb -o -cf $commandFile $pluginval @common $bundle
           }
 
       - name: Collect Windows crash events
@@ -316,6 +316,7 @@ jobs:
           path: |
             validator-logs/
             crash-dumps/
+            validation/**/*.pdb
             ~/Library/Logs/DiagnosticReports/pluginval*
             ~/Library/Logs/DiagnosticReports/clap-validator*
 
