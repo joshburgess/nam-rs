@@ -233,6 +233,7 @@ jobs:
       - name: Generate workspace coverage
         run: >-
           cargo llvm-cov --workspace --all-features
+          --ignore-filename-regex 'third-party/nih-plug'
           --fail-under-lines 70
           --lcov --output-path lcov.info
 
