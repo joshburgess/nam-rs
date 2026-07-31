@@ -494,9 +494,10 @@ pub mod benchmark {
             );
         }
 
-        pub fn new_a2(buffer_size: usize) -> Result<Self, nam_core::NamError> {
+        fn new_model(model_name: &str, buffer_size: usize) -> Result<Self, nam_core::NamError> {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../nam-core/test_fixtures/models/wavenet_a2_max.nam");
+                .join("../nam-core/test_fixtures/models")
+                .join(model_name);
             let mut dsp = nam_core::get_dsp(&path)?;
             let sample_rate = dsp.metadata().expected_sample_rate.unwrap_or(48_000.0);
             dsp.reset(sample_rate, buffer_size);
@@ -524,6 +525,14 @@ pub mod benchmark {
                 case.process();
             }
             Ok(case)
+        }
+
+        pub fn new_a1(buffer_size: usize) -> Result<Self, nam_core::NamError> {
+            Self::new_model("wavenet_a1_standard.nam", buffer_size)
+        }
+
+        pub fn new_a2(buffer_size: usize) -> Result<Self, nam_core::NamError> {
+            Self::new_model("wavenet_a2_max.nam", buffer_size)
         }
     }
 }
