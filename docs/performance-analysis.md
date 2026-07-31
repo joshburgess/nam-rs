@@ -66,6 +66,13 @@ The budget files are pinned to Linux x86-64, and the checker rejects attempts
 to apply them on another architecture. Bench profiles retain symbols so a
 budget change can be traced to the functions and source lines that caused it.
 
+Plugin release builds use `fast-kernels` by default. The release configuration
+matrix builds and inspects the VST3 and CLAP bundles on macOS arm64, Windows
+x86-64, and Linux x86-64. It runs the full `nam-core` and `nam-plugin` release
+test suites, then compares the complete A1 callback with the
+`--no-default-features` fallback. Every callback size must retain a conservative
+10% speedup. `nam-core` itself keeps an empty default feature set.
+
 ## Optimization Journey
 
 ### What worked
@@ -493,12 +500,12 @@ every stable size, so all production kernel and dispatch changes were removed.
 
 ### Portable grouped A2 pipeline
 
-The normal plugin build does not enable `fast-kernels`. In that build, the
-grouped 12x3/k2 condition convolution still multiplied the zero blocks in its
-dense matrix representation. The portable specialization retains compact
-weights and fuses that convolution with its rank-one post-FiLM, input mixin,
-activation pre-FiLM, and SiLU/HardSwish gate. Other layers keep their original
-processing order.
+The plugin's `--no-default-features` fallback does not enable `fast-kernels`.
+In that build, the grouped 12x3/k2 condition convolution still multiplied the
+zero blocks in its dense matrix representation. The portable specialization
+retains compact weights and fuses that convolution with its rank-one post-FiLM,
+input mixin, activation pre-FiLM, and SiLU/HardSwish gate. Other layers keep
+their original processing order.
 
 Matched Apple M4 Criterion runs measured the complete plugin callback:
 

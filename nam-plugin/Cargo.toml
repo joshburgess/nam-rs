@@ -12,6 +12,8 @@ workspace = true
 crate-type = ["cdylib", "lib"]
 
 [features]
+default = ["fast-kernels"]
+fast-kernels = ["nam-core/fast-kernels"]
 benchmark-internals = []
 
 [[bench]]

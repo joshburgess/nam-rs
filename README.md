@@ -33,9 +33,16 @@ cargo build --release
 
 # Build the plugin (VST3 + CLAP)
 cargo xtask bundle nam-plugin --release
+
+# Build the portable plugin fallback
+cargo xtask bundle nam-plugin --release --no-default-features
 ```
 
 The plugin bundles are output to `target/bundled/`.
+
+`nam-plugin` enables the optimized `fast-kernels` backend by default. The
+`--no-default-features` build keeps the pure Rust backend for targets without a
+C compiler. `nam-core` remains pure Rust by default for library users.
 
 ### Recommended: enable native CPU optimizations
 
@@ -99,7 +106,7 @@ Benchmarked on a MacBook Pro 16-inch (Nov 2024) with Apple M4 Max and 48 GB RAM,
 
 All benchmarks below were measured with interleaved C++/Rust runs (alternating single runs, not batches) to equalize thermal conditions on the CPU.
 
-### Default build (pure Rust, stable toolchain, no C compiler needed)
+### `nam-core` default and portable plugin fallback
 
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
@@ -108,11 +115,14 @@ All benchmarks below were measured with interleaved C++/Rust runs (alternating s
 | Standard WaveNet (16/8ch, 20 layers) | 63ms | 145ms | 2.3x slower |
 | a2_max (all advanced features) | 58ms | 105ms | 1.8x slower |
 
-### With `fast-kernels` feature (requires C compiler)
+### Plugin release default: `fast-kernels`
 
 ```bash
-cargo build --release --features fast-kernels
+cargo xtask bundle nam-plugin --release
 ```
+
+The plugin release build requires a C compiler. Library users can opt in with
+`cargo build --release -p nam-core --features fast-kernels`.
 
 | Model | C++ (fast_tanh) | Rust (fast_tanh) | vs C++ |
 |-------|----------------|-----------------|--------|
