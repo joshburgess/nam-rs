@@ -143,4 +143,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: portable-tanh-musl-baseline
-          path: profiles
+          path: |
+            profiles/scalar/a1_accurate_complete_plugin_callback
+            profiles/vector/a1_accurate_complete_plugin_callback

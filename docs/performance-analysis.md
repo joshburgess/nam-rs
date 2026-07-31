@@ -1,6 +1,6 @@
 # Performance Analysis: Rust vs C++ NAM
 
-Last updated: 2026-07-30
+Last updated: 2026-07-31
 
 ## Historical Performance Numbers
 
@@ -518,13 +518,12 @@ complete plugin allocation test also pass.
 The complete A2 plugin callback Criterion benchmark remains as a reusable gate
 for future work.
 
-### Accurate Linux activation backend
+### Accurate x86-64 activation backends
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point
 during WaveNet construction. glibc 2.35 and newer use the vector function.
-Older glibc versions, musl, and non-x86 Linux targets retain the scalar path.
-This avoids a hard GLIBC 2.35 symbol dependency and keeps dynamic loading out
-of the audio callback.
+Older glibc versions retain the scalar path. This avoids a hard GLIBC 2.35
+symbol dependency and keeps dynamic loading out of the audio callback.
 
 Matched Criterion runs in an Ubuntu 22.04 x86-64 container measured the
 complete A1 callback:
@@ -541,6 +540,30 @@ profile remains the architecture-native performance gate. The same Ubuntu
 22.04 environment passed boundary, special-value, and randomized-equivalence
 tests. A glibc 2.31 build resolved no vector entry point and selected the
 scalar fallback.
+
+Windows and non-glibc Linux on x86-64 use an internal four-lane SSE2
+implementation adapted from SLEEF 3.9.0 commit
+`906ca7512ee483296780a81a21b9ca715d40dfe1`. A 2,000,001-value sweep over
+[-10, 10] found a maximum absolute difference of 5.96e-8 and a maximum ULP
+difference of 3 relative to scalar `tanhf`. Signed zero, infinities, and NaN
+behavior also match. The complete A1 render fixture and allocation-free plugin
+callback test cover the retained path.
+
+Native GitHub-hosted runners measured the complete A1 plugin callback. These
+are paired scalar and vector measurements from workflow run 30650870053:
+
+| Frames | Windows scalar | Windows SSE2 | Improvement | musl scalar | musl SSE2 | Improvement |
+|-------:|---------------:|-------------:|------------:|------------:|----------:|------------:|
+| 16 | 63.046 us | 33.550 us | 46.78% | 86.756 us | 35.289 us | 59.24% |
+| 32 | 150.311 us | 69.319 us | 53.88% | 173.350 us | 65.591 us | 62.14% |
+| 64 | 246.438 us | 155.431 us | 36.93% | 322.130 us | 126.420 us | 60.89% |
+| 128 | 576.814 us | 274.779 us | 52.36% | 668.550 us | 245.290 us | 63.33% |
+| 256 | 1.115 ms | 538.245 us | 51.72% | 1.294 ms | 482.660 us | 63.06% |
+
+The conservative 95% confidence-bound improvement is at least 33.93% on
+Windows and 58.89% on musl. The musl instruction count fell from 640,663,041
+to 425,615,410, a 33.57% reduction. Platform CI rejects any buffer size or
+complete-callback instruction result below 10%.
 
 ## Key Insights
 
@@ -576,12 +599,11 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The Apple and GNU x86-64 accurate activation backends, A2 Conv1x1
-specializations, and portable grouped A2 pipeline clear the complete-callback
-retention gate. No remaining A2 leaf has enough measured standalone headroom
-to meet the 10% gate. The LSTM vForce prototype regressed. Windows and
-non-glibc Linux retain scalar accurate tanh until a portable vector-math
-implementation can clear the same accuracy and complete-callback gates.
+The Apple, GNU x86-64, and portable x86-64 accurate activation backends, A2
+Conv1x1 specializations, and portable grouped A2 pipeline clear the
+complete-callback retention gate. No remaining A2 leaf has enough measured
+standalone headroom to meet the 10% gate. The LSTM vForce prototype regressed.
+Accurate activation remains scalar on non-x86 platforms without Apple vForce.
 
 ## Real-world impact of the performance gap
 

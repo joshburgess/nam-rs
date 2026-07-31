@@ -1,6 +1,6 @@
 # Feature Gap Analysis: nam-rs vs C++ NeuralAmpModelerCore
 
-Comparison date: 2026-07-30
+Comparison date: 2026-07-31
 
 ## Comparison Basis
 

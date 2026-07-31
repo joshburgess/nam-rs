@@ -150,7 +150,11 @@ The remaining gap after algorithmic fixes was caused by Rust's strict IEEE 754 f
 - **Element-wise operations**: vector add, vector add-in-place, bias addition, all compiled with fast-math for better vectorization
 - **Full SGEMM**: column-major matrix multiply for the large-matrix path
 
-The C code is trivial: the same loops that exist in the Rust implementation, just compiled with different flags. The entire file is under 300 lines. The performance comes from the compiler flag, not the language.
+The C backend contains the packed convolution kernels plus platform-specific
+accurate activation adapters. Apple uses vForce, GNU x86-64 uses glibc's
+vector math entry point when available, and Windows or non-glibc x86-64 uses
+an internal SSE2 implementation. Rust owns dispatch and all scratch storage,
+so the audio callback remains allocation-free.
 
 **What I tried that didn't help:**
 
