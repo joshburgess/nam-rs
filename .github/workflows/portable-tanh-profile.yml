@@ -58,7 +58,7 @@ jobs:
             rust:1.97-alpine \
             sh -c '
               apk add --no-cache \
-                build-base clang cmake git pkgconf valgrind-dev \
+                build-base clang clang22-libclang cmake git pkgconf valgrind-dev \
                 libx11-dev libxcb-dev mesa-dev libxcursor-dev \
                 libxrandr-dev libxi-dev libxinerama-dev \
                 wayland-dev libxkbcommon-dev &&
