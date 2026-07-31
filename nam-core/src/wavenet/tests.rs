@@ -1063,7 +1063,6 @@ fn test_conv1d_general_when_not_depthwise() {
     assert!(matches!(conv.weights, Conv1dWeights::General(_)));
 }
 
-#[cfg(feature = "fast-kernels")]
 #[test]
 fn test_grouped_conv1d_preserves_compact_tap_major_weights() {
     let mut weights_data = (1..=24).map(|value| value as f32).collect::<Vec<_>>();
@@ -1080,6 +1079,146 @@ fn test_grouped_conv1d_preserves_compact_tap_major_weights() {
             ][..]
         )
     );
+}
+
+#[cfg(not(feature = "fast-kernels"))]
+#[test]
+fn test_grouped_conv1d_12x3_k2_portable_matches_scalar_reference() {
+    let num_frames = 5;
+    let input = (0..30)
+        .map(|index| index as f32 * 0.03125 - 0.4)
+        .collect::<Vec<_>>();
+    let weights = (0..24)
+        .map(|index| index as f32 * 0.015625 - 0.125)
+        .collect::<Vec<_>>();
+    let bias = (0..12)
+        .map(|index| index as f32 * 0.01 - 0.05)
+        .collect::<Vec<_>>();
+    let tap_offsets = [0, 15];
+    let mut actual = vec![0.0; 12 * num_frames];
+
+    conv1d_grouped_12x3_k2_portable(
+        &mut actual,
+        &input,
+        tap_offsets,
+        &weights,
+        &bias,
+        num_frames,
+    );
+
+    let mut expected = vec![0.0; 12 * num_frames];
+    for frame in 0..num_frames {
+        for group in 0..3 {
+            for channel in 0..4 {
+                let output_channel = group * 4 + channel;
+                let input_channel = frame * 3 + group;
+                let tap0 = weights[output_channel].mul_add(input[input_channel], 0.0);
+                let tap1 = weights[12 + output_channel]
+                    .mul_add(input[tap_offsets[1] + input_channel], 0.0);
+                expected[frame * 12 + output_channel] = tap0 + tap1 + bias[output_channel];
+            }
+        }
+    }
+
+    assert_eq!(actual, expected);
+}
+
+#[cfg(not(feature = "fast-kernels"))]
+#[test]
+fn test_grouped_conv1d_fused_pipeline_matches_scalar_reference() {
+    let num_frames = 5;
+    let input = (0..30)
+        .map(|index| index as f32 * 0.03125 - 0.4)
+        .collect::<Vec<_>>();
+    let conv_weights = (0..24)
+        .map(|index| index as f32 * 0.015625 - 0.125)
+        .collect::<Vec<_>>();
+    let conv_bias = (0..12)
+        .map(|index| index as f32 * 0.01 - 0.05)
+        .collect::<Vec<_>>();
+    let condition = (0..num_frames)
+        .map(|index| index as f32 * 0.125 - 0.2)
+        .collect::<Vec<_>>();
+    let film_weights = (0..24)
+        .map(|index| index as f32 * 0.0078125 - 0.08)
+        .collect::<Vec<_>>();
+    let film_bias = (0..24)
+        .map(|index| index as f32 * 0.00625 + 0.85)
+        .collect::<Vec<_>>();
+    let activation_film_weights = (0..24)
+        .map(|index| index as f32 * -0.004 + 0.06)
+        .collect::<Vec<_>>();
+    let activation_film_bias = (0..24)
+        .map(|index| index as f32 * 0.005 + 0.75)
+        .collect::<Vec<_>>();
+    let mixin = (0..12 * num_frames)
+        .map(|index| index as f32 * 0.003 - 0.09)
+        .collect::<Vec<_>>();
+    let tap_offsets = [0, 15];
+
+    for use_fast_activation in [false, true] {
+        let mut actual = vec![f32::NAN; 12 * num_frames];
+        conv1d_grouped_12x3_k2_films_mixin_portable(
+            &mut actual,
+            &input,
+            tap_offsets,
+            &conv_weights,
+            &conv_bias,
+            &condition,
+            &film_weights,
+            &film_bias,
+            &activation_film_weights,
+            &activation_film_bias,
+            &mixin,
+            num_frames,
+            use_fast_activation,
+        );
+
+        for frame in 0..num_frames {
+            let mut activated_input = [0.0f32; 12];
+            for group in 0..3 {
+                for channel in 0..4 {
+                    let output_channel = group * 4 + channel;
+                    let input_channel = frame * 3 + group;
+                    let tap0 = conv_weights[output_channel].mul_add(input[input_channel], 0.0);
+                    let tap1 = conv_weights[12 + output_channel]
+                        .mul_add(input[tap_offsets[1] + input_channel], 0.0);
+                    let convolution = tap0 + tap1 + conv_bias[output_channel];
+                    let scale = film_weights[output_channel].mul_add(condition[frame], 0.0)
+                        + film_bias[output_channel];
+                    let shift = film_weights[12 + output_channel].mul_add(condition[frame], 0.0)
+                        + film_bias[12 + output_channel];
+                    let mixed =
+                        convolution.mul_add(scale, shift) + mixin[frame * 12 + output_channel];
+                    let activation_scale = activation_film_weights[output_channel]
+                        .mul_add(condition[frame], 0.0)
+                        + activation_film_bias[output_channel];
+                    let activation_shift = activation_film_weights[12 + output_channel]
+                        .mul_add(condition[frame], 0.0)
+                        + activation_film_bias[12 + output_channel];
+                    activated_input[output_channel] =
+                        mixed.mul_add(activation_scale, activation_shift);
+                }
+            }
+            for channel in 0..6 {
+                let primary_input = activated_input[channel];
+                let primary = if use_fast_activation {
+                    primary_input * crate::util::fast_sigmoid(primary_input)
+                } else {
+                    primary_input / (1.0 + (-primary_input).exp())
+                };
+                let gate_input = activated_input[6 + channel];
+                let gate = (gate_input * (1.0 / 6.0)) * (gate_input + 3.0).clamp(0.0, 6.0);
+                let expected = primary * gate;
+                let actual = actual[frame * 12 + channel];
+                let tolerance = 1.0e-6 * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "actual={actual}, expected={expected}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

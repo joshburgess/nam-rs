@@ -490,6 +490,31 @@ improvement.
 
 The best candidate failed the required 10% complete-callback improvement at
 every stable size, so all production kernel and dispatch changes were removed.
+
+### Portable grouped A2 pipeline
+
+The normal plugin build does not enable `fast-kernels`. In that build, the
+grouped 12x3/k2 condition convolution still multiplied the zero blocks in its
+dense matrix representation. The portable specialization retains compact
+weights and fuses that convolution with its rank-one post-FiLM, input mixin,
+activation pre-FiLM, and SiLU/HardSwish gate. Other layers keep their original
+processing order.
+
+Matched Apple M4 Criterion runs measured the complete plugin callback:
+
+| Frames | Before | After | Improvement |
+|-------:|-------:|------:|------------:|
+| 16 | 16.131 us | 13.858 us | 13.44% |
+| 32 | 31.248 us | 27.158 us | 13.92% |
+| 64 | 61.294 us | 54.094 us | 10.77% |
+| 128 | 122.98 us | 106.80 us | 13.05% |
+| 256 | 242.30 us | 212.68 us | 13.02% |
+
+The conservative confidence bound exceeds 10% at every size. Scalar tests
+cover the compact convolution and the full fused sequence in accurate and
+fast activation modes. A2 render fixtures, the native-kernel feature, and the
+complete plugin allocation test also pass.
+
 The complete A2 plugin callback Criterion benchmark remains as a reusable gate
 for future work.
 
@@ -551,12 +576,12 @@ For models with channels ≤ 8 (small WaveNet, LSTM), my scalar dot-product loop
 
 ## Remaining performance work
 
-The Apple and GNU x86-64 accurate activation backends and the A2 Conv1x1
-specializations clear the complete-callback retention gate. A2 activation is
-too small a fraction of its callback, and the LSTM vForce prototype regressed.
-Windows and non-glibc Linux retain scalar accurate tanh until a portable
-vector-math implementation can clear the same accuracy and complete-callback
-gates.
+The Apple and GNU x86-64 accurate activation backends, A2 Conv1x1
+specializations, and portable grouped A2 pipeline clear the complete-callback
+retention gate. No remaining A2 leaf has enough measured standalone headroom
+to meet the 10% gate. The LSTM vForce prototype regressed. Windows and
+non-glibc Linux retain scalar accurate tanh until a portable vector-math
+implementation can clear the same accuracy and complete-callback gates.
 
 ## Real-world impact of the performance gap
 

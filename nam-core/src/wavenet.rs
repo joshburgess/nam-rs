@@ -532,7 +532,6 @@ struct Conv1d {
     /// Flattened weights for C FFI: all taps concatenated.
     #[cfg(feature = "fast-kernels")]
     flat_weights: Vec<f32>,
-    #[cfg(feature = "fast-kernels")]
     compact_grouped_weights: Option<Vec<f32>>,
     #[cfg(feature = "fast-kernels")]
     tap_offsets: Vec<usize>,
@@ -616,7 +615,6 @@ impl Conv1d {
         #[cfg(not(feature = "fast-kernels"))]
         let _ = flat_weight_len;
 
-        #[cfg(feature = "fast-kernels")]
         let mut compact_grouped_weights = None;
         let weights = if is_depthwise {
             // Depthwise: one weight per channel per kernel tap
@@ -641,7 +639,6 @@ impl Conv1d {
             let mut tap_weights_colmajor: Vec<Vec<f32>> = (0..kernel_size)
                 .map(|_| vec![0.0f32; matrix_layout.left_len()])
                 .collect();
-            #[cfg(feature = "fast-kernels")]
             let mut compact_tap_weights = (groups > 1)
                 .then(|| vec![0.0f32; kernel_size * out_per_group * in_per_group * groups]);
 
@@ -655,7 +652,6 @@ impl Conv1d {
                         for k in 0..kernel_size {
                             // column-major: index = col * out_channels + row
                             tap_weights_colmajor[k][col * out_channels + row] = taps[k];
-                            #[cfg(feature = "fast-kernels")]
                             if let Some(compact) = &mut compact_tap_weights {
                                 let tap_stride = out_per_group * in_per_group * groups;
                                 let group_offset = g * out_per_group * in_per_group;
@@ -666,10 +662,7 @@ impl Conv1d {
                     }
                 }
             }
-            #[cfg(feature = "fast-kernels")]
-            {
-                compact_grouped_weights = compact_tap_weights;
-            }
+            compact_grouped_weights = compact_tap_weights;
             Conv1dWeights::General(tap_weights_colmajor)
         };
 
@@ -721,7 +714,6 @@ impl Conv1d {
             output_buf: ColMajorMatrix::new(out_channels, 1),
             #[cfg(feature = "fast-kernels")]
             flat_weights,
-            #[cfg(feature = "fast-kernels")]
             compact_grouped_weights,
             #[cfg(feature = "fast-kernels")]
             tap_offsets: vec![0; kernel_size],
@@ -770,6 +762,26 @@ impl Conv1d {
                 &self.bias,
                 &mut self.output_buf.data,
             ) {
+                self.input_buffer.advance(num_frames);
+                return;
+            }
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
+        if out_ch == 12 && in_ch == 3 && ks == 2 && self.groups == 3 {
+            if let Some(weights) = self.compact_grouped_weights.as_deref() {
+                let tap_offsets = [
+                    self.input_buffer.read_offset(dil),
+                    self.input_buffer.read_offset(0),
+                ];
+                conv1d_grouped_12x3_k2_portable(
+                    &mut self.output_buf.data,
+                    &self.input_buffer.storage,
+                    tap_offsets,
+                    weights,
+                    &self.bias,
+                    num_frames,
+                );
                 self.input_buffer.advance(num_frames);
                 return;
             }
@@ -951,9 +963,161 @@ impl Conv1d {
         self.input_buffer.advance(num_frames);
     }
 
+    #[cfg(not(feature = "fast-kernels"))]
+    fn process_grouped_12x3_k2_with_films_and_mixin(
+        &mut self,
+        input: &ColMajorMatrix,
+        condition: &ColMajorMatrix,
+        film_weights: &[f32],
+        film_bias: &[f32],
+        activation_film_weights: &[f32],
+        activation_film_bias: &[f32],
+        mixin: &[f32],
+        output: &mut [f32],
+        num_frames: usize,
+        use_fast_activation: bool,
+    ) -> bool {
+        if self.out_channels != 12
+            || self.in_channels != 3
+            || self.kernel_size != 2
+            || self.groups != 3
+            || condition.rows != 1
+            || film_weights.len() < 24
+            || film_bias.len() < 24
+            || activation_film_weights.len() < 24
+            || activation_film_bias.len() < 24
+            || mixin.len() < 12 * num_frames
+            || output.len() < 12 * num_frames
+        {
+            return false;
+        }
+        let Some(weights) = self.compact_grouped_weights.as_deref() else {
+            return false;
+        };
+
+        self.input_buffer.write(input, num_frames);
+        let tap_offsets = [
+            self.input_buffer.read_offset(self.dilation),
+            self.input_buffer.read_offset(0),
+        ];
+        conv1d_grouped_12x3_k2_films_mixin_portable(
+            output,
+            &self.input_buffer.storage,
+            tap_offsets,
+            weights,
+            &self.bias,
+            &condition.data,
+            film_weights,
+            film_bias,
+            activation_film_weights,
+            activation_film_bias,
+            mixin,
+            num_frames,
+            use_fast_activation,
+        );
+        self.input_buffer.advance(num_frames);
+        true
+    }
+
     #[allow(dead_code)]
     fn zero_state(&mut self) {
         self.input_buffer.zero();
+    }
+}
+
+#[cfg(not(feature = "fast-kernels"))]
+fn conv1d_grouped_12x3_k2_portable(
+    output: &mut [f32],
+    input: &[f32],
+    tap_offsets: [usize; 2],
+    weights: &[f32],
+    bias: &[f32],
+    num_frames: usize,
+) {
+    let (tap0, tap1) = (&input[tap_offsets[0]..], &input[tap_offsets[1]..]);
+    let (weights0, weights1) = weights.split_at(12);
+
+    for frame in 0..num_frames {
+        let input_offset = frame * 3;
+        let output_offset = frame * 12;
+        for group in 0..3 {
+            let input0 = tap0[input_offset + group];
+            let input1 = tap1[input_offset + group];
+            let group_offset = group * 4;
+            for channel in 0..4 {
+                let output_channel = group_offset + channel;
+                let tap0_product = weights0[output_channel].mul_add(input0, 0.0);
+                let tap1_product = weights1[output_channel].mul_add(input1, 0.0);
+                output[output_offset + output_channel] =
+                    tap0_product + tap1_product + bias[output_channel];
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "fast-kernels"))]
+fn conv1d_grouped_12x3_k2_films_mixin_portable(
+    output: &mut [f32],
+    input: &[f32],
+    tap_offsets: [usize; 2],
+    conv_weights: &[f32],
+    conv_bias: &[f32],
+    condition: &[f32],
+    film_weights: &[f32],
+    film_bias: &[f32],
+    activation_film_weights: &[f32],
+    activation_film_bias: &[f32],
+    mixin: &[f32],
+    num_frames: usize,
+    use_fast_activation: bool,
+) {
+    let (tap0, tap1) = (&input[tap_offsets[0]..], &input[tap_offsets[1]..]);
+    let (conv_weights0, conv_weights1) = conv_weights.split_at(12);
+    let (scale_weights, shift_weights) = film_weights.split_at(12);
+    let (scale_bias, shift_bias) = film_bias.split_at(12);
+    let (activation_scale_weights, activation_shift_weights) = activation_film_weights.split_at(12);
+    let (activation_scale_bias, activation_shift_bias) = activation_film_bias.split_at(12);
+
+    for (frame, &condition_value) in condition.iter().take(num_frames).enumerate() {
+        let input_offset = frame * 3;
+        let output_offset = frame * 12;
+        let mut activated_input = [0.0f32; 12];
+        for group in 0..3 {
+            let input0 = tap0[input_offset + group];
+            let input1 = tap1[input_offset + group];
+            let group_offset = group * 4;
+            for channel in 0..4 {
+                let output_channel = group_offset + channel;
+                let tap0_product = conv_weights0[output_channel].mul_add(input0, 0.0);
+                let tap1_product = conv_weights1[output_channel].mul_add(input1, 0.0);
+                let convolution = tap0_product + tap1_product + conv_bias[output_channel];
+                let scale = scale_weights[output_channel].mul_add(condition_value, 0.0)
+                    + scale_bias[output_channel];
+                let shift = shift_weights[output_channel].mul_add(condition_value, 0.0)
+                    + shift_bias[output_channel];
+                let mixed =
+                    convolution.mul_add(scale, shift) + mixin[output_offset + output_channel];
+                let activation_scale = activation_scale_weights[output_channel]
+                    .mul_add(condition_value, 0.0)
+                    + activation_scale_bias[output_channel];
+                let activation_shift = activation_shift_weights[output_channel]
+                    .mul_add(condition_value, 0.0)
+                    + activation_shift_bias[output_channel];
+                activated_input[output_channel] = mixed.mul_add(activation_scale, activation_shift);
+            }
+        }
+        for channel in 0..6 {
+            let primary_input = activated_input[channel];
+            let primary = if use_fast_activation {
+                primary_input * crate::util::fast_sigmoid(primary_input)
+            } else {
+                primary_input / (1.0 + (-primary_input).exp())
+            };
+            let gate_input = activated_input[6 + channel];
+            let gate = (gate_input * (1.0 / 6.0)) * (gate_input + 3.0).clamp(0.0, 6.0);
+            output[output_offset + channel] = primary * gate;
+        }
     }
 }
 
@@ -990,6 +1154,23 @@ impl FiLM {
         self.cond_to_scale_shift
             .set_max_buffer_size(max_buffer_size);
         self.output_buf.resize(self.input_dim, max_buffer_size);
+    }
+
+    #[cfg(not(feature = "fast-kernels"))]
+    fn rank1_scale_shift_parameters(&self, input_dim: usize) -> Option<(&[f32], &[f32])> {
+        if self.do_shift
+            && self.input_dim == input_dim
+            && self.cond_to_scale_shift.in_channels == 1
+            && self.cond_to_scale_shift.out_channels == 2 * input_dim
+            && self.cond_to_scale_shift.groups == 1
+        {
+            Some((
+                &self.cond_to_scale_shift.weight_colmajor,
+                self.cond_to_scale_shift.bias.as_deref()?,
+            ))
+        } else {
+            None
+        }
     }
 
     /// Block FiLM: output = input * scale (+ shift)
@@ -1741,34 +1922,49 @@ impl WaveNetLayer {
             active_bottleneck
         };
 
-        // Step 1: Input convolution
-        if let Some(ref mut film) = self.conv_pre_film {
-            // FiLM modulate input, then conv
+        let conv_input = if let Some(ref mut film) = self.conv_pre_film {
             film.process_block(input, condition, num_frames);
-            self.conv.process_block(&film.output_buf, num_frames);
+            &film.output_buf
         } else {
-            self.conv.process_block(input, num_frames);
+            input
+        };
+
+        #[cfg(not(feature = "fast-kernels"))]
+        let can_fuse_grouped_pipeline = active_channels.is_none()
+            && self.gating_mode == GatingMode::Gated
+            && matches!(self.activation, Activation::Silu)
+            && matches!(self.secondary_activation, Activation::HardSwish)
+            && self
+                .conv_post_film
+                .as_ref()
+                .and_then(|film| film.rank1_scale_shift_parameters(self.conv.out_channels))
+                .zip(
+                    self.activation_pre_film
+                        .as_ref()
+                        .and_then(|film| film.rank1_scale_shift_parameters(z_rows)),
+                )
+                .is_some();
+        #[cfg(feature = "fast-kernels")]
+        let can_fuse_grouped_pipeline = false;
+
+        if !can_fuse_grouped_pipeline {
+            self.conv.process_block(conv_input, num_frames);
+            if let Some(ref mut film) = self.conv_post_film {
+                film.process_block_inplace(
+                    &mut self.conv.output_buf.data,
+                    self.conv.out_channels,
+                    condition,
+                    num_frames,
+                );
+            }
         }
 
-        if let Some(ref mut film) = self.conv_post_film {
-            // In-place modulate conv output
-            film.process_block_inplace(
-                &mut self.conv.output_buf.data,
-                self.conv.out_channels,
-                condition,
-                num_frames,
-            );
-        }
-
-        // Step 2: Input mixin
         if let Some(ref mut film) = self.input_mixin_pre_film {
-            // FiLM modulate condition, then mixin
             film.process_block(condition, condition, num_frames);
             self.input_mixin.process_block(&film.output_buf, num_frames);
         } else {
             self.input_mixin.process_block(condition, num_frames);
         }
-
         if let Some(ref mut film) = self.input_mixin_post_film {
             film.process_block_inplace(
                 &mut self.input_mixin.output_buf.data,
@@ -1776,6 +1972,51 @@ impl WaveNetLayer {
                 condition,
                 num_frames,
             );
+        }
+
+        #[cfg(not(feature = "fast-kernels"))]
+        let fused_grouped_pipeline = can_fuse_grouped_pipeline
+            && self
+                .conv_post_film
+                .as_ref()
+                .and_then(|film| film.rank1_scale_shift_parameters(self.conv.out_channels))
+                .zip(
+                    self.activation_pre_film
+                        .as_ref()
+                        .and_then(|film| film.rank1_scale_shift_parameters(z_rows)),
+                )
+                .is_some_and(
+                    |(
+                        (conv_film_weights, conv_film_bias),
+                        (activation_film_weights, activation_film_bias),
+                    )| {
+                        self.conv.process_grouped_12x3_k2_with_films_and_mixin(
+                            conv_input,
+                            condition,
+                            conv_film_weights,
+                            conv_film_bias,
+                            activation_film_weights,
+                            activation_film_bias,
+                            &self.input_mixin.output_buf.data,
+                            &mut self.z_buf.data,
+                            num_frames,
+                            use_fast_tanh,
+                        )
+                    },
+                );
+        #[cfg(feature = "fast-kernels")]
+        let fused_grouped_pipeline = false;
+
+        if can_fuse_grouped_pipeline && !fused_grouped_pipeline {
+            self.conv.process_block(conv_input, num_frames);
+            if let Some(ref mut film) = self.conv_post_film {
+                film.process_block_inplace(
+                    &mut self.conv.output_buf.data,
+                    self.conv.out_channels,
+                    condition,
+                    num_frames,
+                );
+            }
         }
 
         // z = conv_output + mixin_output
@@ -1802,7 +2043,7 @@ impl WaveNetLayer {
         #[cfg(not(feature = "fast-kernels"))]
         let did_fused_add_activate = false;
 
-        if !did_fused_add_activate {
+        if !did_fused_add_activate && !fused_grouped_pipeline {
             #[cfg(feature = "fast-kernels")]
             crate::fast_kernels::vec_add(
                 &mut self.z_buf.data,
@@ -1821,8 +2062,10 @@ impl WaveNetLayer {
         }
 
         // Optional activation_pre_film
-        if let Some(ref mut film) = self.activation_pre_film {
-            film.process_block_inplace(&mut self.z_buf.data, z_rows, condition, num_frames);
+        if !fused_grouped_pipeline {
+            if let Some(ref mut film) = self.activation_pre_film {
+                film.process_block_inplace(&mut self.z_buf.data, z_rows, condition, num_frames);
+            }
         }
 
         // Step 3: Activation + gating/blending
@@ -1863,7 +2106,9 @@ impl WaveNetLayer {
             }
             GatingMode::Gated => {
                 // Gating: output[c] = primary(z[c]) * secondary(z[bottleneck+c])
-                if active_channels.is_some() {
+                if fused_grouped_pipeline {
+                    // The specialized grouped path already produced the gated top rows.
+                } else if active_channels.is_some() {
                     for f in 0..num_frames {
                         let z_off = f * z_rows;
                         for c in 0..active_bottleneck {
