@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
@@ -52,8 +53,62 @@ jobs:
             target
           key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Verify plugin feature defaults
+        run: python scripts/check_plugin_features.py
+
+      - name: Run release plugin regressions
+        run: cargo test --release -p nam-core -p nam-plugin
+
+      - name: Bundle portable plugin fallback
+        run: cargo xtask bundle nam-plugin --release --no-default-features
+
       - name: Bundle plugin
         run: cargo xtask bundle nam-plugin --release
+
+      - name: Inspect plugin binaries
+        run: python scripts/check_release_artifacts.py target/bundled
+
+      - name: Measure portable A1 callback
+        run: >-
+          cargo bench -p nam-plugin --no-default-features
+          --features benchmark-internals --bench callback
+          -- a1_accurate_complete_plugin_callback
+
+      - name: Preserve portable measurements (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p profiles/portable
+          mv target/criterion/a1_accurate_complete_plugin_callback profiles/portable/
+
+      - name: Preserve portable measurements (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path profiles/portable | Out-Null
+          Move-Item target/criterion/a1_accurate_complete_plugin_callback profiles/portable/
+
+      - name: Measure release A1 callback
+        run: >-
+          cargo bench -p nam-plugin --features benchmark-internals
+          --bench callback -- a1_accurate_complete_plugin_callback
+
+      - name: Preserve release measurements (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p profiles/release
+          mv target/criterion/a1_accurate_complete_plugin_callback profiles/release/
+
+      - name: Preserve release measurements (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path profiles/release | Out-Null
+          Move-Item target/criterion/a1_accurate_complete_plugin_callback profiles/release/
+
+      - name: Enforce release callback speedup
+        run: >-
+          python scripts/check_callback_speedup.py
+          profiles/portable profiles/release
 
       - name: Build trainer
         run: cargo build --release -p nam-trainer
@@ -111,9 +166,17 @@ jobs:
           name: release-${{ matrix.platform }}
           path: release-staging/
 
+      - name: Upload release measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-callback-${{ matrix.platform }}
+          path: profiles/
+
   release:
     name: Create Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
