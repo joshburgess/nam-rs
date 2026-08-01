@@ -9,12 +9,6 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
-
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C llvm-args=--fp-contract=fast"

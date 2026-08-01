@@ -15,6 +15,11 @@ jobs:
   validate:
     name: Validate Release Bundles
     uses: ./.github/workflows/plugin-release-validation.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     with:
       attest: true
 
