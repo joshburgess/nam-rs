@@ -1,5 +1,11 @@
 name: Release
 
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
 on:
   workflow_dispatch:
   push:
@@ -9,6 +15,8 @@ jobs:
   validate:
     name: Validate Release Bundles
     uses: ./.github/workflows/plugin-release-validation.yml
+    with:
+      attest: true
 
   release:
     name: Create Release
@@ -17,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -27,12 +39,47 @@ jobs:
           pattern: release-package-*
           merge-multiple: true
 
+      - name: Verify release version and tag
+        run: >-
+          python scripts/check_release_version.py
+          --expected 0.2.0
+          --tag ${{ github.ref_name }}
+
+      - name: Generate release SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: artifacts/nam-rs.spdx.json
+          artifact-name: nam-rs.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+          syft-version: 1.44.0
+
+      - name: Generate SHA-256 checksums
+        run: python scripts/generate_release_checksums.py artifacts
+
+      - name: Verify SHA-256 checksums
+        run: >-
+          python scripts/generate_release_checksums.py artifacts
+          --verify artifacts/SHA256SUMS
+
+      - name: Attest release provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-checksums: artifacts/SHA256SUMS
+
+      - name: Attest release SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: artifacts/*.zip
+          sbom-path: artifacts/nam-rs.spdx.json
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --prerelease \
-            --generate-notes \
+            --notes-file docs/release-v0.2.0.md \
             artifacts/*

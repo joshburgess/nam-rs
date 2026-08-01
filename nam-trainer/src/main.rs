@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use std::path::PathBuf;
+
 fn load_icon() -> Option<egui::IconData> {
     let png_bytes = include_bytes!("../resources/icon.png");
     let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
@@ -11,7 +13,11 @@ fn load_icon() -> Option<egui::IconData> {
     })
 }
 
-fn main() -> eframe::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(report_path) = smoke_test_report_path() {
+        nam_trainer::configure_smoke_test(report_path)?;
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([680.0, 820.0])
         .with_min_inner_size([560.0, 600.0]);
@@ -29,5 +35,16 @@ fn main() -> eframe::Result<()> {
         "NAM Trainer",
         options,
         Box::new(|cc| Ok(Box::new(nam_trainer::TrainerApp::new(cc)))),
-    )
+    )?;
+    Ok(())
+}
+
+fn smoke_test_report_path() -> Option<PathBuf> {
+    let mut arguments = std::env::args_os();
+    while let Some(argument) = arguments.next() {
+        if argument == "--smoke-test-report" {
+            return arguments.next().map(PathBuf::from);
+        }
+    }
+    None
 }

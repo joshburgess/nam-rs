@@ -4,6 +4,15 @@ A Rust reimplementation of [NeuralAmpModelerCore](https://github.com/sdatkinson/
 
 Loads `.nam` model files produced by the NAM Python trainer and processes audio identically to the C++ implementation.
 
+## Downloads
+
+The [releases page](https://github.com/joshburgess/nam-rs/releases) provides
+one archive for each supported platform. Releases are not signed with a
+publisher identity or notarized. Each release includes SHA-256 checksums, a
+software bill of materials, and GitHub build provenance. Follow the
+[installation and verification guide](docs/installing-releases.md) before
+running the trainer or copying plugins into a host search path.
+
 ## Features
 
 - **All model architectures**: WaveNet, LSTM, ConvNet, Linear

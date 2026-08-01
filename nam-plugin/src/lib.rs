@@ -561,7 +561,7 @@ impl Plugin for NamPlugin {
     const VENDOR: &'static str = "nam-rs";
     const URL: &'static str = "https://github.com/joshburgess/nam-rs";
     const EMAIL: &'static str = "";
-    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+    const VERSION: &'static str = nam_core::build_info::VERSION;
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: NonZeroU32::new(1),
@@ -819,6 +819,7 @@ impl Plugin for NamPlugin {
         buffer_config: &BufferConfig,
         context: &mut impl InitContext<Self>,
     ) -> bool {
+        nih_log!("NAM build {}", nam_core::build_info::SUMMARY);
         self.sample_rate = buffer_config.sample_rate as f64;
         self.max_buffer_size = buffer_config.max_buffer_size as usize;
 

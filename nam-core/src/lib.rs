@@ -1,4 +1,5 @@
 pub mod activations;
+pub mod build_info;
 pub mod convnet;
 pub mod dsp;
 pub mod error;

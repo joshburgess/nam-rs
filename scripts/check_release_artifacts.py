@@ -48,6 +48,16 @@ def validate_architecture(path: Path, expected_format: str) -> None:
             raise ValueError(f"{path} has Mach-O CPU type 0x{cpu_type:08x}, expected arm64")
 
 
+def validate_build_metadata(
+    path: Path, version: str, commit: str, target: str, features: str
+) -> None:
+    data = path.read_bytes()
+    expected = (version, commit[:12], target, "release", features)
+    missing = [value for value in expected if value.encode() not in data]
+    if missing:
+        raise ValueError(f"{path} is missing embedded build metadata: {', '.join(missing)}")
+
+
 def bundled_binaries(bundle_root: Path, expected_format: str) -> list[Path]:
     binaries = []
     for path in bundle_root.rglob("*"):
@@ -133,7 +143,15 @@ def validate_windows_dependencies(path: Path, dumpbin: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("bundle_root", type=Path)
+    parser.add_argument("--version")
+    parser.add_argument("--commit")
+    parser.add_argument("--target")
+    parser.add_argument("--features")
     args = parser.parse_args()
+
+    metadata_values = (args.version, args.commit, args.target, args.features)
+    if any(metadata_values) and not all(metadata_values):
+        parser.error("--version, --commit, --target, and --features must be used together")
 
     system = platform.system()
     expected_formats = {"Linux": "elf", "Darwin": "mach-o", "Windows": "pe"}
@@ -146,6 +164,10 @@ def main() -> int:
         dumpbin = find_dumpbin() if system == "Windows" else None
         for path in binaries:
             validate_architecture(path, expected_format)
+            if all(metadata_values):
+                validate_build_metadata(
+                    path, args.version, args.commit, args.target, args.features
+                )
             if system == "Linux":
                 validate_linux_dependencies(path)
             elif system == "Darwin":

@@ -104,6 +104,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--log", type=Path, required=True)
+    parser.add_argument("--success-on-timeout", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -112,7 +113,10 @@ def main() -> int:
         parser.error("a command is required after --")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be greater than zero")
-    return run_command(command, args.timeout_seconds, args.log)
+    status = run_command(command, args.timeout_seconds, args.log)
+    if status == 124 and args.success_on_timeout:
+        return 0
+    return status
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ pub(crate) fn build_diagnostics_summary(app: &TrainerApp) -> String {
 
     format!(
         "NAM Trainer Diagnostics\n\
+         build: {}\n\
          python_path: {}\n\
          python_status: {python_status}\n\
          nam_version: {nam_version}\n\
@@ -74,6 +75,7 @@ pub(crate) fn build_diagnostics_summary(app: &TrainerApp) -> String {
          active_run: {active_run}\n\n\
          request:\n{request_json}\n\n\
          recent_log:\n{recent_log}\n",
+        nam_core::build_info::SUMMARY,
         app.python_path.display(),
         app.selected_device
     )

@@ -2,13 +2,24 @@ name: Plugin Release Validation
 
 on:
   workflow_call:
+    inputs:
+      attest:
+        description: Generate provenance for release archives
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-C llvm-args=--fp-contract=fast"
+  NAM_BUILD_GIT_COMMIT: ${{ github.sha }}
+  NAM_RELEASE_VERSION: "0.2.0"
 
 jobs:
   validate:
@@ -21,6 +32,7 @@ jobs:
           - os: macos-latest
             platform: macos-arm64
             validator_platform: macos
+            target: aarch64-apple-darwin
             trainer_bin: nam-trainer
             pluginval_bin: validator-tools/pluginval/pluginval.app/Contents/MacOS/pluginval
             clap_validator_bin: validator-tools/clap-validator/clap-validator
@@ -28,6 +40,7 @@ jobs:
           - os: windows-2022
             platform: windows-x86_64
             validator_platform: windows
+            target: x86_64-pc-windows-msvc
             trainer_bin: nam-trainer.exe
             pluginval_bin: validator-tools/pluginval/pluginval.exe
             clap_validator_bin: validator-tools/clap-validator/clap-validator.exe
@@ -35,6 +48,7 @@ jobs:
           - os: ubuntu-22.04
             platform: linux-x86_64
             validator_platform: linux
+            target: x86_64-unknown-linux-gnu
             trainer_bin: nam-trainer
             pluginval_bin: validator-tools/pluginval/pluginval
             clap_validator_bin: validator-tools/clap-validator/clap-validator
@@ -59,6 +73,9 @@ jobs:
 
       - name: Verify plugin feature defaults
         run: python scripts/check_plugin_features.py
+
+      - name: Verify release version
+        run: python scripts/check_release_version.py --expected ${{ env.NAM_RELEASE_VERSION }}
 
       - name: Enable Windows crash symbols
         if: runner.os == 'Windows'
@@ -88,7 +105,12 @@ jobs:
             Copy-Item -Destination validation/portable/
 
       - name: Inspect portable plugin binaries
-        run: python scripts/check_release_artifacts.py validation/portable
+        run: >-
+          python scripts/check_release_artifacts.py validation/portable
+          --version ${{ env.NAM_RELEASE_VERSION }}
+          --commit ${{ github.sha }}
+          --target ${{ matrix.target }}
+          --features portable
 
       - name: Bundle optimized plugin
         run: cargo xtask bundle nam-plugin --release
@@ -110,7 +132,12 @@ jobs:
             Copy-Item -Destination validation/release/
 
       - name: Inspect optimized plugin binaries
-        run: python scripts/check_release_artifacts.py validation/release
+        run: >-
+          python scripts/check_release_artifacts.py validation/release
+          --version ${{ env.NAM_RELEASE_VERSION }}
+          --commit ${{ github.sha }}
+          --target ${{ matrix.target }}
+          --features fast-kernels
 
       - name: Install pinned plugin validators
         run: >-
@@ -403,30 +430,226 @@ jobs:
             exit 1
           "
 
-      - name: Package validated artifacts (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          mkdir -p release-staging
-          cp "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}"
-          cd validation/release
-          for plugin in *.clap *.vst3; do
-            [ -e "$plugin" ] || continue
-            ext="${plugin##*.}"
-            zip -r "../../release-staging/nam-plugin-${{ matrix.platform }}-${ext}.zip" "$plugin"
-          done
+      - name: Package validated release
+        run: >-
+          python scripts/package_release.py
+          --plugin-root validation/release
+          --trainer target/release/${{ matrix.trainer_bin }}
+          --output-dir release-staging
+          --version ${{ env.NAM_RELEASE_VERSION }}
+          --commit ${{ github.sha }}
+          --platform ${{ matrix.platform }}
+          --target ${{ matrix.target }}
+          --features fast-kernels
 
-      - name: Package validated artifacts (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path release-staging | Out-Null
-          Copy-Item "target/release/${{ matrix.trainer_bin }}" "release-staging/nam-trainer-${{ matrix.platform }}.exe"
-          Compress-Archive -Path "validation/release/nam-plugin.clap" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-clap.zip" -Force
-          Compress-Archive -Path "validation/release/nam-plugin.vst3" -DestinationPath "release-staging/nam-plugin-${{ matrix.platform }}-vst3.zip" -Force
+      - name: Build previous-version installation fixture
+        run: >-
+          python scripts/package_release.py
+          --plugin-root validation/release
+          --trainer target/release/${{ matrix.trainer_bin }}
+          --output-dir upgrade-fixture
+          --version 0.1.0
+          --commit 0000000000000000000000000000000000000000
+          --platform ${{ matrix.platform }}
+          --target ${{ matrix.target }}
+          --features fast-kernels
+
+      - name: Exercise install, collision rejection, and upgrade
+        id: installed
+        run: >-
+          python scripts/exercise_release_install.py
+          --previous upgrade-fixture/nam-rs-v0.1.0-${{ matrix.platform }}.zip
+          --current release-staging/nam-rs-v${{ env.NAM_RELEASE_VERSION }}-${{ matrix.platform }}.zip
+
+      - name: Uninstall release
+        if: always() && steps.installed.outcome == 'success'
+        run: >-
+          python scripts/install_release.py uninstall
+          --platform ${{ matrix.platform }}
+
+      - name: Attest release archive provenance
+        if: inputs.attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: release-staging/nam-rs-v${{ env.NAM_RELEASE_VERSION }}-${{ matrix.platform }}.zip
 
       - name: Upload validated release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-package-${{ matrix.platform }}
           path: release-staging/
+
+  install-downloaded:
+    name: Install Downloaded Release (${{ matrix.os }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-arm64
+            validator_platform: macos
+            target: aarch64-apple-darwin
+            pluginval_bin: validator-tools/pluginval/pluginval.app/Contents/MacOS/pluginval
+            clap_validator_bin: validator-tools/clap-validator/clap-validator
+          - os: windows-2022
+            platform: windows-x86_64
+            validator_platform: windows
+            target: x86_64-pc-windows-msvc
+            pluginval_bin: validator-tools/pluginval/pluginval.exe
+            clap_validator_bin: validator-tools/clap-validator/clap-validator.exe
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            validator_platform: linux
+            target: x86_64-unknown-linux-gnu
+            pluginval_bin: validator-tools/pluginval/pluginval
+            clap_validator_bin: validator-tools/clap-validator/clap-validator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libx11-xcb-dev libgl-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev xvfb
+
+      - name: Download release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-package-${{ matrix.platform }}
+          path: release-download
+
+      - name: Install pinned plugin validators
+        run: >-
+          python scripts/install_plugin_validators.py
+          --platform ${{ matrix.validator_platform }}
+          --destination validator-tools
+
+      - name: Install downloaded release into system paths
+        id: installed
+        run: >-
+          python scripts/install_release.py install
+          release-download/nam-rs-v${{ env.NAM_RELEASE_VERSION }}-${{ matrix.platform }}.zip
+          --github-output
+
+      - name: Prepare validation logs
+        shell: bash
+        run: mkdir -p installed-validation/pluginval-results
+
+      - name: Validate installed VST3 (Linux)
+        id: installed_vst3_linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: bash
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log installed-validation/pluginval.log
+          -- xvfb-run -a "${{ matrix.pluginval_bin }}"
+          --strictness-level 10
+          --timeout-ms 120000
+          --skip-gui-tests
+          --sample-rates 44100,48000,96000
+          --block-sizes 1,17,64,127,512,1024
+          --random-seed 0x4e414d
+          --output-dir installed-validation/pluginval-results
+          "${{ steps.installed.outputs.vst3 }}"
+
+      - name: Validate installed VST3
+        id: installed_vst3_other
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log installed-validation/pluginval.log
+          -- "${{ matrix.pluginval_bin }}"
+          --strictness-level 10
+          --timeout-ms 120000
+          --skip-gui-tests
+          --sample-rates 44100,48000,96000
+          --block-sizes 1,17,64,127,512,1024
+          --random-seed 0x4e414d
+          --output-dir installed-validation/pluginval-results
+          "${{ steps.installed.outputs.vst3 }}"
+
+      - name: Validate installed CLAP
+        id: installed_clap
+        continue-on-error: true
+        timeout-minutes: 20
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 900
+          --log installed-validation/clap-validator.log
+          -- "${{ matrix.clap_validator_bin }}"
+          validate --jobs 1
+          "${{ steps.installed.outputs.clap }}"
+
+      - name: Smoke test installed trainer (Linux)
+        id: installed_trainer_linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 5
+          --success-on-timeout
+          --log installed-validation/trainer.log
+          -- xvfb-run -a "${{ steps.installed.outputs.trainer }}"
+          --smoke-test-report installed-validation/trainer-smoke.json
+
+      - name: Smoke test installed trainer
+        id: installed_trainer_other
+        if: runner.os != 'Linux'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 5
+          --success-on-timeout
+          --log installed-validation/trainer.log
+          -- "${{ steps.installed.outputs.trainer }}"
+          --smoke-test-report installed-validation/trainer-smoke.json
+
+      - name: Verify installed trainer metadata
+        id: installed_trainer_metadata
+        if: >-
+          always() &&
+          (steps.installed_trainer_linux.outcome == 'success' ||
+          steps.installed_trainer_other.outcome == 'success')
+        continue-on-error: true
+        run: >-
+          python scripts/check_trainer_smoke_report.py
+          installed-validation/trainer-smoke.json
+          --version ${{ env.NAM_RELEASE_VERSION }}
+          --commit ${{ github.sha }}
+          --target ${{ matrix.target }}
+
+      - name: Upload installed release diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installed-release-${{ matrix.platform }}
+          if-no-files-found: ignore
+          path: installed-validation/
+
+      - name: Uninstall release
+        if: always() && steps.installed.outcome == 'success'
+        run: >-
+          python scripts/install_release.py uninstall
+          --platform ${{ matrix.platform }}
+
+      - name: Enforce installed release validation
+        if: >-
+          always() &&
+          (steps.installed_vst3_linux.outcome == 'failure' ||
+          steps.installed_vst3_other.outcome == 'failure' ||
+          steps.installed_clap.outcome == 'failure' ||
+          steps.installed_trainer_linux.outcome == 'failure' ||
+          steps.installed_trainer_other.outcome == 'failure' ||
+          steps.installed_trainer_metadata.outcome == 'failure')
+        run: exit 1

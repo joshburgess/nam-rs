@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from check_release_artifacts import binary_format, validate_architecture
+from check_release_artifacts import (
+    binary_format,
+    validate_architecture,
+    validate_build_metadata,
+)
 
 
 class ReleaseArtifactTests(unittest.TestCase):
@@ -47,6 +51,26 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertEqual(binary_format(b"MZ"), "pe")
         self.assertEqual(binary_format(b"\xcf\xfa\xed\xfe"), "mach-o")
         self.assertIsNone(binary_format(b"text"))
+
+    def test_embedded_build_metadata_requires_every_release_field(self) -> None:
+        path = self.write_binary(
+            b"0.2.0 0123456789ab x86_64-unknown-linux-gnu release fast-kernels"
+        )
+        validate_build_metadata(
+            path,
+            "0.2.0",
+            "0123456789abcdef0123456789abcdef01234567",
+            "x86_64-unknown-linux-gnu",
+            "fast-kernels",
+        )
+        with self.assertRaisesRegex(ValueError, "portable"):
+            validate_build_metadata(
+                path,
+                "0.2.0",
+                "0123456789abcdef0123456789abcdef01234567",
+                "x86_64-unknown-linux-gnu",
+                "portable",
+            )
 
 
 if __name__ == "__main__":
