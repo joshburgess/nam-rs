@@ -59,7 +59,7 @@ jobs:
           artifact-name: nam-rs.spdx.json
           upload-artifact: false
           upload-release-assets: false
-          syft-version: 1.44.0
+          syft-version: v1.44.0
 
       - name: Generate SHA-256 checksums
         run: python scripts/generate_release_checksums.py artifacts
