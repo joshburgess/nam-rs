@@ -598,7 +598,7 @@ jobs:
 
       - name: Smoke test installed trainer
         id: installed_trainer_other
-        if: runner.os != 'Linux'
+        if: runner.os == 'macOS'
         continue-on-error: true
         timeout-minutes: 5
         run: >-
@@ -609,12 +609,26 @@ jobs:
           -- "${{ steps.installed.outputs.trainer }}"
           --smoke-test-report installed-validation/trainer-smoke.json
 
+      - name: Headless smoke test installed trainer (Windows)
+        id: installed_trainer_windows
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: >-
+          python scripts/run_with_timeout.py
+          --timeout-seconds 5
+          --log installed-validation/trainer.log
+          -- "${{ steps.installed.outputs.trainer }}"
+          --headless-smoke-test
+          --smoke-test-report installed-validation/trainer-smoke.json
+
       - name: Verify installed trainer metadata
         id: installed_trainer_metadata
         if: >-
           always() &&
           (steps.installed_trainer_linux.outcome == 'success' ||
-          steps.installed_trainer_other.outcome == 'success')
+          steps.installed_trainer_other.outcome == 'success' ||
+          steps.installed_trainer_windows.outcome == 'success')
         continue-on-error: true
         run: >-
           python scripts/check_trainer_smoke_report.py
@@ -645,5 +659,6 @@ jobs:
           steps.installed_clap.outcome == 'failure' ||
           steps.installed_trainer_linux.outcome == 'failure' ||
           steps.installed_trainer_other.outcome == 'failure' ||
+          steps.installed_trainer_windows.outcome == 'failure' ||
           steps.installed_trainer_metadata.outcome == 'failure')
         run: exit 1

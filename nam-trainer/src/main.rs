@@ -14,8 +14,26 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(report_path) = smoke_test_report_path() {
+    let smoke_test_report = smoke_test_report_path();
+    if let Some(report_path) = smoke_test_report.clone() {
         nam_trainer::configure_smoke_test(report_path)?;
+    }
+    if has_argument("--headless-smoke-test") {
+        if smoke_test_report.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--headless-smoke-test requires --smoke-test-report",
+            )
+            .into());
+        }
+        if load_icon().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "embedded trainer icon could not be decoded",
+            )
+            .into());
+        }
+        return Ok(());
     }
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -47,4 +65,8 @@ fn smoke_test_report_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn has_argument(expected: &str) -> bool {
+    std::env::args_os().any(|argument| argument == expected)
 }
