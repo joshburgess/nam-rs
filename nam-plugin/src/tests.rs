@@ -750,9 +750,7 @@ fn real_a2_model_loading_stays_within_memory_budgets() {
         let path = fixture_root.join(model_name);
         let (model, allocations, allocated_bytes) =
             allocation_tracking::measure_allocations(|| nam_core::get_dsp(&path));
-        eprintln!(
-            "{model_name}: {allocations} allocations, {allocated_bytes} cumulative bytes"
-        );
+        eprintln!("{model_name}: {allocations} allocations, {allocated_bytes} cumulative bytes");
         assert!(model.is_ok(), "{model_name} failed to load");
         assert!(
             allocations <= 20_000,
