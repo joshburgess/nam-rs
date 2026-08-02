@@ -525,6 +525,36 @@ complete plugin allocation test also pass.
 The complete A2 plugin callback Criterion benchmark remains as a reusable gate
 for future work.
 
+### Packed A2 plugin lifecycle
+
+An ARM64 macOS profile on 2026-08-01 measured the real upstream packed A2
+export through the complete plugin callback:
+
+| Frames | Small model | Full model |
+|-------:|------------:|-----------:|
+| 16 | 1.128 us | 1.601 us |
+| 32 | 2.114 us | 3.004 us |
+| 64 | 3.979 us | 5.643 us |
+| 128 | 7.793 us | 11.597 us |
+| 256 | 15.442 us | 23.670 us |
+
+The 64-frame 95% confidence intervals were 3.839–4.118 us for the small model
+and 5.458–5.838 us for the full model. Loading and configuring the packed
+fixture at 48 kHz with a 256-frame maximum block took 92.982 us. Switching
+between model sizes took 0.948 us.
+
+Allocation tracking during real model construction measured:
+
+| Model | Allocations | Cumulative allocated bytes |
+|-------|------------:|---------------------------:|
+| Maximum A2 | 1,527 | 576,542 |
+| Packed A2 export | 702 | 213,916 |
+
+Tests cap each load at 20,000 allocations and 128 MiB of cumulative allocation
+traffic. The complete packed callback, model-size change, reset, and first
+callback after reset must allocate zero bytes. Linux CI also applies absolute
+instruction ceilings to the 64-frame small and full packed callbacks.
+
 ### Accurate x86-64 activation backends
 
 The GNU x86-64 backend resolves glibc's four-lane SSE2 `tanhf` entry point

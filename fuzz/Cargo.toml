@@ -12,6 +12,7 @@ arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 nam-trainer = { path = "../nam-trainer" }
 nam-core = { path = "../nam-core" }
+nam-plugin = { path = "../nam-plugin", features = ["benchmark-internals"] }
 serde_json = "1"
 
 [[bin]]
@@ -52,6 +53,13 @@ bench = false
 [[bin]]
 name = "model_json"
 path = "fuzz_targets/model_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_lifecycle"
+path = "fuzz_targets/plugin_lifecycle.rs"
 test = false
 doc = false
 bench = false

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -137,22 +138,58 @@ def install(archive: Path, root: Path | None = None, overwrite: bool = False) ->
         return paths
 
 
+def validate_install_state(
+    state: object, paths: InstallPaths, platform: str
+) -> list[tuple[Path, str]]:
+    if not isinstance(state, dict):
+        raise ValueError("installation state must be a JSON object")
+    if state.get("schema_version") != 1:
+        raise ValueError("installation state has an unsupported schema version")
+    if state.get("platform") != platform:
+        raise ValueError("installation state platform does not match the uninstall target")
+    entries = state.get("installed")
+    if not isinstance(entries, list):
+        raise ValueError("installation state is missing its file manifest")
+
+    expected_paths = {paths.vst3, paths.clap, paths.trainer}
+    validated: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("installation state contains an invalid entry")
+        raw_path = entry.get("path")
+        digest = entry.get("sha256")
+        if not isinstance(raw_path, str) or not isinstance(digest, str):
+            raise ValueError("installation state contains an invalid entry")
+        path = Path(raw_path)
+        if path not in expected_paths:
+            raise ValueError(f"installation state contains an unexpected path: {path}")
+        if path in seen:
+            raise ValueError(f"installation state contains a duplicate path: {path}")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"installation state contains an invalid checksum for {path}")
+        seen.add(path)
+        validated.append((path, digest))
+
+    missing = expected_paths - seen
+    if missing:
+        missing_paths = ", ".join(str(path) for path in sorted(missing))
+        raise ValueError(f"installation state is missing expected paths: {missing_paths}")
+    return validated
+
+
 def uninstall(platform: str, root: Path | None = None) -> InstallPaths:
     paths = install_paths(platform, root)
     if not paths.state.is_file():
         raise ValueError(f"installation state does not exist: {paths.state}")
     state = json.loads(paths.state.read_text(encoding="utf-8"))
-    entries = state.get("installed")
-    if not isinstance(entries, list):
-        raise ValueError("installation state is missing its file manifest")
-    for entry in entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-            raise ValueError("installation state contains an invalid entry")
-        path = Path(entry["path"])
-        if path.exists() and tree_hash(path) != entry.get("sha256"):
+    entries = validate_install_state(state, paths, platform)
+    for path, digest in entries:
+        if path.is_symlink():
+            raise ValueError(f"refusing to remove symbolic link installation path: {path}")
+        if path.exists() and tree_hash(path) != digest:
             raise ValueError(f"refusing to remove modified installation path: {path}")
-    for entry in entries:
-        path = Path(entry["path"])
+    for path, _ in entries:
         if path.is_dir():
             shutil.rmtree(path)
         elif path.exists():

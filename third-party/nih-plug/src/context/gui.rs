@@ -103,6 +103,17 @@ pub struct ParamSetter<'a> {
 }
 
 impl<P: Plugin> AsyncExecutor<P> {
+    /// Construct an executor from host task callbacks.
+    pub fn new(
+        execute_background: impl Fn(P::BackgroundTask) + Send + Sync + 'static,
+        execute_gui: impl Fn(P::BackgroundTask) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            execute_background: Arc::new(execute_background),
+            execute_gui: Arc::new(execute_gui),
+        }
+    }
+
     /// Execute a task on a background thread using `[Plugin::task_executor]`. This allows you to
     /// defer expensive tasks for later without blocking either the process function or the GUI
     /// thread. As long as creating the `task` is realtime-safe, this operation is too.

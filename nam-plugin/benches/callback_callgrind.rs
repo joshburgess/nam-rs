@@ -11,10 +11,20 @@ fn setup(host_rate: usize, model_rate: usize, buffer_size: usize) -> CallbackCas
     CallbackCase::new(host_rate, model_rate, buffer_size).unwrap()
 }
 
+fn setup_packed_small(buffer_size: usize) -> CallbackCase {
+    CallbackCase::new_packed_a2_small(buffer_size).unwrap()
+}
+
+fn setup_packed_full(buffer_size: usize) -> CallbackCase {
+    CallbackCase::new_packed_a2_full(buffer_size).unwrap()
+}
+
 #[library_benchmark]
 #[bench::native_64(setup(48_000, 48_000, 64))]
 #[bench::resample_44100_to_48000_64(setup(44_100, 48_000, 64))]
 #[bench::resample_48000_to_44100_256(setup(48_000, 44_100, 256))]
+#[bench::packed_small_64(setup_packed_small(64))]
+#[bench::packed_full_64(setup_packed_full(64))]
 fn callback(mut case: CallbackCase) {
     callgrind::toggle_collect();
     case.process();

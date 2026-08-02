@@ -162,7 +162,7 @@ jobs:
 
       - name: Execute bounded fuzz campaigns
         run: |
-          for target in worker_decode settings_migration artifact_naming manifest_parsing unicode_paths model_json; do
+          for target in worker_decode settings_migration artifact_naming manifest_parsing unicode_paths model_json plugin_lifecycle; do
             cargo fuzz run "$target" --fuzz-dir fuzz -- \
               -runs=1000 -max_len=65536 -timeout=10 -rss_limit_mb=4096
           done

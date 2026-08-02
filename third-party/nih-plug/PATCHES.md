@@ -7,6 +7,7 @@ The wrappers include these local compatibility fixes:
 - Reject state payloads above 64 MiB and use fallible reservation before reading the host-provided length.
 - Request a host parameter-value rescan after state restoration.
 - Backport maintained-fork commit [`83d934c`](https://codeberg.org/RustAudio/nice-plug/commit/83d934cd0a538f402c1a80bac71ca28039928d7c), using weak editor task-executor captures so CLAP and VST3 wrappers can be destroyed without reference cycles.
+- Expose `AsyncExecutor::new` so headless tests can exercise plugin editor construction and host notifications.
 
 The state changes are exercised by CLAP validator 0.4.1. Wrapper destruction is exercised by both plugin validators in the release workflow.
 

@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import random
 import tempfile
 import unittest
 import zipfile
@@ -90,6 +91,29 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsafe archive member"):
             package_release.verify_archive(archive)
 
+    def test_generated_archive_member_names_obey_safety_contract(self):
+        generator = random.Random(0x4E414D)
+        alphabet = "abcXYZ019./\\\0_-"
+        accepted = 0
+        rejected = 0
+        for _ in range(2_000):
+            name = "".join(
+                generator.choice(alphabet) for _ in range(generator.randrange(0, 96))
+            )
+            try:
+                path = package_release.checked_archive_name(name)
+            except ValueError:
+                rejected += 1
+                continue
+            accepted += 1
+            self.assertFalse(path.is_absolute())
+            self.assertNotIn("..", path.parts)
+            self.assertNotIn("\\", name)
+            self.assertNotIn("\0", name)
+            self.assertTrue(path.parts)
+        self.assertGreater(accepted, 0)
+        self.assertGreater(rejected, 0)
+
     def test_install_overwrite_upgrade_and_uninstall(self):
         old_archive = self.package(version="0.1.0", commit="b" * 40)
         install_root = self.root / "installed"
@@ -121,6 +145,104 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "modified"):
             install_release.uninstall("linux-x86_64", install_root)
         self.assertTrue(paths.clap.exists())
+        self.assertTrue(paths.state.exists())
+
+    def test_install_state_rejects_redirects_duplicates_and_malformed_metadata(self):
+        archive = self.package()
+        install_root = self.root / "installed"
+        paths = install_release.install(archive, install_root)
+        original = json.loads(paths.state.read_text(encoding="utf-8"))
+        outside = self.root / "outside"
+        outside.write_bytes(b"must survive")
+
+        mutations = {
+            "redirected path": lambda state: state["installed"][0].update(
+                path=str(outside), sha256=install_release.tree_hash(outside)
+            ),
+            "duplicate path": lambda state: state["installed"][1].update(
+                path=state["installed"][0]["path"]
+            ),
+            "wrong platform": lambda state: state.update(platform="windows-x86_64"),
+            "wrong schema": lambda state: state.update(schema_version=2),
+            "invalid checksum": lambda state: state["installed"][0].update(sha256="xyz"),
+            "missing entry": lambda state: state["installed"].pop(),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                state = json.loads(json.dumps(original))
+                mutate(state)
+                with self.assertRaises(ValueError):
+                    install_release.validate_install_state(
+                        state, paths, "linux-x86_64"
+                    )
+        self.assertEqual(outside.read_bytes(), b"must survive")
+
+    def test_generated_install_state_mutations_never_escape_expected_targets(self):
+        archive = self.package()
+        install_root = self.root / "generated-state"
+        paths = install_release.install(archive, install_root)
+        original = json.loads(paths.state.read_text(encoding="utf-8"))
+        expected = {paths.vst3, paths.clap, paths.trainer}
+        generator = random.Random(0x4132)
+
+        for _ in range(64):
+            state = json.loads(json.dumps(original))
+            generator.shuffle(state["installed"])
+            validated = install_release.validate_install_state(
+                state, paths, "linux-x86_64"
+            )
+            self.assertEqual({path for path, _ in validated}, expected)
+
+        for case in range(256):
+            state = json.loads(json.dumps(original))
+            entry = generator.randrange(len(state["installed"]))
+            mutation = case % 6
+            if mutation == 0:
+                state["installed"][entry]["path"] = str(
+                    self.root / f"outside-{case}"
+                )
+            elif mutation == 1:
+                state["installed"][entry]["sha256"] = "".join(
+                    generator.choice("0123456789abcdefXYZ") for _ in range(64)
+                )
+                if all(
+                    character in "0123456789abcdef"
+                    for character in state["installed"][entry]["sha256"]
+                ):
+                    state["installed"][entry]["sha256"] = "g" * 64
+            elif mutation == 2:
+                state["installed"][entry] = generator.choice(
+                    [None, [], "entry", 7]
+                )
+            elif mutation == 3:
+                state["installed"].append(state["installed"][entry].copy())
+            elif mutation == 4:
+                state["installed"].pop(entry)
+            else:
+                state["platform"] = generator.choice(
+                    [None, "", "windows-x86_64", 7]
+                )
+
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                install_release.validate_install_state(
+                    state, paths, "linux-x86_64"
+                )
+
+    def test_uninstall_rejects_replaced_installation_symlink(self):
+        archive = self.package()
+        install_root = self.root / "installed-symlink"
+        paths = install_release.install(archive, install_root)
+        outside = self.root / "outside-plugin"
+        outside.write_bytes(paths.clap.read_bytes())
+        paths.clap.unlink()
+        try:
+            paths.clap.symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"symbolic links are unavailable: {error}")
+
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            install_release.uninstall("linux-x86_64", install_root)
+        self.assertTrue(outside.exists())
         self.assertTrue(paths.state.exists())
 
     def test_checksum_manifest_covers_all_release_artifacts(self):

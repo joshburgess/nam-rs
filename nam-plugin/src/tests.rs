@@ -1,6 +1,33 @@
 use super::*;
 use proptest::prelude::*;
 
+struct TestInitContext {
+    executor: TaskExecutor<NamPlugin>,
+}
+
+impl InitContext<NamPlugin> for TestInitContext {
+    fn plugin_api(&self) -> PluginApi {
+        PluginApi::Standalone
+    }
+
+    fn execute(&self, task: NamTask) {
+        (self.executor)(task);
+    }
+
+    fn set_latency_samples(&self, _samples: u32) {}
+
+    fn set_current_voice_capacity(&self, _capacity: u32) {}
+}
+
+fn buffer_config(sample_rate: f32, max_buffer_size: u32) -> BufferConfig {
+    BufferConfig {
+        sample_rate,
+        min_buffer_size: None,
+        max_buffer_size,
+        process_mode: ProcessMode::Realtime,
+    }
+}
+
 #[test]
 fn model_reaper_is_joined_during_teardown() {
     let mut plugin = NamPlugin::default();
@@ -102,6 +129,10 @@ impl nam_core::Dsp for ActivationModeProbe {
 fn loaded_model(generation: u64) -> LoadedModel {
     LoadedModel {
         generation,
+        source_path: None,
+        host_sample_rate: 48_000,
+        model_sample_rate: 48_000,
+        configured_max_buffer_size: 0,
         dsp: Box::new(PassthroughDsp),
         resampler: None,
         applied_model_size: None,
@@ -139,6 +170,10 @@ fn plugin_with_model_fixture(model_name: &str, buffer_size: usize) -> NamPlugin 
     let mut plugin = plugin_with_passthrough_model(buffer_size);
     plugin.model = Some(LoadedModel {
         generation: 1,
+        source_path: Some(path),
+        host_sample_rate: 48_000,
+        model_sample_rate: 48_000,
+        configured_max_buffer_size: buffer_size,
         dsp,
         resampler: None,
         applied_model_size,
@@ -152,6 +187,10 @@ fn callback_mutes_non_finite_model_output_without_allocating() {
     let mut plugin = plugin_with_passthrough_model(buffer_size);
     plugin.model = Some(LoadedModel {
         generation: 1,
+        source_path: None,
+        host_sample_rate: 48_000,
+        model_sample_rate: 48_000,
+        configured_max_buffer_size: buffer_size,
         dsp: Box::new(NonFiniteDsp),
         resampler: None,
         applied_model_size: None,
@@ -171,6 +210,10 @@ fn callback_mutes_non_finite_model_output_without_allocating() {
         AudioProcessError::from_raw(plugin.audio_error.load(Ordering::Acquire)),
         AudioProcessError::NonFiniteOutput
     );
+    let diagnostics = plugin.diagnostics_summary();
+    assert!(diagnostics.contains(nam_core::build_info::SUMMARY));
+    assert!(diagnostics.contains("audio_error: The loaded model produced non-finite audio"));
+    assert!(diagnostics.contains("occurrences 1, last_block_size 64"));
 
     plugin.model = Some(loaded_model(1));
     audio.fill(1.0);
@@ -501,6 +544,81 @@ proptest! {
             render_resampled_stream(host_rate, model_rate, &partitions, 16_384);
         prop_assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn restored_plugin_state_sanitizes_arbitrary_floats_and_model_paths(
+        input_gain_bits in any::<u32>(),
+        output_gain_bits in any::<u32>(),
+        model_size_bits in any::<u32>(),
+        model_path in any::<String>(),
+        serialize_path in any::<bool>(),
+    ) {
+        let serialized_path = if serialize_path {
+            serde_json::to_string(&model_path).unwrap()
+        } else {
+            model_path
+        };
+        let mut state = PluginState {
+            version: String::from(NamPlugin::VERSION),
+            params: std::collections::BTreeMap::from([
+                (String::from("in_gain"), ParamValue::F32(f32::from_bits(input_gain_bits))),
+                (String::from("out_gain"), ParamValue::F32(f32::from_bits(output_gain_bits))),
+                (String::from("model_size"), ParamValue::F32(f32::from_bits(model_size_bits))),
+            ]),
+            fields: std::collections::BTreeMap::from([
+                (String::from("model_path"), serialized_path),
+            ]),
+        };
+
+        NamPlugin::filter_state(&mut state);
+        for (id, min, max) in [
+            ("in_gain", -24.0, 24.0),
+            ("out_gain", -40.0, 40.0),
+            ("model_size", 0.0, 1.0),
+        ] {
+            if let Some(value) = state.params.get(id) {
+                let ParamValue::F32(value) = value else {
+                    return Err(TestCaseError::fail("state filter retained a mismatched type"));
+                };
+                prop_assert!(value.is_finite());
+                prop_assert!((min..=max).contains(value));
+            }
+        }
+
+        let params = NamParams::default();
+        params.deserialize_fields(&state.fields);
+        if let Some(serialized) = state.fields.get("model_path") {
+            let expected: String = serde_json::from_str(serialized).unwrap();
+            let restored = params.model_path.lock().clone();
+            prop_assert_eq!(restored, expected);
+        } else {
+            prop_assert!(params.model_path.lock().is_empty());
+        }
+    }
+}
+
+#[test]
+fn restored_plugin_state_rejects_oversized_paths_and_mismatched_parameter_types() {
+    let oversized_path = serde_json::to_string(&"x".repeat(MAX_MODEL_PATH_BYTES + 1)).unwrap();
+    let mut state = PluginState {
+        version: String::from(NamPlugin::VERSION),
+        params: std::collections::BTreeMap::from([
+            (String::from("in_gain"), ParamValue::Bool(true)),
+            (String::from("out_gain"), ParamValue::I32(12)),
+            (
+                String::from("model_size"),
+                ParamValue::String(String::from("full")),
+            ),
+        ]),
+        fields: std::collections::BTreeMap::from([(String::from("model_path"), oversized_path)]),
+    };
+
+    NamPlugin::filter_state(&mut state);
+
+    assert!(!state.params.contains_key("in_gain"));
+    assert!(!state.params.contains_key("out_gain"));
+    assert!(!state.params.contains_key("model_size"));
+    assert!(!state.fields.contains_key("model_path"));
 }
 
 #[test]
@@ -625,6 +743,29 @@ fn complete_callback_with_a2_wavenet_does_not_allocate() {
 }
 
 #[test]
+fn real_a2_model_loading_stays_within_memory_budgets() {
+    let fixture_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../nam-core/test_fixtures/models");
+    for model_name in ["wavenet_a2_max.nam", "upstream_packed_a2_export.nam"] {
+        let path = fixture_root.join(model_name);
+        let (model, allocations, allocated_bytes) =
+            allocation_tracking::measure_allocations(|| nam_core::get_dsp(&path));
+        eprintln!(
+            "{model_name}: {allocations} allocations, {allocated_bytes} cumulative bytes"
+        );
+        assert!(model.is_ok(), "{model_name} failed to load");
+        assert!(
+            allocations <= 20_000,
+            "{model_name} used {allocations} allocations while loading"
+        );
+        assert!(
+            allocated_bytes <= 128 * 1024 * 1024,
+            "{model_name} allocated {allocated_bytes} cumulative bytes while loading"
+        );
+    }
+}
+
+#[test]
 fn complete_callback_with_fft_linear_model_does_not_allocate() {
     let buffer_size = 512;
     let weights = (0..4_096)
@@ -647,6 +788,10 @@ fn complete_callback_with_fft_linear_model_does_not_allocate() {
     let mut plugin = plugin_with_passthrough_model(buffer_size);
     plugin.model = Some(LoadedModel {
         generation: 1,
+        source_path: None,
+        host_sample_rate: 48_000,
+        model_sample_rate: 48_000,
+        configured_max_buffer_size: buffer_size,
         dsp,
         resampler: None,
         applied_model_size: None,
@@ -771,6 +916,10 @@ fn plugin_instances_keep_independent_activation_modes() {
         let mut plugin = plugin_with_passthrough_model(1);
         plugin.model = Some(LoadedModel {
             generation: 1,
+            source_path: None,
+            host_sample_rate: 48_000,
+            model_sample_rate: 48_000,
+            configured_max_buffer_size: 1,
             dsp: Box::new(ActivationModeProbe {
                 mode: nam_core::ActivationMode::Accurate,
             }),
@@ -963,6 +1112,188 @@ fn callback_installs_models_from_a_synchronized_concurrent_loader() {
 
     producer.join().unwrap();
     assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 32);
+}
+
+#[test]
+fn host_lifecycle_reloads_state_and_reconfigures_models_with_current_host_limits() {
+    let fixture_root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../nam-core/test_fixtures/models");
+    let first_path = fixture_root.join("wavenet_a2_max.nam");
+    let restored_path = fixture_root.join("upstream_packed_a2_export.nam");
+    let mut plugin = NamPlugin::new(false);
+    let executor = Plugin::task_executor(&mut plugin);
+    let mut context = TestInitContext { executor };
+
+    *plugin.params.model_path.lock() = first_path.to_string_lossy().into_owned();
+    assert!(Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(44_100.0, 64),
+        &mut context,
+    ));
+    assert_eq!(plugin.loaded_models.len(), 1);
+
+    let mut audio = [0.1f32; 64];
+    assert_eq!(
+        plugin.process_buffer(&mut mono_buffer(&mut audio)),
+        ProcessStatus::Normal
+    );
+    let first_generation = plugin.installed_generation.load(Ordering::Acquire);
+    let first_model = plugin.model.as_ref().unwrap();
+    assert_eq!(first_model.source_path.as_ref(), Some(&first_path));
+    assert_eq!(first_model.host_sample_rate, 44_100);
+    assert_eq!(first_model.model_sample_rate, 48_000);
+    assert_eq!(first_model.configured_max_buffer_size, 64);
+    assert!(first_model.resampler.is_some());
+
+    *plugin.params.model_path.lock() = restored_path.to_string_lossy().into_owned();
+    assert!(Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(48_000.0, 257),
+        &mut context,
+    ));
+    let mut restored_audio = [0.1f32; 257];
+    assert_eq!(
+        plugin.process_buffer(&mut mono_buffer(&mut restored_audio)),
+        ProcessStatus::Normal
+    );
+    let restored_model = plugin.model.as_ref().unwrap();
+    assert_eq!(restored_model.source_path.as_ref(), Some(&restored_path));
+    assert!(restored_model.generation > first_generation);
+    assert_eq!(restored_model.host_sample_rate, 48_000);
+    assert_eq!(restored_model.configured_max_buffer_size, 257);
+    assert!(restored_model.resampler.is_none());
+
+    Plugin::deactivate(&mut plugin);
+    assert!(Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(96_000.0, 511),
+        &mut context,
+    ));
+    let reconfigured_model = plugin.model.as_ref().unwrap();
+    assert_eq!(
+        reconfigured_model.source_path.as_ref(),
+        Some(&restored_path)
+    );
+    assert_eq!(reconfigured_model.host_sample_rate, 96_000);
+    assert_eq!(reconfigured_model.model_sample_rate, 48_000);
+    assert_eq!(reconfigured_model.configured_max_buffer_size, 511);
+    assert!(reconfigured_model.resampler.is_some());
+    assert_eq!(plugin.input_buf.len(), 511);
+    assert_eq!(plugin.output_buf.len(), 511);
+    let diagnostics = plugin.diagnostics_summary();
+    assert!(diagnostics.contains("host: 96000 Hz, max 511 samples"));
+    assert!(diagnostics.contains("model: 48000 Hz, max 511 samples, resampling=true"));
+    assert!(diagnostics.contains(restored_path.to_string_lossy().as_ref()));
+
+    let missing_path = fixture_root.join("missing_model.nam");
+    *plugin.params.model_path.lock() = missing_path.to_string_lossy().into_owned();
+    assert!(Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(88_200.0, 333),
+        &mut context,
+    ));
+    let fallback_model = plugin.model.as_ref().unwrap();
+    assert_eq!(fallback_model.source_path.as_ref(), Some(&restored_path));
+    assert_eq!(fallback_model.host_sample_rate, 88_200);
+    assert_eq!(fallback_model.configured_max_buffer_size, 333);
+    assert!(fallback_model.resampler.is_some());
+    assert!(matches!(
+        *plugin.load_status.lock(),
+        ModelLoadStatus::Failed { ref path, .. } if path == &missing_path
+    ));
+    let mut fallback_audio = [0.1f32; 333];
+    assert_eq!(
+        plugin.process_buffer(&mut mono_buffer(&mut fallback_audio)),
+        ProcessStatus::Normal
+    );
+    assert!(fallback_audio.iter().all(|sample| sample.is_finite()));
+
+    *plugin.params.model_path.lock() = String::new();
+    assert!(Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(48_000.0, 128),
+        &mut context,
+    ));
+    assert!(plugin.model.is_none());
+    assert_eq!(plugin.installed_generation.load(Ordering::Acquire), 0);
+    assert!(matches!(*plugin.load_status.lock(), ModelLoadStatus::Empty));
+}
+
+#[test]
+fn host_lifecycle_rejects_invalid_processing_config_without_mutating_live_buffers() {
+    let mut plugin = NamPlugin::new(false);
+    let executor = Plugin::task_executor(&mut plugin);
+    let mut context = TestInitContext { executor };
+    let original_sample_rate = plugin.sample_rate;
+    let original_max_buffer_size = plugin.max_buffer_size;
+
+    assert!(!Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(f32::NAN, 64),
+        &mut context,
+    ));
+    assert!(!Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(48_000.0, 0),
+        &mut context,
+    ));
+    assert!(!Plugin::initialize(
+        &mut plugin,
+        &NamPlugin::AUDIO_IO_LAYOUTS[0],
+        &buffer_config(48_000.0, MAX_SUPPORTED_BUFFER_SIZE as u32 + 1),
+        &mut context,
+    ));
+    assert_eq!(plugin.sample_rate, original_sample_rate);
+    assert_eq!(plugin.max_buffer_size, original_max_buffer_size);
+    assert!(plugin.input_buf.is_empty());
+    assert!(plugin.output_buf.is_empty());
+}
+
+#[test]
+fn editor_construction_survives_repeated_host_notification_cycles() {
+    let mut plugin = NamPlugin::new(false);
+
+    for scale_factor in [1.0, 1.5, 2.0, 0.75] {
+        let executor = AsyncExecutor::new(|_| {}, |_| {});
+        let editor = Plugin::editor(&mut plugin, executor).unwrap();
+        assert_eq!(editor.size(), (400, 280));
+        assert!(editor.set_scale_factor(scale_factor));
+        editor.param_value_changed("input_gain", 0.25);
+        editor.param_modulation_changed("output_gain", -0.1);
+        editor.param_values_changed();
+        drop(editor);
+    }
+}
+
+#[test]
+fn plugin_reset_with_resampled_packed_a2_model_does_not_allocate() {
+    let buffer_size = 257;
+    let mut plugin = plugin_with_model_fixture("upstream_packed_a2_export.nam", buffer_size);
+    plugin
+        .model
+        .as_mut()
+        .unwrap()
+        .configure_processing(44_100.0, buffer_size)
+        .unwrap();
+    plugin.sample_rate = 44_100.0;
+
+    let (_, allocations) = allocation_tracking::count_allocations(|| Plugin::reset(&mut plugin));
+    assert_eq!(allocations, 0, "plugin reset allocated");
+
+    let mut audio = [0.1f32; 257];
+    let mut buffer = mono_buffer(&mut audio);
+    let (status, callback_allocations) =
+        allocation_tracking::count_allocations(|| plugin.process_buffer(&mut buffer));
+    assert_eq!(status, ProcessStatus::Normal);
+    assert_eq!(callback_allocations, 0, "callback after reset allocated");
+    assert!(audio.iter().all(|sample| sample.is_finite()));
 }
 
 #[test]
